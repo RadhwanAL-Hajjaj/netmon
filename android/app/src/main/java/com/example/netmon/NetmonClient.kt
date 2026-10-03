@@ -60,6 +60,34 @@ class NetmonClient(address: String) {
         post("/api/reboot", ByteArray(0), null)
     }
 
+    // --- Nearby, Finder and Map (firmware 0.10 and 0.11) ------------------------
+
+    /** Both radios' tables. Reading it counts as watching: the board scans quickly for the next 20 s. */
+    fun nearby(): Nearby = Parse.nearby(get("/api/nearby", 12000))
+
+    /** Asks for a scan of both radios as soon as the board's own work leaves the radio free. */
+    fun nearbyScan() {
+        post("/api/nearby/scan", ByteArray(0), null)
+    }
+
+    fun nearbyConfig(): NearbyConfig = Parse.nearbyConfig(get("/api/nearby/config"))
+
+    fun setNearbyConfig(wifi: Boolean? = null, ble: Boolean? = null, backgroundS: Int? = null): NearbyConfig =
+        Parse.nearbyConfig(post("/api/nearby/config",
+            Parse.nearbyConfigBody(wifi, ble, backgroundS).toByteArray(Charsets.UTF_8), "application/json"))
+
+    /** The Finder's state and the readings numbered after [after]. Asking keeps the Finder going. */
+    fun find(after: Long): FindStatus = Parse.find(get("/api/nearby/find?after=$after"))
+
+    /** Starts finding a device, or keeps finding it; [holdS] asks the sweep to wait for a turn (0 ends that). */
+    fun findStart(type: String, addr: String, holdS: Int? = null): FindStatus =
+        Parse.find(post("/api/nearby/find", Parse.findBody(type, addr, holdS).toByteArray(Charsets.UTF_8), "application/json"))
+
+    fun findStop(): FindStatus =
+        Parse.find(post("/api/nearby/find", Parse.FIND_STOP_BODY.toByteArray(Charsets.UTF_8), "application/json"))
+
+    fun map(): MapInfo = Parse.map(get("/api/map"))
+
     /** True when the board accepts this update password. */
     fun checkUpdateKey(key: String): Boolean = try {
         post("/api/update/check", ByteArray(0), null, mapOf(KEY_HEADER to key))

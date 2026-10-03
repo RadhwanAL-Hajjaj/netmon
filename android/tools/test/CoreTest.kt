@@ -39,7 +39,15 @@ fun main() {
     latencyTests()
     normalizeTests()
     validateTests()
+    nearbyParseTests()
+    airTests()
+    liveLogTests()
+    finderTests()
+    headingTests()
+    mapTests()
+    parityTests()
     clientTests()
+    nearbyClientTests()
     println("passed $passed, failed $failed")
     if (failed > 0) System.exit(1)
 }
@@ -170,7 +178,14 @@ fun firmwareTests() {
         "That is the bootloader image, not the firmware. Choose the file ending in .ino.bin.", "bootloader")
     eq(Firmware.problem("netmon.ino.merged.bin", 4_000_000, 0xE9)?.startsWith("That is the merged image"), true, "merged")
     eq(Firmware.problem("notes.txt", 400_000, 0xE9), "That is not a .bin file.", "not bin")
-    eq(Firmware.problem("big.bin", 1_310_721, 0xE9), "Too large: the app partition holds 1,310,720 bytes.", "too large")
+    eq(Firmware.problem("big.bin", 1_310_721, 0xE9), "Too large: this board takes firmware up to 1,310,720 bytes.", "too large")
+    // From 0.10 the board says what it takes: an 0.11 image is 1.5 MB.
+    eq(Firmware.problem("netmon.ino.bin", 1_503_443, 0xE9, Firmware.limit(1_966_080)), null, "0.11 image fits a 0.10+ board")
+    eq(Firmware.problem("netmon.ino.bin", 1_503_443, 0xE9, Firmware.limit(0)),
+        "Too large: this board takes firmware up to 1,310,720 bytes.", "0.11 image too large for an old board")
+    eq(Firmware.problem("big.bin", 1_966_081, 0xE9, 1_966_080), "Too large: this board takes firmware up to 1,966,080 bytes.", "over update_max")
+    eq(Firmware.limit(0), 1_310_720L, "limit without update_max")
+    eq(Firmware.limit(1_966_080), 1_966_080L, "limit from update_max")
     eq(Firmware.problem("big.bin", 1_310_720, 0xE9), null, "exactly the partition size is fine")
     eq(Firmware.problem("small.bin", 262_143, 0xE9), "Too small to be netmon firmware.", "too small")
     eq(Firmware.problem("x.BIN", 400_000, 0x00), "That file is not an ESP32 firmware image.", "bad magic")
@@ -447,5 +462,479 @@ fun clientTests() {
     val e5 = throws<ApiException>("404 on old firmware") { c.networks() }
     eq(e5?.status, 404, "404 surfaced")
     eq(e5?.message?.startsWith("This board's firmware does not have that feature"), true, "404 explained")
+    mock("/__reset", "POST")
+}
+
+
+// --- Nearby, the Finder and the map (1.1.0) ---------------------------------------
+
+fun near(a: Double, b: Double, what: String, tol: Double = 1e-9) =
+    check(Math.abs(a - b) <= tol * Math.max(1.0, Math.abs(b)), "$what: expected <$b> got <$a>")
+
+val NEARBY_JSON = """{"version":"0.11.0-finder","on_lan":true,"sweeping":false,"background_s":120,"finding":null,"wifi_scan":{"enabled":true,"state":"idle","scans":42,"failures":0,"age_s":5,"took_ms":1640},"ble_scan":{"enabled":true,"state":"listening","bursts":120,"age_s":0,"dropped":0},"wifi":[{"bssid":"50:91:e3:12:34:56","ssid":"HOME-5G","ch":6,"rssi":-38,"security":"WPA2/WPA3","live":true,"joined":true,"age_s":3,"known_s":603},{"bssid":"AC:84:C6:AA:00:02","ssid":"","ch":1,"rssi":-66,"security":"WPA2","live":true,"joined":false,"age_s":3,"known_s":603},{"bssid":"E4:6F:13:00:11:22","ssid":"Say \"hi\"","ch":11,"rssi":-81,"security":"Open","live":true,"joined":false,"age_s":3,"known_s":603},{"bssid":"A0:63:91:01:02:03","ssid":"Neighbours","ch":11,"rssi":-90,"security":"WPA2","live":false,"joined":false,"age_s":3400,"known_s":4000}],"ble":[{"addr":"5d:21:8a:00:11:22","name":"","vendor":"Apple","company":76,"kind":"private","type":"audio","sure":4,"model":"AirPods Pro","rssi":-52,"age_s":1,"known_s":300,"seen":12},{"addr":"C4:9E:11:22:33:44","name":"Tile","vendor":"Tile","company":1660,"kind":"static","type":"tracker","sure":3,"model":"","rssi":-80,"age_s":2,"known_s":300,"seen":12},{"addr":"E2:11:09:44:21:7A","name":"","vendor":"","company":-1,"kind":"private","type":"unknown","sure":0,"model":"","rssi":-88,"age_s":75,"known_s":300,"seen":3}]}"""
+
+fun nearbyParseTests() {
+    val n = Parse.nearby(NEARBY_JSON)
+    eq(n.version, "0.11.0-finder", "nearby version")
+    eq(n.finding, null, "no finding")
+    eq(n.wifi.size, 4, "nearby wifi")
+    eq(n.wifi[0].bssid, "50:91:E3:12:34:56", "bssid upper-cased")
+    eq(n.wifi[0].joined, true, "joined")
+    eq(n.wifi[2].ssid, "Say \"hi\"", "escaped ssid")
+    eq(n.wifi[3].live, false, "history entry")
+    eq(n.wifiScan.count, 42L, "wifi scans")
+    eq(n.bleScan.count, 120L, "ble bursts")
+    eq(n.bleScan.state, "listening", "ble state")
+    eq(n.ble.size, 3, "ble")
+    eq(n.ble[0].addr, "5D:21:8A:00:11:22", "ble addr upper")
+    eq(n.ble[0].model, "AirPods Pro", "model")
+    eq(n.ble[2].company, -1, "no company")
+    val f = Parse.nearby("""{"finding":{"type":"ble","addr":"c4:9e:11:22:33:44","name":"Tile"},"wifi":[],"ble":[]}""")
+    eq(f.finding?.addr, "C4:9E:11:22:33:44", "finding addr")
+    eq(f.wifiScan.enabled, false, "missing scan block reads as off")
+    eq(f.wifiScan.ageS, -1L, "never scanned")
+    throws<ApiException>("nearby not json") { Parse.nearby("not found") }
+
+    val cfg = Parse.nearbyConfig("""{"wifi":false,"ble":true,"ble_ready":false,"background_s":300}""")
+    eq(cfg, NearbyConfig(false, true, false, 300), "nearby config")
+    eq(JSONObject(Parse.nearbyConfigBody(ble = false)).toString(), """{"ble":false}""", "only the field changed is sent")
+    eq(JSONObject(Parse.nearbyConfigBody(backgroundS = 0)).getInt("background_s"), 0, "background off")
+
+    val fs = Parse.find("""{"active":true,"type":"ble","addr":"c4:9e:11:22:33:44","name":"Tile","kind":"static","dtype":"tracker","model":"","vendor":"Tile","state":"paused","why":"sweep","for_s":12,"heard_ms":800,"hold_ms":0,"seq":131,"readings":[[129,1900,-71],[130,900,-70],[131,0,-69],[132]]}""")
+    eq(fs.addr, "C4:9E:11:22:33:44", "find addr")
+    eq(fs.dtype, "tracker", "find dtype")
+    eq(fs.why, "sweep", "find why")
+    eq(fs.readings.size, 3, "short reading arrays are skipped")
+    eq(fs.readings[0], FindReading(129, 1900, -71), "reading")
+    eq(Parse.find("""{"active":false,"seq":7}""").active, false, "find inactive")
+    eq(Parse.find("""{"active":false,"seq":7}""").heardMs, -1L, "never heard")
+    val fb = JSONObject(Parse.findBody("wifi", "50:91:E3:12:34:56", 36))
+    eq(fb.getString("type"), "wifi", "find body type")
+    eq(fb.getInt("hold_s"), 36, "find body hold")
+    check(!JSONObject(Parse.findBody("ble", "AA:BB:CC:DD:EE:FF")).has("hold_s"), "no hold unless asked")
+    eq(JSONObject(Parse.FIND_STOP_BODY).getBoolean("stop"), true, "stop body")
+
+    val m = Parse.map("""{"version":"0.11.0-finder","wifi":"connected","ssid":"HOME","ip":"192.168.2.30","mac":"d4:e9:f4:12:34:56","hostname":"netmon","gateway":"192.168.2.1","subnet":"192.168.2.0/24","rssi":-38,"channel":6,"bssid":"50:91:e3:12:34:56","uptime_s":99,"latency_valid":true,"latency_ms":4,"isp":{"checked":true,"valid":true,"isp":"Example","org":"Ex","age_s":5},"nearby_wifi":true,"aps":[{"bssid":"50:91:E3:12:34:56","ch":6,"rssi":-38,"live":true,"joined":true,"age_s":0}]}""")
+    eq(m.mac, "D4:E9:F4:12:34:56", "map mac")
+    eq(m.aps.size, 1, "map aps")
+    eq(m.isp.isp, "Example", "map isp")
+    eq(m.fromBoard, true, "map from the board")
+    eq(Parse.config("""{"update_max":1966080}""").updateMax, 1_966_080L, "update_max")
+    eq(Parse.config("""{"ssid":"x"}""").updateMax, 0L, "no update_max before 0.10")
+}
+
+fun airTests() {
+    val cal = Calibration()
+    near(Air.metres(-45, false, cal), 1.0, "wifi 1 m reference")
+    near(Air.metres(-59, true, cal), 1.0, "ble 1 m reference")
+    eq(Air.metres(-10, true, cal), 0.1, "clamped near")
+    eq(Air.metres(-127, false, cal), 200.0, "clamped far")
+    eq(Air.distance(3.25), "~3.3 m", "distance text")
+    eq(Air.distance(12.4), "~12 m", "distance text over 10")
+    eq(Air.group("phone"), "p", "personal")
+    eq(Air.group("flipper"), "t", "trackers")
+    eq(Air.group("sensor"), "h", "home and things")
+    eq(Air.group("unknown"), "u", "not identified")
+    eq(Air.group(""), "u", "blank type")
+    val n = Parse.nearby(NEARBY_JSON)
+    eq(Air.bleName(n.ble[0]), "AirPods Pro", "name from the model")
+    eq(Air.bleName(n.ble[1]), "Tile", "own name")
+    eq(Air.bleName(n.ble[2]), "unnamed device", "nothing to go by")
+    eq(Air.bleName(n.ble[0].copy(model = "")), "Apple device", "name from the maker")
+    eq(Air.bleName(n.ble[0].copy(model = "", vendor = "")), "Headphones", "name from the kind")
+    eq(Air.apName(n.wifi[1]), "hidden network", "hidden network")
+    eq(Air.apName(n.wifi[0], masked = true), "HO*****", "masked name")
+    eq(Air.maskAddr("50:91:E3:12:34:56"), "50:91:XX:XX:XX:XX", "masked address")
+    check(Air.matches(n.wifi[0], "home 5g"), "search words")
+    check(Air.matches(n.wifi[0], "5091e3"), "search mac without colons")
+    check(Air.matches(n.wifi[1], "hidden"), "search hidden")
+    check(!Air.matches(n.wifi[0], "cafe"), "no match")
+    check(Air.matches(n.ble[0], "headphones apple"), "search kind and maker")
+    check(Air.matches(n.ble[1], "trackers"), "search group name")
+    eq(Air.countLine(n), "3 Wi-Fi networks and 3 Bluetooth devices nearby", "count line")
+    eq(Air.stateLine(n).text, "Wi-Fi scanned 5 s ago · listening for Bluetooth now", "state line")
+    val off = n.copy(wifiScan = n.wifiScan.copy(enabled = false), bleScan = n.bleScan.copy(state = "unavailable"))
+    eq(Air.countLine(off), "3 Bluetooth devices nearby", "count without wifi")
+    eq(Air.stateLine(off), Air.State("Bluetooth could not start", true), "bluetooth failed")
+    val finding = n.copy(finding = Finding("ble", "C4:9E:11:22:33:44", "Tile"), onLan = false)
+    eq(Air.stateLine(finding).text, "Finding Tile. The other scans wait until that stops, so these lists stand still · " +
+        "setup mode: scanning only while this screen is open", "state while finding")
+    check(Air.stateLine(finding, masked = true).text.startsWith("Finding Ti**. "), "the name of what is being found is masked too")
+    eq(Air.backgroundWord(120), "2 min", "background words")
+    eq(Air.backgroundWord(0), "Off", "background off")
+    check(Air.BACKGROUND.all { it == 0 || it in 30..3600 }, "background choices are ones the board takes")
+    val tm = TrendMemory()
+    for (r in listOf(-80, -79, -78)) tm.remember(mapOf("A" to r))
+    eq(tm.trend("A"), 0, "no trend from three readings")
+    tm.remember(mapOf("A" to -70))
+    eq(tm.trend("A"), 1, "stronger")
+    eq(tm.arrow("A"), " ▲", "arrow")
+    tm.remember(mapOf("B" to -50))
+    eq(tm.trend("A"), 0, "a device missing from a reading is forgotten")
+}
+
+fun liveLogTests() {
+    val n = Parse.nearby(NEARBY_JSON)
+    val log = LiveLog()
+    val t0 = 1_800_000_000_000L
+    val all = { _: NearbyBle -> true }
+    eq(log.track(t0, n, all).arrived.size, 0, "first reading only learns")
+    val more = n.copy(ble = n.ble + NearbyBle("11:22:33:44:55:66", "New", "", -1, "public", "phone", 2, "", -60, 0, 0, 1))
+    eq(log.track(t0 + 10_000, more, all).arrived.size, 0, "still learning")
+    eq(log.entries.size, 0, "nothing logged while learning")
+    val gone = more.copy(wifi = more.wifi.filter { it.ssid != "HOME-5G" })
+    val ch = log.track(t0 + 25_000, gone, all)
+    eq(ch.left.map { it.key }, listOf("50:91:E3:12:34:56"), "departure after learning")
+    eq(log.entries[0].arrived, false, "logged as left")
+    eq(log.entries[0].name, "HOME-5G", "with its name")
+    // Masking applies when shown, so turning it on hides names logged before it.
+    eq(log.entries[0].shown(true), "HO*****", "a logged network name masked when shown")
+    eq(log.entries[0].shown(false), "HOME-5G", "and in full without masking")
+    val back = log.track(t0 + 28_000, more, all)
+    eq(back.arrived, listOf("50:91:E3:12:34:56"), "arrival")
+    // A Bluetooth device unheard for over a minute counts as gone.
+    eq(log.track(t0 + 31_000, more.copy(ble = more.ble.map { if (it.name == "New") it.copy(ageS = 61) else it }), all).left.map { it.key },
+        listOf("11:22:33:44:55:66"), "stale bluetooth leaves")
+    eq(log.entries[0].shown(true), "Ne*", "a device's own name masked when shown")
+    // Hidden groups are not logged.
+    val hidden = log.track(t0 + 34_000, more, { it.type != "phone" })
+    eq(hidden.arrived.size, 0, "hidden arrival not logged")
+    // Nothing while the board is finding a device: the lists stand still.
+    val f = more.copy(finding = Finding("ble", "C4:9E:11:22:33:44", ""), wifi = emptyList())
+    eq(log.track(t0 + 37_000, f, all).left.size, 0, "nothing logged while finding")
+    // A crowd arriving at once is one line.
+    val crowd = more.copy(wifi = more.wifi + (1..13).map { NearbyAp("00:00:00:00:00:%02X".format(it), "n$it", 1, -70, "WPA2", true, false, 1, 1) })
+    log.track(t0 + 40_000, crowd, all)
+    eq(log.entries[0].batch, 13, "batch line")
+    log.relearn(t0 + 50_000)
+    eq(log.track(t0 + 51_000, n, all).left.size, 0, "relearn starts quiet again")
+    check(log.entries.size <= 80, "log capped")
+    // A name made up for a device (its product, maker or kind) is not its own: masking leaves it.
+    val log2 = LiveLog(learnMs = 0)
+    val none = n.copy(ble = emptyList())
+    log2.track(t0, none, all)
+    val pods = NearbyBle("22:33:44:55:66:77", "", "Apple", 76, "random", "earbuds", 2, "AirPods Pro", -60, 0, 0, 1)
+    log2.track(t0 + 1000, none.copy(ble = listOf(pods)), all)
+    eq(log2.entries.map { it.shown(true) }, listOf("AirPods Pro"), "a made-up name is not masked")
+}
+
+fun finderTests() {
+    val tr = FinderTrack()
+    val t = 1_800_000_000_000L
+    tr.sinceMs = t
+    tr.add(t, -70)
+    eq(tr.value(), -70, "first reading")
+    tr.add(t + 500, -72)
+    near(tr.points[1].m, -71.0, "median of two is their mean")
+    tr.add(t + 1000, -95)
+    near(tr.points[2].m, -72.0, "a deep fade is outvoted")
+    tr.add(t + 30_000, -50)
+    near(tr.points[3].e, -50.0, "after a long gap the smoothing starts again")
+    eq(tr.heardAgo(t + 31_000), 1000L, "heard ago")
+    check(tr.heardAgo(t) < 0 || true, "")
+    val up = FinderTrack()
+    up.sinceMs = t
+    for (i in 0 until 12) up.add(t + i * 1000L, -80 + i)
+    check(up.trend(t + 11_000)!! >= 3, "warmer")
+    eq(FinderMath.trendWord(up.trend(t + 11_000)), "▲ Warmer", "warmer word")
+    val down = FinderTrack()
+    for (i in 0 until 12) down.add(t + i * 1000L, -60 - i)
+    eq(FinderMath.trendWord(down.trend(t + 11_000)), "▼ Colder", "colder word")
+    eq(FinderTrack().trend(t), null, "no trend without readings")
+    eq(up.rate(t + 2000), null, "no rate in the first five seconds")
+    eq(up.rate(t + 11_000), 65, "readings a minute")
+    eq(FinderMath.prox(0.5), "Very close", "very close")
+    eq(FinderMath.prox(20.0), "Far off", "far off")
+    near(FinderMath.hot(30.0), 0.0, "30 m is cold")
+    near(FinderMath.hot(0.3), 1.0, "30 cm is hot")
+    eq(FinderMath.big(2.44), "≈ 2.4 m", "big distance")
+    check(FinderMath.found(0.5, 5000), "found")
+    check(!FinderMath.found(0.5, 12_000), "not heard lately")
+    check(!FinderMath.found(1.0, 1000), "not close enough")
+    eq(FinderMath.turnSeconds(null), 30, "turn without a rate")
+    eq(FinderMath.turnSeconds(60), 20, "quick readings, short turn")
+    eq(FinderMath.turnSeconds(30), 36, "turn for 18 readings")
+    eq(FinderMath.turnSeconds(10), 45, "slow readings, long turn")
+    eq(FinderMath.clock(0.0), 12, "12 o'clock")
+    eq(FinderMath.clock(Math.PI / 2), 3, "3 o'clock")
+    eq(FinderMath.clock(Math.PI), 6, "6 o'clock")
+    eq(FinderMath.clock(-Math.PI / 2), 9, "9 o'clock")
+    val pts = (0 until 36).map { FinderMath.TurnPoint(it * Math.PI / 18, (-75 + 10 * Math.cos(it * Math.PI / 18 - Math.PI)).toInt()) }
+    val d = FinderMath.direction(pts)
+    check(d.ok, "clear direction")
+    near(d.a, Math.PI, "strongest behind", 1e-9)
+    check(FinderMath.liveText(d, 0.0).startsWith("Strongest at about 12 o’clock from where you face now, straight ahead"), "live text ahead")
+    check(FinderMath.liveText(d, Math.PI / 2).contains("3 o’clock from where you face now, to your right"), "live text right")
+    eq(FinderMath.noAnswer(FinderMath.direction(pts.take(4))), "Too few readings during the turn to tell. Turn more slowly, " +
+        "or move a little closer, and try again.", "too few")
+}
+
+fun headingTests() {
+    val flatNorth = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+    near(FinderMath.headingOf(flatNorth)!!, 0.0, "flat, top to the north")
+    // Upright, screen towards you, facing east: x is south, y is up, z is west.
+    val uprightEast = floatArrayOf(0f, 0f, -1f, -1f, 0f, 0f, 0f, 1f, 0f)
+    near(FinderMath.headingOf(uprightEast)!!, Math.PI / 2, "upright, facing east")
+    // Tilted back 45 degrees, facing south: y = (0,-c,s), z = (0,c,s)... towards you is north and up.
+    val c = Math.sqrt(0.5).toFloat()
+    val tiltSouth = floatArrayOf(-1f, 0f, 0f, 0f, -c, c, 0f, c, c)
+    near(FinderMath.headingOf(tiltSouth)!!, Math.PI, "tilted, facing south", 1e-6)
+    eq(FinderMath.headingOf(FloatArray(9)), null, "no heading from nothing")
+    near(FinderMath.diff(0.1, 2 * Math.PI - 0.1), 0.2, "difference across north")
+    near(FinderMath.norm(-Math.PI / 2), 1.5 * Math.PI, "norm")
+    val log = HeadingLog()
+    val t = 1_000_000L
+    var h = 0.0
+    for (i in 0..40) {
+        log.add(t + i * 100L, FinderMath.norm(h))
+        h += 2 * Math.PI / 40
+    }
+    near(log.turned, 2 * Math.PI, "a full turn, unwrapped", 1e-9)
+    near(log.at(t + 2000)!!, Math.PI, "half way round at half time", 1e-9)
+    near(log.at(t + 2050)!!, Math.PI + Math.PI / 40, "interpolated", 1e-9)
+    near(log.at(t - 500)!!, 0.0, "held at the start")
+    val left = HeadingLog()
+    for (i in 0..10) left.add(t + i * 100L, FinderMath.norm(-i * 0.3))
+    near(left.turned, -3.0, "turning left counts down", 1e-9)
+}
+
+val MAP_INFO = """{"version":"0.11.0-finder","wifi":"connected","ssid":"HOME","ip":"192.168.2.30","mac":"D4:E9:F4:12:34:56","hostname":"netmon","gateway":"192.168.2.1","subnet":"192.168.2.0/24","rssi":-38,"channel":6,"bssid":"50:91:E3:12:34:56","uptime_s":99,"latency_valid":true,"latency_ms":4,"isp":{"checked":true,"valid":true,"isp":"Example","org":"Ex","age_s":5},"nearby_wifi":true,"aps":[{"bssid":"50:91:E3:12:34:56","ch":6,"rssi":-38,"live":true,"joined":true,"age_s":0},{"bssid":"52:91:E3:12:34:57","ch":6,"rssi":-71,"live":true,"joined":false,"age_s":9}]}"""
+
+fun lan(): List<Device> = listOf(
+    Device("D4:E9:F4:12:34:56", "192.168.2.30", "netmon", "Espressif Inc.", "known", false, true, true, 0, 99),
+    Device("50:91:E3:12:34:56", "192.168.2.1", "", "TP-Link", "known", false, false, true, 0, 99),
+    Device("DA:A1:19:77:88:99", "192.168.2.45", "Pixel-7", "", "private", true, false, true, 0, 9),
+    Device("00:11:32:AA:BB:CC", "192.168.2.10", "DiskStation", "Synology Incorporated", "known", false, false, true, 0, 9),
+    Device("A4:CF:12:44:55:66", "192.168.2.73", "", "Espressif Inc.", "unknown", false, false, true, 0, 9),
+    Device("38:6B:1C:22:00:11", "192.168.2.90", "HP-OfficeJet-Pro", "", "known", false, false, false, 600, 0),
+    Device("F4:F5:D8:77:66:55", "192.168.2.80", "Chromecast", "Google Inc.", "known", false, false, true, 0, 9),
+    Device("AE:22:10:5B:01:02", "192.168.2.48", "", "", "private", true, false, true, 0, 9),
+)
+
+fun mapTests() {
+    val info = Parse.map(MAP_INFO)
+    val devs = lan()
+    eq(NetMap.kindOf(devs[2]), "phone", "phone by name")
+    eq(NetMap.kindOf(devs[3]), "nas", "storage by name")
+    eq(NetMap.kindOf(devs[4]), "iot", "smart home by maker")
+    eq(NetMap.kindOf(devs[5]), "print", "printer by name")
+    eq(NetMap.kindOf(devs[6]), "media", "media by name")
+    eq(NetMap.kindOf(devs[7]), "priv", "private, nothing else known")
+    eq(NetMap.kindOf(Device("00:00:00:00:00:01", "1", "", "", "known", false, false, true, 0, 0)), "other", "not identified")
+    for (w in listOf(320.0, 360.0, 412.0, 800.0)) for (byStatus in listOf(false, true)) for (off in listOf(false, true)) {
+        val p = NetMap.plan(info, devs, byStatus, off, w)!!
+        val what = "w=$w status=$byStatus off=$off"
+        check(p.groups.first().wifi, "$what: your Wi-Fi first")
+        eq(p.groups.first().items.last().me, true, "$what: the board is in its Wi-Fi bubble")
+        val shown = p.items.count { it.device != null && !it.me }
+        eq(shown, devs.count { !it.self && it.ip != info.gateway && (off || it.online) }, "$what: every device but the router and the board")
+        for (i in p.groups.indices) for (j in i + 1 until p.groups.size) {
+            val a = p.groups[i]; val b = p.groups[j]
+            check(Math.hypot(a.x - b.x, a.y - b.y) >= a.r + b.r + 10 - 1e-9, "$what: bubbles ${a.key} and ${b.key} overlap")
+        }
+        for (g in p.groups) for (it in g.items) check(Math.hypot(it.x - g.x, it.y - g.y) <= g.r, "$what: a dot outside ${g.key}")
+        check(p.scale > 0 && p.scale <= 1.25 + 1e-9, "$what: scale")
+        check(p.box[2] > 0 && p.box[3] > 0, "$what: box")
+        val first = p.groups[1].items[0]
+        val hit = NetMap.hit(p, first.x + 1, first.y, 18.0)
+        check(hit is NetMap.Hit.Dot && hit.item === first, "$what: tap on a dot")
+        check(NetMap.hit(p, 0.0, 0.0, 1.0) is NetMap.Hit.Router, "$what: tap on the router")
+        check(NetMap.hit(p, 0.0, p.iy, 1.0) is NetMap.Hit.Internet, "$what: tap on the internet")
+        eq(NetMap.hit(p, p.box[0] + 1, p.box[1] + 1, 1.0), null, "$what: tap on nothing")
+    }
+    val byStatus = NetMap.plan(info, devs, true, true, 360.0)!!
+    eq(byStatus.groups.map { it.key }, listOf("wifi", "unknown", "private", "known", "off"), "status groups in order")
+    eq(NetMap.plan(info.copy(wifi = "softap"), devs, false, false, 360.0), null, "nothing to map in setup mode")
+    val h = Parse.health("""{"status":"ok","version":"0.9.6","wifi":"connected","ssid":"HOME","ip":"192.168.2.30","gateway":"192.168.2.1","subnet":"192.168.2.0/24","rssi":-40,"uptime_s":5}""")
+    val old = NetMap.fromHealth(h, devs)
+    eq(old.fromBoard, false, "map from health")
+    eq(old.mac, "D4:E9:F4:12:34:56", "board mac from the device list")
+    val op = NetMap.plan(old, devs, false, false, 360.0)!!
+    eq(op.groups.first().aps.size, 0, "no access points without the board's map")
+    eq(NetMap.wrap("Phones and tablets", 12), listOf("Phones and", "tablets"), "wrap")
+}
+
+fun parityTests() {
+    val path = System.getenv("PARITY") ?: "parity.json"
+    val f = File(path)
+    if (!f.exists()) { println("skip parity: $path missing (tools/test/web_parity.py makes it)"); return }
+    val root = JSONObject(f.readText())
+    val nb = root.getJSONObject("nearby")
+    val cal = Calibration()
+    val metres = nb.getJSONArray("metres")
+    for (i in 0 until metres.length()) {
+        val r = metres.getJSONArray(i)
+        near(Air.metres(r.getInt(0), false, cal), r.getDouble(1), "web metres wifi ${r.getInt(0)}")
+        near(Air.metres(r.getInt(0), true, cal), r.getDouble(2), "web metres ble ${r.getInt(0)}")
+    }
+    val bearing = nb.getJSONArray("bearing")
+    for (i in 0 until bearing.length()) {
+        val b = bearing.getJSONArray(i)
+        near(Air.bearing(b.getString(0)), b.getDouble(1), "web bearing ${b.getString(0)}", 1e-12)
+    }
+    val fd = nb.getJSONArray("fdist")
+    for (i in 0 until fd.length()) {
+        val x = fd.getJSONArray(i)
+        eq(Air.distance(x.getDouble(0)), x.getString(1), "web distance ${x.getDouble(0)}")
+    }
+    val ts = nb.getJSONObject("trend")
+    val series = ts.getJSONArray("series")
+    val want = ts.getJSONArray("trend")
+    val tm = TrendMemory()
+    for (i in 0 until series.length()) {
+        tm.remember(mapOf("T" to series.getInt(i)))
+        eq(tm.trend("T"), want.getInt(i), "web trend step $i")
+    }
+    val fin = nb.getJSONObject("finder")
+    val now = 1_800_000_000_000L
+    val track = FinderTrack()
+    track.sinceMs = now - 30_000
+    val rd = fin.getJSONArray("readings")
+    for (i in 0 until rd.length()) {
+        val x = rd.getJSONArray(i)
+        track.add(now + x.getLong(0), x.getInt(1))
+        val p = track.points.last()
+        near(p.m, x.getDouble(2), "web median $i")
+        near(p.e, x.getDouble(3), "web smoothed $i")
+    }
+    near(track.trend(now)!!, fin.getDouble("trend"), "web trend")
+    eq(track.rate(now), fin.getInt("rate"), "web rate")
+    eq(track.value(), fin.getInt("now"), "web value")
+    val hot = nb.getJSONArray("hot")
+    for (i in 0 until hot.length()) {
+        val x = hot.getJSONArray(i)
+        near(FinderMath.hot(x.getDouble(0)), x.getDouble(1), "web hot ${x.getDouble(0)}")
+        eq(FinderMath.prox(x.getDouble(0)), x.getString(2), "web prox ${x.getDouble(0)}")
+        eq(FinderMath.big(x.getDouble(0)), x.getString(3), "web big ${x.getDouble(0)}")
+    }
+    for (name in listOf("direction", "flat", "partial")) {
+        val o = nb.getJSONObject(name)
+        val pa = o.getJSONArray("pts")
+        val pts = (0 until pa.length()).map { FinderMath.TurnPoint(pa.getJSONArray(it).getDouble(0), pa.getJSONArray(it).getInt(1)) }
+        val d = FinderMath.direction(pts)
+        eq(d.ok, o.getBoolean("ok"), "web $name ok")
+        if (o.has("a")) near(d.a, o.getDouble("a"), "web $name angle")
+        if (o.has("contrast")) near(d.contrast, o.getDouble("contrast"), "web $name contrast")
+        if (o.has("gap")) near(d.gap, o.getDouble("gap"), "web $name gap")
+        if (o.has("curve")) {
+            val cv = o.getJSONArray("curve")
+            for (k in 0 until cv.length()) {
+                val v = d.curve[k]
+                if (cv.isNull(k)) eq(v, null, "web $name curve $k") else near(v!!, cv.getDouble(k), "web $name curve $k")
+            }
+        }
+        eq(FinderMath.dirText(d), o.getString("text"), "web $name text")
+    }
+    eq(FinderMath.dirText(FinderMath.direction(listOf(FinderMath.TurnPoint(0.0, -60), FinderMath.TurnPoint(1.0, -61)))),
+        nb.getJSONObject("few").getString("text"), "web few text")
+
+    val mp = root.getJSONObject("map")
+    val input = root.getJSONObject("map_input")
+    val info = Parse.map(input.getJSONObject("map").toString())
+    val devs = Parse.devices(input.getJSONArray("devices").toString())
+    val kinds = mp.getJSONArray("kinds")
+    for (i in 0 until kinds.length()) {
+        val k = kinds.getJSONArray(i)
+        eq(NetMap.kindOf(devs.first { it.mac == k.getString(0) }), k.getString(1), "web kind ${k.getString(0)}")
+    }
+    val wraps = mp.getJSONArray("wrap")
+    for (i in 0 until wraps.length()) {
+        val w = wraps.getJSONArray(i)
+        val lines = w.getJSONArray(2)
+        eq(NetMap.wrap(w.getString(0), w.getInt(1)), (0 until lines.length()).map { lines.getString(it) }, "web wrap ${w.getString(0)}")
+    }
+    val cases = mp.getJSONArray("cases")
+    for (i in 0 until cases.length()) {
+        val cs = cases.getJSONObject(i)
+        val label = "web map " + cs.getString("label")
+        val p = NetMap.plan(info, devs, cs.getString("by") == "status", cs.getBoolean("off"), cs.getDouble("W"))!!
+        near(p.ringR, cs.getDouble("R"), "$label ring", 1e-9)
+        near(p.iy, cs.getDouble("iy"), "$label internet", 1e-9)
+        near(p.scale, cs.getDouble("scale"), "$label scale", 1e-9)
+        val box = cs.getJSONArray("box")
+        for (k in 0 until 4) near(p.box[k], box.getDouble(k), "$label box $k", 1e-9)
+        val gs = cs.getJSONArray("groups")
+        eq(p.groups.size, gs.length(), "$label groups")
+        for (g in 0 until minOf(gs.length(), p.groups.size)) {
+            val wg = gs.getJSONObject(g)
+            val ag = p.groups[g]
+            eq(ag.key, wg.getString("key"), "$label group $g key")
+            eq(ag.title, wg.getString("title"), "$label group $g title")
+            near(ag.r, wg.getDouble("r"), "$label group $g r")
+            near(ag.x, wg.getDouble("x"), "$label group $g x", 1e-9)
+            near(ag.y, wg.getDouble("y"), "$label group $g y", 1e-9)
+            near(ag.lw, wg.getDouble("lw"), "$label group $g lw")
+            val items = wg.getJSONArray("items")
+            eq(ag.items.size, items.length(), "$label group $g items")
+            for (k in 0 until minOf(items.length(), ag.items.size)) {
+                val wi = items.getJSONArray(k)
+                val ai = ag.items[k]
+                val id = when { ai.ap != null -> "ap:" + ai.ap!!.bssid; ai.me -> "me"; else -> "d:" + ai.device!!.mac }
+                eq(id, wi.getString(2), "$label group $g item $k")
+                near(ai.x, wi.getDouble(0), "$label group $g item $k x", 1e-9)
+                near(ai.y, wi.getDouble(1), "$label group $g item $k y", 1e-9)
+            }
+        }
+    }
+}
+
+fun nearbyClientTests() {
+    try { mock("/__reset", "POST") } catch (e: Exception) { return }
+    val c = NetmonClient(MOCK)
+    // Firmware before 0.10: no Nearby, no map, no update_max.
+    eq(throws<ApiException>("nearby on 0.9") { c.nearby() }?.status, 404, "nearby 404 on old firmware")
+    eq(throws<ApiException>("map on 0.9") { c.map() }?.status, 404, "map 404 on old firmware")
+    eq(c.config().updateMax, 0L, "no update_max on old firmware")
+    mock("/__fw?v=0.11", "POST")
+    eq(c.health().version, "0.11.0-finder", "0.11 board")
+    eq(c.config().updateMax, 1_966_080L, "update_max")
+    val n = c.nearby()
+    eq(n.wifi.size, 6, "nearby wifi, sent in chunks")
+    eq(n.wifi[2].ssid, "Corner \"Cafe\"", "escaped name through chunks")
+    eq(n.ble.size, 5, "nearby ble")
+    eq(c.nearbyConfig(), NearbyConfig(true, true, true, 120), "nearby config")
+    eq(c.setNearbyConfig(wifi = false).wifi, false, "wifi off")
+    eq(c.nearby().wifi.size, 0, "no wifi rows while off")
+    eq(throws<ApiException>("bad interval") { c.setNearbyConfig(backgroundS = 10) }?.message,
+        "the background interval must be 0, or 30 to 3600 seconds", "board's words for a bad interval")
+    eq(throws<ApiException>("wifi find while off") { c.findStart("wifi", "50:91:E3:12:34:56") }?.status, 409, "409 while wifi off")
+    c.setNearbyConfig(wifi = true, backgroundS = 300)
+    eq(c.nearbyConfig().backgroundS, 300, "background set")
+    c.nearbyScan()
+
+    eq(throws<ApiException>("unknown device") { c.findStart("ble", "00:11:22:33:44:55") }?.message,
+        "That device has not been heard in the last five minutes.", "404 words")
+    eq(throws<ApiException>("bad type") { c.findStart("zigbee", "00:11:22:33:44:55") }?.status, 400, "400 bad type")
+    val s = c.findStart("ble", "C4:9E:11:22:33:44")
+    eq(s.active, true, "finding")
+    eq(s.name, "Tile", "finding name")
+    eq(s.dtype, "tracker", "finding kind")
+    eq(c.nearby().finding?.addr, "C4:9E:11:22:33:44", "nearby says what is being found")
+    Thread.sleep(1300)
+    val r1 = c.find(s.seq)
+    check(r1.readings.size >= 2, "readings arrive (${r1.readings.size})")
+    check(r1.readings.all { it.seq > s.seq && it.msAgo >= 0 }, "only new readings, with their age")
+    check(r1.readings.zipWithNext().all { (a, b) -> b.seq == a.seq + 1 }, "readings in order")
+    eq(c.find(r1.seq).readings.size, 0, "nothing new yet")
+    val track = FinderTrack()
+    val got = System.currentTimeMillis()
+    for (r in r1.readings) track.add(got - r.msAgo, r.rssi)
+    check(track.value() != null, "readings feed the smoothing")
+    val held = c.findStart("ble", "C4:9E:11:22:33:44", 30)
+    check(held.holdMs in 1..30_000, "a turn holds the sweep (${held.holdMs})")
+    eq(c.findStart("ble", "C4:9E:11:22:33:44", 0).holdMs, 0L, "and lets it go")
+    eq(c.findStart("ble", "C4:9E:11:22:33:44", 30).holdMs, 0L, "once in two minutes")
+    mock("/__find?other=1", "POST")
+    check(c.find(0).addr != "C4:9E:11:22:33:44", "another page took the Finder")
+    mock("/__find?idle=1", "POST")
+    eq(c.find(0).active, false, "unasked for 15 s, the Finder stops")
+    val w = c.findStart("wifi", "50:91:E3:12:34:56")
+    eq(w.ch, 6, "wifi finder channel")
+    eq(c.findStop().active, false, "stopped")
+    val m = c.map()
+    eq(m.aps.size, 2, "map access points")
+    eq(m.isp.isp, "Example Telecom Ltd", "map provider")
+    val plan = NetMap.plan(m, c.devices(), false, false, 360.0)
+    check(plan != null && plan.groups.isNotEmpty(), "the mock board's network maps")
     mock("/__reset", "POST")
 }

@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- The Finder buzzes once when you are within arm's reach of the device. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- The monitor serves plain HTTP on the local network, so cleartext is allowed. -->
     <application

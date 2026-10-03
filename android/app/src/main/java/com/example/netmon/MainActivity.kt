@@ -34,6 +34,7 @@ import com.example.netmon.ui.EventsScreen
 import com.example.netmon.ui.Fonts
 import com.example.netmon.ui.InternetScreen
 import com.example.netmon.ui.MATCH
+import com.example.netmon.ui.NearbyScreen
 import com.example.netmon.ui.OverviewScreen
 import com.example.netmon.ui.Screen
 import com.example.netmon.ui.SettingsScreen
@@ -55,9 +56,10 @@ class MainActivity : Activity() {
     companion object {
         const val TAB_OVERVIEW = 0
         const val TAB_DEVICES = 1
-        const val TAB_EVENTS = 2
-        const val TAB_INTERNET = 3
-        const val TAB_SETTINGS = 4
+        const val TAB_NEARBY = 2
+        const val TAB_EVENTS = 3
+        const val TAB_INTERNET = 4
+        const val TAB_SETTINGS = 5
         private const val POLL_MS = 10_000L
         private const val REQ_FILE = 11
         private const val REQ_NOTIFY = 12
@@ -85,6 +87,17 @@ class MainActivity : Activity() {
             handler.postDelayed(this, POLL_MS)
         }
     }
+    // The quicker readings a screen asks for, such as the Nearby tables.
+    private val fastTick = object : Runnable {
+        override fun run() {
+            val s = showing
+            if (s == null || s is ConnectScreen || s.fastParts.isEmpty() || s.fastMs <= 0) return
+            Board.refresh(s.fastParts)
+            handler.postDelayed(this, s.fastMs)
+        }
+    }
+    private var resumed = false
+    private val awake = HashSet<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,7 +117,8 @@ class MainActivity : Activity() {
         setContentView(root)
         applyInsets(root)
 
-        screens = listOf(OverviewScreen(this), DevicesScreen(this), EventsScreen(this), InternetScreen(this), SettingsScreen(this))
+        screens = listOf(OverviewScreen(this), DevicesScreen(this), NearbyScreen(this), EventsScreen(this),
+            InternetScreen(this), SettingsScreen(this))
 
         val savedTab = savedInstanceState?.getInt(STATE_TAB, TAB_OVERVIEW) ?: TAB_OVERVIEW
         if (Board.base == null) showConnect() else showTab(tabFrom(intent) ?: savedTab)
@@ -114,16 +128,22 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         Board.addListener(boardListener)
         handler.removeCallbacks(tick)
         handler.post(tick)
+        restartFastPoll()
+        showing?.onResume()
         onBoardChanged()
     }
 
     override fun onPause() {
         super.onPause()
+        resumed = false
         Board.removeListener(boardListener)
         handler.removeCallbacks(tick)
+        handler.removeCallbacks(fastTick)
+        showing?.onPause()
         AppState.flushLatency()
     }
 
@@ -147,6 +167,7 @@ class MainActivity : Activity() {
 
     private fun tabFrom(i: Intent?): Int? = when (i?.getStringExtra(Alerts.EXTRA_TAB)) {
         "devices" -> TAB_DEVICES
+        "nearby" -> TAB_NEARBY
         "events" -> TAB_EVENTS
         else -> null
     }
@@ -185,6 +206,7 @@ class MainActivity : Activity() {
         val items = listOf(
             R.drawable.ic_nav_overview to "Overview",
             R.drawable.ic_nav_devices to "Devices",
+            R.drawable.ic_nav_nearby to "Nearby",
             R.drawable.ic_nav_events to "Events",
             R.drawable.ic_nav_internet to "Internet",
             R.drawable.ic_nav_settings to "Settings",
@@ -199,10 +221,15 @@ class MainActivity : Activity() {
             val iv = ImageView(this)
             iv.setImageResource(icon)
             iv.scaleType = ImageView.ScaleType.CENTER
-            item.add(iv, dp(56), dp(30))
+            // Six destinations share the width: the pill behind the selected
+            // icon is never wider than its slot leaves room for.
+            item.add(iv, dp(52), dp(30))
             val tv = label(text, 11.5f, T.TEXT2)
             tv.gravity = Gravity.CENTER
-            item.add(tv, WRAP, WRAP, top = 3)
+            tv.maxLines = 1
+            // With a large font setting a label shrinks to fit rather than wrap.
+            tv.setAutoSizeTextTypeUniformWithConfiguration(8, 12, 1, TypedValue.COMPLEX_UNIT_SP)
+            item.add(tv, MATCH, dp(18), top = 2)
             item.setOnClickListener { showTab(i) }
             navIcons.add(iv)
             navLabels.add(tv)
@@ -271,12 +298,34 @@ class MainActivity : Activity() {
         switchTo(screens[tab])
         styleNav()
         poll()
+        restartFastPoll()
+    }
+
+    /** Starts, or restarts at a new pace, the quicker readings the showing screen asks for. */
+    fun restartFastPoll() {
+        handler.removeCallbacks(fastTick)
+        val s = showing ?: return
+        if (!resumed || s is ConnectScreen || s.fastParts.isEmpty() || s.fastMs <= 0) return
+        handler.post(fastTick)
+    }
+
+    /** Opens the Finder for one device: from the map, or from anywhere else that names one. */
+    fun openFinder(type: String, addr: String) {
+        if (Board.base == null) return
+        showTab(TAB_NEARBY)
+        (screens[TAB_NEARBY] as NearbyScreen).find(type, addr)
+    }
+
+    /** Shows one device's details, as the Devices list does. */
+    fun showDevice(mac: String) {
+        (screens[TAB_DEVICES] as DevicesScreen).detailFor(mac)
     }
 
     fun showConnect() {
         val c = connect ?: ConnectScreen(this).also { connect = it }
         nav.visibility = View.GONE
         switchTo(c)
+        restartFastPoll()
     }
 
     /** Leaves the connect screen, if there is a board to go back to. */
@@ -358,8 +407,13 @@ class MainActivity : Activity() {
         }
     }
 
-    fun keepScreenOn(on: Boolean) {
-        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    /**
+     * Keeps the screen on while anything asks for it: a firmware upload, or
+     * the Finder while you walk with the phone in hand.
+     */
+    fun keepScreenOn(who: String, on: Boolean) {
+        if (on) awake.add(who) else awake.remove(who)
+        if (awake.isNotEmpty()) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 

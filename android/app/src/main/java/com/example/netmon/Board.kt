@@ -19,7 +19,7 @@ import java.util.concurrent.Executors
  */
 object Board {
 
-    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP }
+    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP, NEARBY, NEARBY_CONFIG, MAP }
 
     enum class Link { NONE, CONNECTING, LIVE, LOST }
 
@@ -48,9 +48,20 @@ object Board {
         private set
     var dhcp: DhcpStatus? = null
         private set
+    var nearby: Nearby? = null
+        private set
+    /** When [nearby] was read, phone clock. */
+    var nearbyAtMs = 0L
+        private set
+    var nearbyConfig: NearbyConfig? = null
+        private set
+    var map: MapInfo? = null
+        private set
 
     /** Readings that failed for a reason other than the board being unreachable. */
     val partErrors = EnumMap<Part, String>(Part::class.java)
+    /** The HTTP status behind each of [partErrors], when there was one: 404 means the firmware lacks it. */
+    val partStatus = EnumMap<Part, Int>(Part::class.java)
     var lastOkMs = 0L
         private set
     var lastError: String? = null
@@ -105,7 +116,9 @@ object Board {
         generation++
         health = null; devices = null; latency = null; isp = null
         config = null; networks = null; dhcp = null
+        nearby = null; nearbyAtMs = 0L; nearbyConfig = null; map = null
         partErrors.clear()
+        partStatus.clear()
         lastOkMs = 0L; lastError = null; failures = 0
         synchronized(queued) { queued.clear() }
     }
@@ -199,6 +212,19 @@ object Board {
                 val d = c.dhcp()
                 publish(gen, part) { dhcp = d }
             }
+            Part.NEARBY -> {
+                val n = c.nearby()
+                val at = System.currentTimeMillis()
+                publish(gen, part) { nearby = n; nearbyAtMs = at }
+            }
+            Part.NEARBY_CONFIG -> {
+                val n = c.nearbyConfig()
+                publish(gen, part) { nearbyConfig = n }
+            }
+            Part.MAP -> {
+                val m = c.map()
+                publish(gen, part) { map = m }
+            }
         }
     }
 
@@ -207,6 +233,7 @@ object Board {
             if (gen != generation) return@post
             set()
             partErrors.remove(part)
+            partStatus.remove(part)
             failures = 0
             lastOkMs = System.currentTimeMillis()
             lastError = null
@@ -220,7 +247,10 @@ object Board {
                 failures++
                 lastError = e.message
             }
-            else -> partErrors[part] = e.message ?: "Something went wrong."
+            else -> {
+                partErrors[part] = e.message ?: "Something went wrong."
+                if (e.status != 0) partStatus[part] = e.status else partStatus.remove(part)
+            }
         }
         changed()
     }
@@ -268,4 +298,8 @@ object Board {
     /** Lets the screens set readings they fetched themselves, such as a forced ISP lookup. */
     fun setIsp(i: Isp) { isp = i; changed() }
     fun setNetworks(n: List<SavedNetwork>) { networks = n; changed() }
+    fun setNearbyConfig(c: NearbyConfig) { nearbyConfig = c; changed() }
+
+    /** True when the last try at [part] was answered 404: this board's firmware does not have it. */
+    fun missing(part: Part): Boolean = partStatus[part] == 404
 }

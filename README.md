@@ -6,7 +6,7 @@ Bluetooth around it. You use it through web pages that the board serves
 itself, and those pages never load anything from the internet.
 
 - **Firmware** 0.11.0-finder for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
-- **Android app** 1.0.0 (optional). It reads the same HTTP API, keeps a longer event history on the phone, sends notifications and can update the firmware.
+- **Android app** 1.1.0 (optional). It reads the same HTTP API and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications and can update the firmware.
 
 <table>
   <tr>
@@ -47,7 +47,9 @@ also identifies device kinds from Bluetooth advertisements (AirPods, Find My
 trackers, Tile, Windows laptops, Flipper Zero and others). The **Finder** tab
 helps you walk up to one device, such as a lost tracker. It shows a smoothed
 distance and whether you're getting warmer or colder. Turn slowly on the spot
-with the board held against your chest and it also gives a direction.
+with the board held against your chest and it also gives a direction. In the
+Android app the phone follows that turn with its own rotation sensor, and an
+arrow keeps pointing the way afterwards.
 
 **Events** (`/events`) lists devices that appeared, went offline or came back.
 **Internet** (`/isp`) shows your public address and provider, plus the
@@ -185,7 +187,6 @@ that added it.
 - Distances worked out from signal strength are rough. The Finder's direction
   depends on your body blocking the signal, so it's a hint, not a bearing.
 - Map groups are guesses from names and a small built-in list of makers.
-- The Android app doesn't show Nearby, the Finder or the Map.
 
 ## Tests
 

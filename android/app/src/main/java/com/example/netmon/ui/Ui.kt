@@ -21,37 +21,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/**
- * The look, in one place. Pure black canvas, charcoal surfaces, a white-to-grey
- * text ladder and one amber accent for whatever can be pressed. Status colours
- * match the board's own web pages, except "private", which moves off amber so
- * it never reads as something to tap.
- */
-object T {
-    const val BG = 0xFF000000.toInt()
-    const val SURFACE = 0xFF141414.toInt()
-    const val RAISED = 0xFF1F1F1F.toInt()
-    const val EDGE = 0xFF2A2A2A.toInt()
-    const val TEXT = 0xFFF2F2F2.toInt()
-    const val TEXT2 = 0xFFA6A6A6.toInt()
-    const val TEXT3 = 0xFF6E6E6E.toInt()
-    const val ACCENT = 0xFFFFB020.toInt()
-    const val ACCENT_TINT = 0xFF2B2110.toInt()
-    const val ON_ACCENT = 0xFF1A1200.toInt()
-    const val OK = 0xFF4FD18B.toInt()
-    const val BAD = 0xFFF0605F.toInt()
-    const val WARN = 0xFFF0924A.toInt()
-    const val PRIVATE = 0xFF8AB4F8.toInt()
-    const val OFFLINE = 0xFF555555.toInt()
-
-    fun status(status: String, online: Boolean): Int = when {
-        !online -> OFFLINE
-        status == "unknown" -> BAD
-        status == "private" -> PRIVATE
-        else -> OK
-    }
-}
-
 object Fonts {
     val regular: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
     val medium: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -274,4 +243,83 @@ fun Context.dialog(title: String?, body: View?, positive: String?, onPositive: (
     val d = b.create()
     d.show()
     return d
+}
+
+/** Centres a view across its LinearLayout parent; call after adding it. */
+fun <V : View> V.centred(): V {
+    (layoutParams as? LinearLayout.LayoutParams)?.gravity = Gravity.CENTER_HORIZONTAL
+    return this
+}
+
+/** Sets text only when it differs, so a screen refreshed every few seconds does not relayout for nothing. */
+fun TextView.put(s: CharSequence) {
+    if (text.toString() != s.toString()) text = s
+}
+
+fun TextView.put(s: CharSequence, color: Int) {
+    put(s)
+    if (currentTextColor != color) setTextColor(color)
+}
+
+fun View.shown(on: Boolean) {
+    val v = if (on) View.VISIBLE else View.GONE
+    if (visibility != v) visibility = v
+}
+
+/** A label and a switch on one line, in the app's colours. */
+fun Context.switchRow(text: String, checked: Boolean, onChange: (Boolean) -> Unit): Pair<LinearLayout, android.widget.Switch> {
+    val r = row()
+    r.minimumHeight = dp(44)
+    r.add(label(text, 15f, T.TEXT), 0, WRAP, weight = 1f)
+    val sw = android.widget.Switch(this)
+    sw.isChecked = checked
+    sw.thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(T.ACCENT, T.TEXT2))
+    sw.trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(0x88FFB020.toInt(), T.EDGE))
+    sw.contentDescription = text
+    sw.setOnCheckedChangeListener { _, on -> onChange(on) }
+    r.add(sw, WRAP, WRAP, start = 8)
+    return r to sw
+}
+
+/**
+ * Rows kept by key and moved, not rebuilt. A list that refreshes every few
+ * seconds and re-sorts as signals move would otherwise be torn down under a
+ * finger: a tap that straddled a refresh could miss, or land on the row that
+ * had just moved there. Each row carries its own divider, shown from the
+ * second row on.
+ */
+class KeyedRows<H : KeyedRows.Holder>(private val box: LinearLayout, private val create: () -> H) {
+
+    abstract class Holder(context: Context) {
+        val view: LinearLayout = context.column()
+        val divider: View = context.divider()
+        init {
+            view.add(divider, MATCH, maxOf(1, context.dp(1) / 2))
+        }
+    }
+
+    private val held = HashMap<String, H>()
+
+    fun <X> show(items: List<X>, keyOf: (X) -> String, bind: (H, X) -> Unit) {
+        val keep = HashSet<String>()
+        for (x in items) {
+            val k = keyOf(x)
+            if (!keep.add(k)) continue
+            val h = held.getOrPut(k) { create() }
+            bind(h, x)
+            h.divider.shown(keep.size > 1)
+            val at = keep.size - 1
+            if (box.getChildAt(at) !== h.view) {
+                (h.view.parent as? ViewGroup)?.removeView(h.view)
+                box.addView(h.view, at, LinearLayout.LayoutParams(MATCH, WRAP))
+            }
+        }
+        while (box.childCount > keep.size) box.removeViewAt(box.childCount - 1)
+        held.keys.retainAll(keep)
+    }
+
+    fun clear() {
+        box.removeAllViews()
+        held.clear()
+    }
 }

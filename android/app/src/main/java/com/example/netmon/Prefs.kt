@@ -40,6 +40,85 @@ class Prefs(context: Context) {
         get() = sp.getString("event_filter", "all") ?: "all"
         set(v) = sp.edit().putString("event_filter", v).apply()
 
+    // --- Nearby, the Finder and the map --------------------------------------
+
+    /** wifi, bluetooth or finder. */
+    var nearbyTab: String
+        get() = sp.getString("nearby_tab", "wifi") ?: "wifi"
+        set(v) = sp.edit().putString("nearby_tab", v).apply()
+
+    /** A radar's scale in metres, 0 for plain signal strength. */
+    fun radarScale(ble: Boolean): Int =
+        sp.getInt(if (ble) "radar_ble" else "radar_wifi", if (ble) 20 else 30).let { if (it in Air.SCALES) it else if (ble) 20 else 30 }
+
+    fun setRadarScale(ble: Boolean, m: Int) = sp.edit().putInt(if (ble) "radar_ble" else "radar_wifi", m).apply()
+
+    /** Bluetooth colour groups switched off in the legend. */
+    var hiddenGroups: Set<String>
+        get() = (sp.getString("hidden_groups", "") ?: "").split(',').filter { it in Air.GROUPS }.toSet()
+        set(v) = sp.edit().putString("hidden_groups", v.joinToString(",")).apply()
+
+    var hidePrivate: Boolean
+        get() = sp.getBoolean("hide_private", false)
+        set(v) = sp.edit().putBoolean("hide_private", v).apply()
+
+    var masked: Boolean
+        get() = sp.getBoolean("masked", false)
+        set(v) = sp.edit().putBoolean("masked", v).apply()
+
+    var calibration: Calibration
+        get() {
+            val d = Calibration()
+            fun f(k: String, def: Double, ok: (Double) -> Boolean): Double {
+                val v = sp.getFloat(k, Float.NaN).toDouble()
+                return if (!v.isNaN() && ok(v)) v else def
+            }
+            return Calibration(
+                f("cal_wp", d.wifiAt1m) { Calibration.atOneMetreOk(it) },
+                f("cal_wn", d.wifiFalloff) { Calibration.falloffOk(it) },
+                f("cal_bp", d.bleAt1m) { Calibration.atOneMetreOk(it) },
+                f("cal_bn", d.bleFalloff) { Calibration.falloffOk(it) },
+            )
+        }
+        set(c) = sp.edit()
+            .putFloat("cal_wp", c.wifiAt1m.toFloat()).putFloat("cal_wn", c.wifiFalloff.toFloat())
+            .putFloat("cal_bp", c.bleAt1m.toFloat()).putFloat("cal_bn", c.bleFalloff.toFloat())
+            .apply()
+
+    fun resetCalibration() = sp.edit().remove("cal_wp").remove("cal_wn").remove("cal_bp").remove("cal_bn").apply()
+
+    /** How a Nearby list is sorted: rssi, name, ch, kind or age. */
+    fun nearbySort(list: String, def: String): String = sp.getString("sort_$list", def) ?: def
+
+    fun setNearbySort(list: String, key: String) = sp.edit().putString("sort_$list", key).apply()
+
+    /** The device the Finder was last asked for, "ble|AA:BB:..." or "wifi|...", kept so it can carry on. */
+    var finderTarget: String?
+        get() = sp.getString("finder_target", null)
+        set(v) = sp.edit().putString("finder_target", v).apply()
+
+    var finderSound: Boolean
+        get() = sp.getBoolean("finder_sound", false)
+        set(v) = sp.edit().putBoolean("finder_sound", v).apply()
+
+    /** The Finder's picker: t trackers, b Bluetooth, w Wi-Fi. */
+    var finderPick: String
+        get() = sp.getString("finder_pick", "") ?: ""
+        set(v) = sp.edit().putString("finder_pick", v).apply()
+
+    /** list or map. */
+    var devicesView: String
+        get() = sp.getString("devices_view", "list") ?: "list"
+        set(v) = sp.edit().putString("devices_view", v).apply()
+
+    var mapByStatus: Boolean
+        get() = sp.getBoolean("map_by_status", false)
+        set(v) = sp.edit().putBoolean("map_by_status", v).apply()
+
+    var mapOffline: Boolean
+        get() = sp.getBoolean("map_offline", false)
+        set(v) = sp.edit().putBoolean("map_offline", v).apply()
+
     // Insertion order matters (oldest are dropped first), and a StringSet does
     // not keep it, so the MAC lists are stored as one comma-separated string.
     fun loadAlertMemory(): AlertMemory = AlertMemory(

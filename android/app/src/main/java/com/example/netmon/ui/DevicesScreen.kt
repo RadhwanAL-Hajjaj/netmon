@@ -24,7 +24,16 @@ import com.example.netmon.MainActivity
 
 class DevicesScreen(host: MainActivity) : Screen(host) {
 
-    override val parts = listOf(Board.Part.HEALTH, Board.Part.DEVICES)
+    override val parts: List<Board.Part>
+        get() = if (mapMode) listOf(Board.Part.HEALTH, Board.Part.DEVICES, Board.Part.MAP)
+        else listOf(Board.Part.HEALTH, Board.Part.DEVICES)
+
+    private var mapMode = AppState.prefs.devicesView == "map"
+    private val mapPane = MapPane(host)
+    private lateinit var listChip: TextView
+    private lateinit var mapChip: TextView
+    private lateinit var listPart: LinearLayout
+    private lateinit var mapPart: View
 
     private enum class Filter(val key: String, val title: String) {
         ALL("all", "All"), ONLINE("online", "Online"), UNKNOWN("unknown", "Unrecognised"),
@@ -49,9 +58,17 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
 
     override fun build(): View {
         val c = ctx
-        val col = c.column()
+        val outer = c.column()
+        val vr = outer.add(c.row(), top = 8)
+        listChip = vr.add(c.chip("List", !mapMode) { setMode(false) }, WRAP, WRAP)
+        mapChip = vr.add(c.chip("Map", mapMode) { setMode(true) }, WRAP, WRAP, start = 8)
+        listPart = outer.add(c.column())
+        mapPart = outer.add(mapPane.build())
+        listPart.visibility = if (mapMode) View.GONE else View.VISIBLE
+        mapPart.visibility = if (mapMode) View.VISIBLE else View.GONE
+        val col = listPart
 
-        search = col.add(c.input("Search name, address or maker", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS), top = 8)
+        search = col.add(c.input("Search name, address or maker", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS), top = 12)
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -88,8 +105,28 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
         col.add(c.hint("Names come from DHCP, so a device shows its name after it next joins the network. " +
             "Marks on the left: green known, blue private address, red unrecognised, grey offline."), top = 14)
 
-        return c.page(col)
+        return c.page(outer)
     }
+
+    private fun setMode(map: Boolean) {
+        if (map == mapMode) return
+        mapMode = map
+        AppState.prefs.devicesView = if (map) "map" else "list"
+        listChip.styleChip(!map)
+        mapChip.styleChip(map)
+        listPart.visibility = if (map) View.GONE else View.VISIBLE
+        mapPart.visibility = if (map) View.VISIBLE else View.GONE
+        if (map) Board.refresh(Board.Part.MAP, Board.Part.DEVICES)
+        render()
+    }
+
+    /** Shows one device's details, from the map or anywhere else that names it. */
+    fun detailFor(mac: String) {
+        val d = Board.devices?.firstOrNull { it.mac == mac.uppercase() } ?: return
+        showDetail(d)
+    }
+
+    override fun onBack(): Boolean = mapMode && mapPane.onBack()
 
     /** Opens a device's details once its row exists, as when arriving from a notification. */
     fun reveal(mac: String) {
@@ -145,6 +182,7 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
 
     override fun render() {
         if (!::listBox.isInitialized) return
+        if (mapMode) mapPane.render()
         val all = Board.devices
         sortButton.text = "By ${sort.title}"
 

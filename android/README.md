@@ -1,20 +1,25 @@
 # netmon for Android
 
 Companion app for the netmon ESP32 network monitor. It talks to the board's own
-HTTP API on your network: the same readings as the web pages, plus
+HTTP API on your network: the same readings as the web pages, including the
+Wi-Fi and Bluetooth radars, the Finder and the network map, plus
 notifications, a longer event history kept on the phone, and firmware updates
 from the phone.
 
-Version 1.0.0, for Android 8.0 and later. It was written against netmon
-firmware 0.9.x and works with later firmware too, since newer versions only add
-to the API; the Nearby, Finder and Map pages (0.10 and 0.11) are web-only.
-Network history needs firmware 0.9.4 or later, the DHCP listener status 0.9.6.
+Version 1.1.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
+and later, and shows what each board has: network history needs firmware 0.9.4
+or later, the DHCP listener status 0.9.6, Nearby 0.10, and the Finder and the
+access points on the map 0.11. On older firmware those screens say what they
+need instead.
 
 ## Install
 
 1. Build the APK (see [Building from source](#building-from-source)), copy it
    to the phone and open it. Android asks once to allow installs from the app
-   you opened it with (Files, Chrome, ...).
+   you opened it with (Files, Chrome, ...). An APK signed with the same key as
+   the one installed updates it in place and keeps the event history and
+   settings; one signed with another key has to replace it, which means
+   uninstalling the old one first.
 2. Start netmon. It looks for the monitor three ways at once: the address used
    last time, the board's mDNS adverts, and a sweep of the phone's subnet that
    asks each address for `/api/health`. Tap the monitor it finds, or type its
@@ -37,6 +42,57 @@ learned, free memory), gateway latency, and recent activity.
 **Devices.** Search by name, address or maker; filter by status; sort by
 address, name, status, maker or time online. Tap a device for its details, to
 copy its MAC or address, or to open its web page.
+
+*Map*, at the top of Devices, draws the network as the board's Map page does:
+the router in the middle, the internet above it, and around it a bubble per
+group of devices, by what they are (network gear, servers and storage,
+computers, phones and tablets, TV and media, printers, cameras, smart home,
+private addresses, not identified) or by whether they are recognised. Your
+Wi-Fi gets a bubble of its own with this board and the access points that
+carry your network's name. Tap a group for its devices, a dot for what the
+board knows about it, the router or the internet for theirs; an access point
+offers *Find it with the board*. Offline devices can be shown or left out.
+The layout is the web page's own, worked out the same way, so the two look
+alike. On firmware before 0.11 the map is drawn from the health report,
+without the access points and the provider.
+
+**Nearby.** What the board hears around it, read every three seconds while
+the screen is open, which is also what keeps the board scanning quickly:
+
+- *Wi-Fi*: a radar of the networks in range, scaled in metres (estimated from
+  signal strength, up to 5 to 100 m) or in signal strength itself. Open
+  networks are rings, the network the board is on has a second ring, a dot
+  pulses when a network arrives and leaves a fading ring when it goes. Tap a
+  dot for its details and a *Find it* button. Below: the networks in range,
+  with signal, a trend arrow, distance, channel and security, then the ones
+  heard earlier and gone.
+- *Bluetooth*: the same for Bluetooth devices, coloured by kind (personal,
+  trackers, home and things, not identified), with a switch per group and one
+  to hide private addresses. The kind and product come from the board's own
+  reading of each advertisement ("AirPods Pro", "Find My tracker", ...).
+- A live log of arrivals and departures while the screen is open, and a search
+  box on each.
+- *Scanning on the board*: Wi-Fi and Bluetooth scanning on or off, how often the
+  board scans while nobody is watching, distance calibration, and masking of
+  names and addresses for screenshots.
+
+**Finder.** Pick a tracker, any Bluetooth device or an access point (or press
+*Find* beside one anywhere) and the board listens for that device alone. Take
+the board with you on a power bank and walk: the app shows the distance
+smoothed over about three seconds, warmer or colder from the trend over the
+last eight, a cold-to-hot bar, the last minute of signal, and optional beeps
+that quicken as you close in. The phone buzzes when you are within arm's
+reach, and the screen stays on while you look.
+
+For a direction, hold the board flat against your chest and turn on the spot:
+your body blocks the signal from behind you, so it is strongest when you face
+the device. On a phone with a rotation sensor the app follows your turn
+itself, so you can turn at your own pace either way round, and afterwards an
+arrow on the Finder's radar keeps pointing the way as you turn. Without one,
+the turn is timed, as on the web page: turn to your right in step with the
+hand. The arithmetic (smoothing, trend, direction) is the web page's own, so
+both give the same answer from the same readings. Leaving the Finder lets the
+board go back to scanning for everything.
 
 **Events.** The board keeps only its last 48 events, in RAM, and two ARP sweeps
 a minute take two of those slots, so a device event scrolls off within half an
@@ -104,10 +160,27 @@ Maven repository. Set `KS_PASS` (and `KEYSTORE`, if your keystore is not
 It refuses to package if any code could reach `invokedynamic`, which dx
 cannot convert for Android.
 
-**Tests:** `tools/test/CoreTest.kt` holds 231 checks of the parsers, formatting,
-settings validation, firmware checks, event history, alert rules and the HTTP
-client. `tools/mock_board.py` is a stand-in board that answers every endpoint
-the way the firmware does, including uploads and the restart that follows.
+Where the toolchain folder is not `../tc`, set `TOOLCHAIN`. kotlinc needs
+about 2 GB of heap for the API 35 jar; the script asks for that unless
+`JAVA_OPTS` says otherwise.
+
+**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 1962 checks of the
+parsers, formatting, settings validation, firmware checks, event history,
+alert rules, the Nearby, Finder and map logic, and the HTTP client against
+`tools/mock_board.py`, a stand-in board that answers every endpoint the way
+the firmware does, including uploads and the restart that follows (and, after
+`POST /__fw?v=0.11`, Nearby, the Finder and the map). Where node is installed,
+`tools/test/web_parity.py` first runs the board's own Nearby and Map page
+scripts from `pages.h` and the checks compare the app's distances, bearings,
+trend arrows, smoothing, warmer and colder, directions and map layouts with
+them, number for number. It needs Android's org.json for the JVM
+(`libandroid-json-java` on Debian and Ubuntu). Then `tools/test/beeper` checks
+the Finder's beeps against a stand-in for Android's audio track: one sound at
+a time however quickly they are stopped and started.
+
+`tools/test/shots.sh` draws the radars, the Finder, the signal trace and the
+map with the app's own drawing code and writes PNG files, for looking at a
+change without a phone (into `build-manual/shots` unless told otherwise).
 
 ## Layout
 
@@ -121,9 +194,15 @@ app/src/main/java/com/example/netmon/
   AlertRules.kt, Alerts.kt, AlertJobService.kt   notifications
   Discovery.kt, NetRoute.kt, Subnet.kt           finding the board
   Firmware.kt, Validate.kt, Format.kt            checks and wording
+  Nearby.kt               radar wording, distances, trend arrows, the live log
+  Finder.kt               the Finder's smoothing, trend and direction
+  NetMap.kt               the map's groups and layout
+  TurnSensor.kt, Beeper.kt   the phone's rotation sensor, the Finder's beeps
   CrashLog.kt             keeps a crash report to show on the next start
   MainActivity.kt         top bar, bottom bar, screens
   ui/                     screens, view helpers, charts
+  ui/Painters.kt          the drawing of the radars, the Finder and the map
+  ui/NearbyScreen.kt, ui/FinderPane.kt, ui/MapPane.kt   the new screens
 ```
 
 ## Notes
@@ -137,3 +216,23 @@ app/src/main/java/com/example/netmon/
   need a password.
 - If the app ever stops unexpectedly, the next start shows the error with a
   Copy button, so it can be sent along.
+- The Finder asks for no permission beyond vibration: the rotation sensor needs
+  none, and neither do the beeps. These play at media volume, as the web
+  page's do, so they sound with the phone on silent once you turn them on.
+
+## Changes
+
+**1.1.0**
+- Nearby: the Wi-Fi and Bluetooth radars, lists, live log and scanning
+  settings of the board's Nearby page.
+- The Finder, with a turn the phone follows with its own rotation sensor, an
+  arrow that keeps pointing the way afterwards, beeps and a buzz on arrival.
+- The network map, under Devices.
+- Firmware updates: the file check now uses the largest image the board says
+  it takes (`update_max`, firmware 0.10 and later). Before this the app refused
+  every 0.10 and 0.11 image as larger than the old 1.3 MB partition.
+- Six tabs: Overview, Devices, Nearby, Events, Internet, Settings.
+
+**1.0.0**
+- First release: overview, devices, events, internet, settings, notifications
+  and firmware updates.

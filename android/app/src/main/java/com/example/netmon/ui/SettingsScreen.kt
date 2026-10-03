@@ -534,6 +534,10 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
     fun loadImage(uri: Uri) {
         say(fwInfo, "Reading the file")
         val resolver = host.contentResolver
+        // From 0.10 the board says how large an image it takes; before that it
+        // is the default partition's 1,310,720 bytes. Settings not read yet:
+        // the largest netmon uses, and the board checks again itself.
+        val maxBytes = Board.config?.let { Firmware.limit(it.updateMax) } ?: Firmware.MINIMAL_SPIFFS_APP_BYTES
         Thread {
             var name = "firmware.bin"
             var size = -1L
@@ -549,7 +553,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
             var bytes: ByteArray? = null
             var problem: String?
             try {
-                val limit = Firmware.APP_PARTITION_BYTES + 1
+                val limit = Firmware.READ_LIMIT_BYTES + 1
                 val data = resolver.openInputStream(uri)?.use { input ->
                     val out = java.io.ByteArrayOutputStream()
                     val buf = ByteArray(16384)
@@ -564,7 +568,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
                     problem = "Could not open that file."
                 } else {
                     val len = if (size >= 0) maxOf(size, data.size.toLong()) else data.size.toLong()
-                    problem = Firmware.problem(name, len, if (data.isNotEmpty()) data[0].toInt() and 0xFF else null)
+                    problem = Firmware.problem(name, len, if (data.isNotEmpty()) data[0].toInt() and 0xFF else null, maxBytes)
                     if (problem == null) bytes = data
                     size = len
                 }
@@ -610,7 +614,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         val name = imageName
         uploading = true
         fwBtn.enabled(false)
-        host.keepScreenOn(true)
+        host.keepScreenOn("upload", true)
         say(fwMsg, "Checking the password")
 
         Thread {
@@ -658,7 +662,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
             main.post {
                 uploading = false
                 fwBtn.enabled(true)
-                host.keepScreenOn(false)
+                host.keepScreenOn("upload", false)
                 if (f != null) {
                     fwBar.visibility = View.GONE
                     say(fwMsg, f, T.BAD)
@@ -737,7 +741,8 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         card.add(c.cardTitle("About"))
         card.addKV("App", top = 10).set("netmon for Android ${BuildInfo.VERSION_NAME}")
         card.add(c.hint("Talks to the monitor's own web API; nothing leaves your network except the monitor's own " +
-            "provider lookup. Network history needs firmware 0.9.4 or later, and the DHCP listener status 0.9.6."), top = 8)
+            "provider lookup. Network history needs firmware 0.9.4 or later, the DHCP listener status 0.9.6, " +
+            "Nearby 0.10, and the Finder and the network map 0.11."), top = 8)
         return card
     }
 

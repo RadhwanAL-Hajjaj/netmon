@@ -114,6 +114,7 @@ object Parse {
             probeIntervalS = int("probe_interval_s", 30),
             offlineAfterS = int("offline_after_s", 180),
             learningWindowS = int("learning_window_s", 600),
+            updateMax = long("update_max"),
             active = a?.let {
                 ActiveLink(
                     ip = it.str("ip"),
@@ -199,7 +200,156 @@ object Parse {
 
     fun forgetBody(ssid: String): String = JSONObject().put("ssid", ssid).toString()
 
+    // --- Nearby, Finder and Map --------------------------------------------
+
+    fun nearby(text: String): Nearby = obj(text).run {
+        val f = optJSONObject("finding")
+        Nearby(
+            version = str("version"),
+            onLan = bool("on_lan", true),
+            sweeping = bool("sweeping"),
+            backgroundS = int("background_s"),
+            finding = f?.let { Finding(it.str("type"), it.str("addr").uppercase(), it.str("name")) },
+            wifiScan = airScan(optJSONObject("wifi_scan"), "scans"),
+            bleScan = airScan(optJSONObject("ble_scan"), "bursts"),
+            wifi = array(this, "wifi").map { o ->
+                NearbyAp(
+                    bssid = o.str("bssid").uppercase(),
+                    ssid = o.str("ssid"),
+                    ch = o.int("ch"),
+                    rssi = o.int("rssi", -100),
+                    security = o.str("security"),
+                    live = o.bool("live"),
+                    joined = o.bool("joined"),
+                    ageS = o.long("age_s"),
+                    knownS = o.long("known_s"),
+                )
+            }.filter { it.bssid.isNotEmpty() },
+            ble = array(this, "ble").map { o ->
+                NearbyBle(
+                    addr = o.str("addr").uppercase(),
+                    name = o.str("name"),
+                    vendor = o.str("vendor"),
+                    company = o.int("company", -1),
+                    kind = o.str("kind", "private"),
+                    type = o.str("type", "unknown").ifEmpty { "unknown" },
+                    sure = o.int("sure"),
+                    model = o.str("model"),
+                    rssi = o.int("rssi", -100),
+                    ageS = o.long("age_s"),
+                    knownS = o.long("known_s"),
+                    seen = o.long("seen"),
+                )
+            }.filter { it.addr.isNotEmpty() },
+        )
+    }
+
+    private fun airScan(o: JSONObject?, countKey: String): AirScan =
+        if (o == null) AirScan(false, "off", 0, 0, -1, 0, 0)
+        else AirScan(
+            enabled = o.bool("enabled"),
+            state = o.str("state", "idle"),
+            count = o.long(countKey),
+            failures = o.long("failures"),
+            ageS = o.long("age_s", -1),
+            tookMs = o.long("took_ms"),
+            dropped = o.long("dropped"),
+        )
+
+    fun nearbyConfig(text: String): NearbyConfig = obj(text).run {
+        NearbyConfig(
+            wifi = bool("wifi", true),
+            ble = bool("ble", true),
+            bleReady = bool("ble_ready", true),
+            backgroundS = int("background_s", 120),
+        )
+    }
+
+    /** Only the fields given are sent: the board leaves the others as they are. */
+    fun nearbyConfigBody(wifi: Boolean? = null, ble: Boolean? = null, backgroundS: Int? = null): String {
+        val o = JSONObject()
+        if (wifi != null) o.put("wifi", wifi)
+        if (ble != null) o.put("ble", ble)
+        if (backgroundS != null) o.put("background_s", backgroundS)
+        return o.toString()
+    }
+
+    fun find(text: String): FindStatus = obj(text).run {
+        val rd = ArrayList<FindReading>()
+        val a = optJSONArray("readings")
+        if (a != null) {
+            for (i in 0 until a.length()) {
+                val r = a.optJSONArray(i) ?: continue
+                if (r.length() < 3) continue
+                rd.add(FindReading(r.optLong(0), r.optLong(1), r.optInt(2, -100)))
+            }
+        }
+        FindStatus(
+            active = bool("active"),
+            type = str("type"),
+            addr = str("addr").uppercase(),
+            name = str("name"),
+            kind = str("kind"),
+            dtype = str("dtype", "unknown").ifEmpty { "unknown" },
+            model = str("model"),
+            vendor = str("vendor"),
+            ch = int("ch"),
+            security = str("security"),
+            state = str("state"),
+            why = str("why"),
+            forS = long("for_s"),
+            heardMs = long("heard_ms", -1),
+            holdMs = long("hold_ms"),
+            seq = long("seq"),
+            readings = rd,
+        )
+    }
+
+    /** Starts finding a device, keeps it going, or with [holdS] asks the sweep to wait for a turn. */
+    fun findBody(type: String, addr: String, holdS: Int? = null): String {
+        val o = JSONObject()
+        o.put("type", type)
+        o.put("addr", addr)
+        if (holdS != null) o.put("hold_s", holdS)
+        return o.toString()
+    }
+
+    const val FIND_STOP_BODY = "{\"stop\":true}"
+
+    fun map(text: String): MapInfo = obj(text).run {
+        val i = optJSONObject("isp")
+        MapInfo(
+            version = str("version"),
+            wifi = str("wifi"),
+            ssid = str("ssid"),
+            ip = str("ip"),
+            mac = str("mac").uppercase(),
+            hostname = str("hostname"),
+            gateway = str("gateway"),
+            subnet = str("subnet"),
+            rssi = int("rssi"),
+            channel = int("channel"),
+            bssid = str("bssid").uppercase(),
+            uptimeS = long("uptime_s"),
+            latencyValid = bool("latency_valid"),
+            latencyMs = long("latency_ms"),
+            isp = if (i == null) MapIsp(false, false, "", "", 0)
+            else MapIsp(i.bool("checked"), i.bool("valid"), i.str("isp"), i.str("org"), i.long("age_s")),
+            nearbyWifi = bool("nearby_wifi"),
+            aps = array(this, "aps").map { o ->
+                MapAp(o.str("bssid").uppercase(), o.int("ch"), o.int("rssi"), o.bool("live"), o.bool("joined"), o.long("age_s"))
+            }.filter { it.bssid.isNotEmpty() },
+        )
+    }
+
     // --- helpers -----------------------------------------------------------
+
+    private fun array(o: JSONObject, name: String): List<JSONObject> {
+        val a = o.optJSONArray(name) ?: return emptyList()
+        val out = ArrayList<JSONObject>(a.length())
+        for (i in 0 until a.length()) out.add(a.optJSONObject(i) ?: continue)
+        return out
+    }
 
     private fun obj(text: String): JSONObject = try {
         JSONObject(text)

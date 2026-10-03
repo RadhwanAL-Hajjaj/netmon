@@ -41,7 +41,8 @@ javac -nowarn -source 8 -target 8 -bootclasspath "$COMPILE_JAR" -d "$OUT/classes
 
 echo "== kotlin"
 set +e
-"$KOTLINC" -no-jdk -no-reflect -jvm-target 1.8 -Xlambdas=class -Xsam-conversions=class \
+# The API 35 jar is large; kotlinc's own 256 MB default heap runs out on it.
+JAVA_OPTS="${JAVA_OPTS:--Xmx2g}" "$KOTLINC" -no-jdk -no-reflect -jvm-target 1.8 -Xlambdas=class -Xsam-conversions=class \
     -classpath "$COMPILE_JAR:$OUT/classes" -d "$OUT/classes" \
     $(find "$APP/java" -name '*.kt') > "$OUT/kotlinc.raw" 2>&1
 rc=$?
@@ -67,7 +68,10 @@ javac -nowarn -cp "$ASM" -d "$OUT/tools" "$HERE/StripIndy.java" 2>&1 | grep -v J
 java -cp "$ASM:$OUT/tools" StripIndy "$OUT/stdlib" 2>&1 | grep -v JAVA_TOOL_OPTIONS || true
 dalvik-exchange --dex --min-sdk-version=26 --output="$OUT/classes.dex" "$OUT/classes" "$OUT/stdlib" 2>&1 | grep -v JAVA_TOOL_OPTIONS || true
 test -s "$OUT/classes.dex"
-if dexdump -d "$OUT/classes.dex" 2>/dev/null | grep -q "invoke-custom"; then echo "invoke-custom in dex"; exit 1; fi
+# grep -c reads to the end: with grep -q, dexdump would die of SIGPIPE on a
+# match and pipefail would turn the match into a pass.
+indy=$(dexdump -d "$OUT/classes.dex" 2>/dev/null | grep -c "invoke-custom" || true)
+if [ "${indy:-0}" != 0 ]; then echo "invoke-custom in dex ($indy)"; exit 1; fi
 echo "dex has no invoke-custom; $(dexdump -f "$OUT/classes.dex" 2>/dev/null | grep -m1 -E '^method_ids_size' | tr -s ' ')"
 
 echo "== package"
@@ -81,6 +85,8 @@ if [ ! -f "$KEYSTORE" ]; then
 fi
 apksigner sign --ks "$KEYSTORE" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --ks-key-alias netmon \
     --out "$OUT/netmon-$VERSION_NAME.apk" "$OUT/aligned.apk" 2>&1 | grep -v JAVA_TOOL_OPTIONS || true
-apksigner verify --verbose "$OUT/netmon-$VERSION_NAME.apk" 2>&1 | grep -v JAVA_TOOL_OPTIONS | head -5
-aapt2 dump badging "$OUT/netmon-$VERSION_NAME.apk" 2>/dev/null | head -4
+# sed rather than head: head stops reading early, and with pipefail the
+# writer's SIGPIPE would fail the build after the APK is made.
+apksigner verify --verbose "$OUT/netmon-$VERSION_NAME.apk" 2>&1 | grep -v JAVA_TOOL_OPTIONS | sed -n 1,5p
+aapt2 dump badging "$OUT/netmon-$VERSION_NAME.apk" 2>/dev/null | sed -n 1,4p
 ls -la "$OUT/netmon-$VERSION_NAME.apk"

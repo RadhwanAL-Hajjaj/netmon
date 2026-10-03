@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an idea or an improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! The maintainer reads every idea. netmon is a small hobby project, so there's no promise of whether or when an idea gets built, but good ideas shape where it goes next.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to be able to do?
+      description: The situation or problem behind the idea.
+      placeholder: I'd like to know when a device I've named "my phone" leaves the network.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How you picture it working, for example a page, a setting or an API field.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of netmon?
+      options:
+        - Devices page or device discovery
+        - Map
+        - Nearby (Wi-Fi or Bluetooth radar)
+        - Finder
+        - Events
+        - Internet page
+        - Settings or Wi-Fi setup
+        - Firmware update
+        - Android app
+        - Documentation
+        - Something new
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you've tried instead?
+      description: Workarounds, or other tools that do this well.

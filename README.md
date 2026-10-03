@@ -141,6 +141,9 @@ settings and learned hostnames survive an update.
 - Don't expose the board to the internet. To check on it from outside, use a
   VPN into your network.
 
+Found a security problem? Please report it privately, as described in
+[SECURITY.md](SECURITY.md).
+
 ## HTTP API
 
 Every endpoint returns JSON. The Android app uses this API, and anything else

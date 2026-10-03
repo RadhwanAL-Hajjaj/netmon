@@ -1,0 +1,98 @@
+name: Bug report
+description: Something in netmon isn't working as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this! The details below help the maintainer reproduce the problem.
+
+        **Before you paste anything:** issues are public. Remove Wi-Fi names, passwords, MAC addresses and public IP addresses you'd rather not share. For a security problem, please don't open an issue: see [SECURITY.md](https://github.com/RadhwanAL-Hajjaj/netmon/blob/main/SECURITY.md).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of netmon?
+      options:
+        - Devices page or device discovery
+        - Map
+        - Nearby (Wi-Fi or Bluetooth radar)
+        - Finder
+        - Events
+        - Internet page
+        - Settings or Wi-Fi setup (netmon-setup)
+        - Firmware update (browser, ArduinoOTA or app)
+        - Building or flashing the firmware
+        - Android app
+        - Documentation
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected to see instead.
+      placeholder: The Devices page says "Cannot reach the monitor", but the board answers at its IP address.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest way to make it happen again.
+      placeholder: |
+        1. Flash 0.11.0 over USB
+        2. Join netmon-setup and save my network
+        3. Open http://netmon.local
+        4. ...
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: Shown next to the netmon logo on every page, and as "version" in /api/health.
+      placeholder: 0.11.0-finder
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Board
+      description: Board name, module and flash size.
+      placeholder: ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB)
+    validations:
+      required: true
+  - type: textarea
+    id: build
+    attributes:
+      label: Build setup
+      description: Only needed for build, flash or update problems.
+      placeholder: |
+        Arduino IDE 2.3.x (or arduino-cli version)
+        esp32 core 3.3.x
+        ArduinoJson 7.x, NimBLE-Arduino 2.x
+        Partition scheme: Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)
+  - type: input
+    id: client
+    attributes:
+      label: Browser, phone or app version
+      description: For problems with the web pages or the Android app.
+      placeholder: Chrome on Windows 11, or netmon app 1.0.0 on Android 14
+  - type: textarea
+    id: serial
+    attributes:
+      label: Serial log
+      description: From the serial monitor at 115200 baud, from boot until the problem. Remove anything private first.
+      render: shell
+  - type: textarea
+    id: health
+    attributes:
+      label: /api/health output
+      description: Open http://<board address>/api/health and paste the result. Remove the Wi-Fi name if you'd rather not share it.
+      render: json
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: Screenshots, your router model, roughly how many devices are on the network, or what you've already tried.

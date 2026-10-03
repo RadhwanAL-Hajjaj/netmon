@@ -1,0 +1,277 @@
+package com.example.netmon.ui
+
+import android.app.AlertDialog
+import android.content.Context
+import android.content.res.ColorStateList
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.StateListDrawable
+import android.text.InputType
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+
+/**
+ * The look, in one place. Pure black canvas, charcoal surfaces, a white-to-grey
+ * text ladder and one amber accent for whatever can be pressed. Status colours
+ * match the board's own web pages, except "private", which moves off amber so
+ * it never reads as something to tap.
+ */
+object T {
+    const val BG = 0xFF000000.toInt()
+    const val SURFACE = 0xFF141414.toInt()
+    const val RAISED = 0xFF1F1F1F.toInt()
+    const val EDGE = 0xFF2A2A2A.toInt()
+    const val TEXT = 0xFFF2F2F2.toInt()
+    const val TEXT2 = 0xFFA6A6A6.toInt()
+    const val TEXT3 = 0xFF6E6E6E.toInt()
+    const val ACCENT = 0xFFFFB020.toInt()
+    const val ACCENT_TINT = 0xFF2B2110.toInt()
+    const val ON_ACCENT = 0xFF1A1200.toInt()
+    const val OK = 0xFF4FD18B.toInt()
+    const val BAD = 0xFFF0605F.toInt()
+    const val WARN = 0xFFF0924A.toInt()
+    const val PRIVATE = 0xFF8AB4F8.toInt()
+    const val OFFLINE = 0xFF555555.toInt()
+
+    fun status(status: String, online: Boolean): Int = when {
+        !online -> OFFLINE
+        status == "unknown" -> BAD
+        status == "private" -> PRIVATE
+        else -> OK
+    }
+}
+
+object Fonts {
+    val regular: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+    val medium: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+    val light: Typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+}
+
+const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+fun Context.dpf(v: Float): Float = v * resources.displayMetrics.density
+
+fun Context.label(
+    text: CharSequence = "",
+    size: Float = 15f,
+    color: Int = T.TEXT,
+    font: Typeface = Fonts.regular,
+    numbers: Boolean = false,
+): TextView = TextView(this).apply {
+    this.text = text
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, size)
+    setTextColor(color)
+    typeface = font
+    // Tabular figures keep addresses and counts aligned without a monospace face.
+    if (numbers) fontFeatureSettings = "tnum"
+    setLineSpacing(0f, 1.12f)
+}
+
+fun Context.column(): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+fun Context.row(): LinearLayout = LinearLayout(this).apply {
+    orientation = LinearLayout.HORIZONTAL
+    gravity = Gravity.CENTER_VERTICAL
+}
+
+/** Adds a child to a LinearLayout. Sizes are pixels (or MATCH / WRAP); margins are dp. */
+fun <V : View> LinearLayout.add(
+    v: V,
+    w: Int = MATCH,
+    h: Int = WRAP,
+    weight: Float = 0f,
+    top: Int = 0,
+    bottom: Int = 0,
+    start: Int = 0,
+    end: Int = 0,
+): V {
+    val lp = LinearLayout.LayoutParams(w, h, weight)
+    val c = context
+    lp.setMargins(c.dp(start), c.dp(top), c.dp(end), c.dp(bottom))
+    addView(v, lp)
+    return v
+}
+
+fun <V : View> FrameLayout.addFull(v: V): V {
+    addView(v, FrameLayout.LayoutParams(MATCH, MATCH))
+    return v
+}
+
+fun rounded(color: Int, radius: Float, stroke: Int = 0, strokeColor: Int = 0): GradientDrawable =
+    GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = radius
+        setColor(color)
+        if (stroke > 0) setStroke(stroke, strokeColor)
+    }
+
+/** A touch ripple clipped to the shape of [base]. */
+fun Context.pressable(base: Drawable?, radius: Float): Drawable =
+    RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), base, rounded(0xFFFFFFFF.toInt(), radius))
+
+fun Context.card(): LinearLayout = column().apply {
+    background = rounded(T.SURFACE, dpf(20f))
+    setPadding(dp(16), dp(16), dp(16), dp(16))
+}
+
+fun Context.cardTitle(text: String): TextView = label(text, 17f, T.TEXT, Fonts.medium)
+
+fun Context.hint(text: CharSequence = ""): TextView = label(text, 13f, T.TEXT3)
+
+fun Context.divider(): View = View(this).apply { setBackgroundColor(T.EDGE) }
+
+fun LinearLayout.addDivider(top: Int = 0, bottom: Int = 0): View =
+    add(context.divider(), MATCH, maxOf(1, context.dp(1) / 2), top = top, bottom = bottom)
+
+enum class Btn { PRIMARY, SECONDARY, QUIET, DANGER }
+
+private object ButtonRole : View.AccessibilityDelegate() {
+    override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(host, info)
+        info.className = Button::class.java.name
+    }
+}
+
+fun Context.button(text: String, kind: Btn = Btn.SECONDARY, onClick: (View) -> Unit): TextView {
+    val r = dpf(12f)
+    val (bg, fg) = when (kind) {
+        Btn.PRIMARY -> rounded(T.ACCENT, r) to T.ON_ACCENT
+        Btn.SECONDARY -> rounded(T.RAISED, r, dp(1), T.EDGE) to T.TEXT
+        Btn.QUIET -> rounded(0, r) to T.ACCENT
+        Btn.DANGER -> rounded(T.RAISED, r, dp(1), T.EDGE) to T.BAD
+    }
+    return label(text, 15f, fg, Fonts.medium).apply {
+        gravity = Gravity.CENTER
+        minHeight = dp(46)
+        minWidth = dp(64)
+        setPadding(dp(18), dp(10), dp(18), dp(10))
+        background = pressable(bg, r)
+        isClickable = true
+        isFocusable = true
+        setAccessibilityDelegate(ButtonRole)
+        setOnClickListener(onClick)
+    }
+}
+
+fun View.enabled(on: Boolean) {
+    isEnabled = on
+    alpha = if (on) 1f else 0.4f
+}
+
+/** A pill that can be selected. Colour and weight both change, so it never relies on colour alone. */
+fun Context.chip(text: String, selected: Boolean, onClick: (View) -> Unit): TextView =
+    label(text, 14f).apply {
+        gravity = Gravity.CENTER
+        minHeight = dp(36)
+        setPadding(dp(14), dp(6), dp(14), dp(6))
+        isClickable = true
+        isFocusable = true
+        setAccessibilityDelegate(ButtonRole)
+        setOnClickListener(onClick)
+        styleChip(selected)
+    }
+
+fun TextView.styleChip(selected: Boolean) {
+    val c = context
+    val r = c.dpf(18f)
+    background = c.pressable(
+        if (selected) rounded(T.ACCENT_TINT, r, c.dp(1), T.ACCENT) else rounded(T.RAISED, r),
+        r,
+    )
+    setTextColor(if (selected) T.ACCENT else T.TEXT2)
+    typeface = if (selected) Fonts.medium else Fonts.regular
+    isSelected = selected
+}
+
+fun Context.input(hint: String, type: Int = InputType.TYPE_CLASS_TEXT): EditText = EditText(this).apply {
+    this.hint = hint
+    setHintTextColor(T.TEXT3)
+    setTextColor(T.TEXT)
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+    // No setSingleLine(): it swaps the transformation method and would show a
+    // password in clear. A text input type without the multi-line flag is
+    // already single-line.
+    inputType = type
+    maxLines = 1
+    minHeight = dp(50)
+    setPadding(dp(14), dp(12), dp(14), dp(12))
+    val r = dpf(12f)
+    background = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_focused), rounded(T.RAISED, r, dp(2), T.ACCENT))
+        addState(intArrayOf(), rounded(T.RAISED, r, dp(1), T.EDGE))
+    }
+}
+
+fun Context.fieldLabel(text: String): TextView = label(text, 13f, T.TEXT2)
+
+/** A key and value on one line; the value side is kept to update in place. */
+class KV(context: Context, key: String) {
+    val view: LinearLayout = context.row()
+    private val k: TextView = context.label(key, 14f, T.TEXT2)
+    val value: TextView = context.label("", 14f, T.TEXT, numbers = true)
+
+    init {
+        view.gravity = Gravity.TOP
+        view.minimumHeight = context.dp(30)
+        view.add(k, 0, WRAP, weight = 0.9f)
+        view.add(value, 0, WRAP, weight = 1.3f, start = 12)
+        value.gravity = Gravity.END
+        value.setTextIsSelectable(true)
+    }
+
+    fun set(text: CharSequence?, color: Int = T.TEXT) {
+        value.text = if (text.isNullOrEmpty()) "-" else text
+        value.setTextColor(color)
+    }
+
+    fun show(on: Boolean) { view.visibility = if (on) View.VISIBLE else View.GONE }
+}
+
+fun LinearLayout.addKV(key: String, top: Int = 6): KV {
+    val kv = KV(context, key)
+    add(kv.view, top = top)
+    return kv
+}
+
+/** The scrolling page every screen sits in. */
+fun Context.page(content: LinearLayout): ScrollView = ScrollView(this).apply {
+    isFillViewport = true
+    isVerticalScrollBarEnabled = false
+    // The page takes focus first, so arriving on a screen never opens the keyboard.
+    content.isFocusableInTouchMode = true
+    content.descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS
+    content.setPadding(dp(16), dp(4), dp(16), dp(28))
+    addView(content, FrameLayout.LayoutParams(MATCH, WRAP))
+}
+
+fun Context.dialog(title: String?, body: View?, positive: String?, onPositive: (() -> Unit)?, negative: String? = "Cancel"): AlertDialog? {
+    // A reply can arrive after the screen that asked for it has closed; a
+    // dialog shown then would throw BadTokenException.
+    if (this is android.app.Activity && (isFinishing || isDestroyed)) return null
+    val b = AlertDialog.Builder(this)
+    if (title != null) b.setTitle(title)
+    if (body != null) {
+        val wrap = FrameLayout(this)
+        wrap.setPadding(dp(24), dp(8), dp(24), dp(4))
+        wrap.addView(body, FrameLayout.LayoutParams(MATCH, WRAP))
+        b.setView(wrap)
+    }
+    if (positive != null) b.setPositiveButton(positive) { _, _ -> onPositive?.invoke() }
+    if (negative != null) b.setNegativeButton(negative, null)
+    val d = b.create()
+    d.show()
+    return d
+}

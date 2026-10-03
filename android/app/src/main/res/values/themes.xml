@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Strict dark: pure black canvas, amber accent for anything that can be pressed. -->
+    <style name="Theme.Netmon" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorPrimary">#FF000000</item>
+        <item name="android:colorPrimaryDark">#FF000000</item>
+        <item name="android:colorAccent">#FFFFB020</item>
+        <item name="android:colorControlActivated">#FFFFB020</item>
+        <item name="android:colorControlNormal">#FF6E6E6E</item>
+        <item name="android:colorControlHighlight">#33FFFFFF</item>
+        <item name="android:colorBackground">#FF000000</item>
+        <item name="android:windowBackground">@color/canvas</item>
+        <item name="android:statusBarColor">#FF000000</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:textColorPrimary">#FFF2F2F2</item>
+        <item name="android:textColorSecondary">#FFA6A6A6</item>
+        <item name="android:textColorHint">#FF6E6E6E</item>
+        <item name="android:alertDialogTheme">@style/Theme.Netmon.Dialog</item>
+    </style>
+
+    <style name="Theme.Netmon.Dialog" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#FFFFB020</item>
+        <item name="android:colorBackground">#FF181818</item>
+        <item name="android:textColorPrimary">#FFF2F2F2</item>
+        <item name="android:textColorSecondary">#FFA6A6A6</item>
+    </style>
+</resources>

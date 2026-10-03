@@ -1,0 +1,227 @@
+# netmon
+
+A network monitor that runs on one ESP32 board. It finds every device on your
+LAN, tells you which ones it doesn't recognise, and scans the Wi-Fi and
+Bluetooth around it. You use it through web pages that the board serves
+itself, and those pages never load anything from the internet.
+
+- **Firmware** 0.11.0-finder for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
+- **Android app** 1.0.0 (optional). It reads the same HTTP API, keeps a longer event history on the phone, sends notifications and can update the firmware.
+
+<table>
+  <tr>
+    <td><img src="docs/images/devices.png" alt="Devices page: every device on the subnet with its state, address, MAC, hostname and vendor"></td>
+    <td><img src="docs/images/map.png" alt="Map page: devices grouped around the router by what they are"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/nearby-bluetooth.png" alt="Nearby page, Bluetooth tab: a radar of nearby Bluetooth devices coloured by kind"></td>
+    <td><img src="docs/images/finder.png" alt="Finder: distance, warmer or colder, and signal history while walking up to one device"></td>
+  </tr>
+</table>
+
+<sub>Screenshots are from the simulated board in <code>firmware/test/pages</code>. None of the names or addresses are real.</sub>
+
+## What it does
+
+**Devices** (`/`). Once a minute the board sends an ARP sweep across its own
+subnet (any size from /16 up), which takes about 6.5 s for a /24. Each device
+gets a vendor from its MAC prefix and a hostname from the DHCP broadcasts the
+router relays. It also gets one of three states:
+
+| State | Meaning |
+|---|---|
+| known | Seen during the 10-minute learning window after start-up |
+| private | Uses a randomised (locally administered) MAC, as most phones do. Never flagged |
+| unknown | Has a manufacturer-assigned MAC and first appeared after the learning window. **This is the case worth checking.** |
+
+The page also shows uptime as the board has seen it, and the time each offline
+device was last seen.
+
+**Map** (`/map`). Draws your network around the router. Devices are grouped by
+what they are (phones, cameras, smart home, servers and so on), going by
+their names and makers. Your Wi-Fi access points appear as a group of their own.
+
+**Nearby** (`/nearby`). Has a Wi-Fi radar and a Bluetooth radar with live
+arrival and departure logs, signal trends and rough distance estimates. It
+also identifies device kinds from Bluetooth advertisements (AirPods, Find My
+trackers, Tile, Windows laptops, Flipper Zero and others). The **Finder** tab
+helps you walk up to one device, such as a lost tracker. It shows a smoothed
+distance and whether you're getting warmer or colder. Turn slowly on the spot
+with the board held against your chest and it also gives a direction.
+
+**Events** (`/events`) lists devices that appeared, went offline or came back.
+**Internet** (`/isp`) shows your public address and provider, plus the
+router's maker and the latency to it. **Settings** (`/settings`) covers Wi-Fi
+setup and the saved-network history, DHCP or a fixed address, monitoring
+intervals and firmware updates from the browser.
+
+## Hardware
+
+- An ESP32 DevKit V1 or another classic ESP32 board with **4 MB flash** and Bluetooth. Only the DevKit V1 has been tested.
+- A USB cable for the first flash. After that, updates go over Wi-Fi.
+- For the Finder you take the board with you, so a USB power bank helps.
+
+## Build and flash
+
+1. Install the **Arduino IDE** (2.x) and the **esp32 by Espressif Systems**
+   boards package, version 3.x. Builds have used 3.3.12.
+2. Install the libraries **ArduinoJson** 7 by Benoit Blanchon (7.4.3) and
+   **NimBLE-Arduino** 2 by h2zero (2.5.1).
+3. Copy `firmware/netmon/secrets.example.h` to `firmware/netmon/secrets.h` and
+   set your own `NETMON_UPDATE_PASSWORD`. This password protects firmware
+   updates. The build refuses to run if the file is missing or still holds the
+   placeholder, and git ignores `secrets.h`.
+4. Open `firmware/netmon/netmon.ino` and select:
+   - Board: **ESP32 Dev Module**
+   - Partition Scheme: **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**.
+     The default 1.2 MB app partition is too small now that Bluetooth is in.
+5. Upload. The image is about 1.5 MB, which is 76% of the app partition.
+
+To do the same with arduino-cli:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs firmware/netmon
+arduino-cli upload  --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -p <port> firmware/netmon
+```
+
+Coming from firmware 0.9.x or older? Flash over USB once, because 0.10.0
+changed the partition scheme. See the [changelog](CHANGELOG.md#0100-nearby).
+
+## First start
+
+1. The board doesn't know your Wi-Fi yet, so it opens its own open network
+   called **`netmon-setup`**. Join it from a phone. The settings page should
+   open by itself as a "sign in to network" page. If it doesn't, browse to
+   `http://192.168.4.1`.
+2. Tap **Scan for networks**, pick yours, enter the password, then **Save and restart**.
+3. The board joins your network and starts sweeping. Open `http://netmon.local`,
+   or find the board's address in your router's client list, where it shows
+   up as `netmon`. More ways to find it are in [Finding netmon](docs/finding-netmon.md).
+
+For the first ten minutes everything it sees counts as **known**, because it
+is learning what normal looks like. After that, any new device with a
+manufacturer MAC shows as **unknown**.
+
+The board remembers up to four networks and tries each one for 12 s at
+start-up. If none of them answers, it falls back to `netmon-setup`. While
+nobody is connected to that setup network, it retries the saved networks
+every three minutes, so it gets back on its own after a power cut. See
+[Taking netmon to another network](docs/moving-to-another-network.md).
+
+## Updating
+
+Once a build is on the board, you can update it over Wi-Fi in any of these ways:
+
+- **Settings → Firmware update** in the browser. In the Arduino IDE, use
+  *Sketch → Export Compiled Binary* and pick the file ending in `.ino.bin`.
+  The page refuses bootloader, partition and merged images, files that are too
+  large, and anything that isn't an ESP32 image. It also checks the password
+  before uploading.
+- **ArduinoOTA** from the Arduino IDE. The board appears as `netmon`.
+- **The Android app**, under Settings → Firmware update.
+
+All three use the update password from `secrets.h`. Saved Wi-Fi networks,
+settings and learned hostnames survive an update.
+
+## Security notes
+
+- The pages and the read-only API need no login, so anyone on your LAN can
+  view them.
+- Requests that change things, such as settings, forgetting a network,
+  restarting or the Nearby controls, are refused when they come from a page on
+  another site (a browser Origin check). This is not authentication: a device
+  on the LAN that talks to the board directly can still make them. Only
+  firmware updates need the password.
+- `netmon-setup` is an open network. It exists only while the board can't join
+  one of its saved networks.
+- The Internet page sends one plain-HTTP request to [ip-api.com](https://ip-api.com)
+  at most every six hours (or when you press *Check again*). This request
+  reveals your public IP address to that service. Nothing else leaves your
+  network.
+- Don't expose the board to the internet. To check on it from outside, use a
+  VPN into your network.
+
+## HTTP API
+
+Every endpoint returns JSON. The Android app uses this API, and anything else
+on your network can use it too.
+
+| Endpoint | |
+|---|---|
+| `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, free memory |
+| `GET /api/devices` | Every device: MAC, IP, hostname, vendor, state, online, uptime, last seen |
+| `GET /api/events` | The last 48 events (appeared, offline, returned, hostname learned) |
+| `GET /api/latency` | Gateway round trip (TCP connect to port 80 or 443, not ICMP) |
+| `GET /api/dhcp` | DHCP listener state and the last request heard |
+| `GET /api/isp` | Public address, provider, AS and location from the last lookup (`?force` to look up now) |
+| `GET /api/scan` | Wi-Fi networks in range, one per name |
+| `GET`/`POST /api/config` | Settings. Stored passwords are never returned; a blank password keeps the saved one |
+| `GET /api/networks`, `POST /api/networks/forget` | Saved networks in start-up order, with how each fared at the last boot |
+| `POST /api/update`, `POST /api/update/check` | Firmware upload and password check (`X-Netmon-Key` header) |
+| `POST /api/reboot` | Restart the board |
+| `GET /api/nearby`, `POST /api/nearby/scan` | Wi-Fi and Bluetooth tables for the radars; scan now |
+| `GET`/`POST /api/nearby/config` | Turn Wi-Fi and Bluetooth scanning on or off, and set the background interval |
+| `GET`/`POST /api/nearby/find` | The Finder: start, keep alive, stop, read new signal readings |
+| `GET /api/map` | The board, its access points, the router, the subnet and the provider, for the Map page |
+
+The [changelog](CHANGELOG.md) describes each endpoint's fields in the release
+that added it.
+
+## Limitations
+
+- The known/unknown baseline, the event history, the Nearby lists and the map
+  data are all kept in RAM. A restart, including one after an update, starts
+  the learning window again.
+- Settings endpoints take no password, as described under Security notes.
+- A fixed address applies to every saved network.
+- Hostnames come from DHCP broadcasts. A device that only renews a lease it
+  already holds stays unnamed until it next reconnects. Routers that isolate
+  wireless clients don't relay these broadcasts at all.
+- The board is just another client on your network. It can't see cables,
+  which access point a device uses, or other devices' signal strength.
+- Distances worked out from signal strength are rough. The Finder's direction
+  depends on your body blocking the signal, so it's a hint, not a bearing.
+- Map groups are guesses from names and a small built-in list of makers.
+- The Android app doesn't show Nearby, the Finder or the Map.
+
+## Tests
+
+The hardware-independent logic lives in `firmware/netmon/src/core/` and is
+tested on a PC:
+
+```sh
+cd firmware/test && make test        # 1331 checks, g++ or clang, C++17
+```
+
+The web pages are tested in headless Chromium against a simulated board. See
+[firmware/test/pages/README.txt](firmware/test/pages/README.txt). The Android
+app has its own checks and a mock board in `android/tools/`.
+
+## Project layout
+
+```
+firmware/
+  netmon/               Arduino sketch: open netmon.ino
+    netmon.ino          web server, API, scheduling
+    secrets.example.h   copy to secrets.h (git-ignored)
+    src/core/           pure C++ logic, unit-tested on the host
+    src/hw/             ESP32 parts: ARP, Wi-Fi, BLE, storage, pages
+  test/                 host unit tests and page checks
+android/                companion app (Kotlin, no AndroidX): see android/README.md
+docs/                   how-tos and screenshots
+CHANGELOG.md            release notes, 0.3.1 onwards
+```
+
+## Credits
+
+- Several ideas on the Nearby page come from [BlueWatch](https://github.com/PolarPatch/BlueWatch)
+  (MIT licence) and were reimplemented in C++ for the board: the signal-strength
+  radar scale, the arrival and departure marks, trend arrows, device kinds
+  grouped by colour, hiding private addresses and masking for screenshots.
+- Bluetooth company identifiers and service UUIDs come from the Bluetooth SIG's
+  assigned numbers. MAC vendors come from a small subset of the IEEE OUI registry.
+- Public address lookups come from [ip-api.com](https://ip-api.com).
+
+## License
+
+[MIT](LICENSE)

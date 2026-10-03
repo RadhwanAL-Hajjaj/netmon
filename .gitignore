@@ -1,0 +1,30 @@
+# Secrets: never commit these
+firmware/netmon/secrets.h
+android/keystore.properties
+*.jks
+*.keystore
+
+# Firmware builds and host tests
+*.bin
+*.elf
+*.map
+build/
+firmware/test/test_core
+firmware/test/pages/shots/
+__pycache__/
+
+# Android builds
+*.apk
+*.aab
+.gradle/
+android/build-manual/
+local.properties
+.idea/
+*.iml
+captures/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/

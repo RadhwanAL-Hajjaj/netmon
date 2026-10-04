@@ -224,9 +224,16 @@ function render(){
    +'<td title="'+esc(x.vendor||'')+'">'+esc(vendor(x))+'</td>'
    +'<td class=up title="last seen '+age(x.last_seen_s)+' ago">'
    +(x.online?dur(x.up_s):'—')+'</td></tr>'}).join('')}
+// The board has no clock of its own; it dates saved reports by the first one
+// it is given (firmware 0.12).
+var clockSent=false;
+function sendclock(){if(clockSent)return;clockSent=true;
+ fetch('/api/clock',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({unix:Math.floor(Date.now()/1000)})}).catch(function(){})}
 function load(){
  fetch('/api/health').then(function(r){return r.json()}).then(function(h){
   ver.textContent=h.version;
+  if(h.clock===false)sendclock();
   count.textContent=h.devices+(h.devices==1?' device on ':' devices on ')+h.subnet;
   log.textContent=(h.last_pass_ms
    ?'Swept in '+(h.last_pass_ms/1000).toFixed(1)+'s, reached '+h.pass_seen+'. '
@@ -289,6 +296,20 @@ button:disabled{opacity:.5;cursor:default}
 input[type=file]{padding:.4rem}
 input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.7rem;
  padding:.3rem .7rem;border:1px solid var(--edge);border-radius:7px;background:var(--bg)}
+.btrow{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.9rem}
+.btrow button.arm{border-color:var(--bad);color:var(--bad)}
+#btcode{margin:.9rem 0 0;padding:.7rem .9rem;border:1px solid var(--edge);border-radius:12px;
+ background:var(--tint)}
+#btcode b{display:block;font:600 2rem/1.15 var(--mono);letter-spacing:.14em;
+ font-variant-numeric:tabular-nums}
+#btmsg{margin:.75rem 0 0;font-size:.85rem}#btmsg:empty{display:none}
+#btmsg.err{color:var(--bad)}#btmsg.ok{color:var(--ok)}
+#reprows td{vertical-align:top}#reprows .acts{display:flex;flex-wrap:wrap;gap:.35rem;justify-content:flex-end}
+@media(min-width:560px){#reprows .acts{flex-wrap:nowrap}}
+#reprows a.dl{font-size:.8rem;padding:.28rem .6rem;border:1px solid var(--edge);border-radius:9px;
+ text-decoration:none;background:var(--bg);color:inherit;white-space:nowrap}
+#repmsg{margin:.75rem 0 0;font-size:.85rem}#repmsg:empty{display:none}
+#repmsg.err{color:var(--bad)}#repmsg.ok{color:var(--ok)}
 </style>
 <div class=sh>
 <header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a><nav><a href="/">Devices</a><a href="/map">Map</a><a href="/nearby">Nearby</a><a href="/events">Events</a><a href="/isp">Internet</a>
@@ -355,6 +376,31 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  <p class=hint>Saving reconnects the board. If it cannot rejoin, it opens a
  setup network called netmon-setup at 192.168.4.1, and goes back to trying its
  saved networks whenever nobody has been joined to that for three minutes.</p>
+</section>
+<section>
+ <h2>Bluetooth</h2>
+ <p class=hint>A phone paired with this board can use the netmon app over
+ Bluetooth, out of reach of this Wi-Fi: while you walk with the Finder, say, or
+ when the board is in setup mode. Each phone pairs once, with a code shown here.</p>
+ <dl id=btinfo><dt>Link</dt><dd>Reading&hellip;</dd></dl>
+ <div id=btcode hidden aria-live=polite><b id=btdigits></b>
+ <p class=hint id=btsteps></p></div>
+ <div class=btrow><button type=button id=btpair onclick=btpairing()>Pair a phone</button>
+ <button type=button id=btonoff onclick=btswitch()>Switch off</button>
+ <button type=button id=btforget onclick=btforgetall()>Forget paired phones</button></div>
+ <p id=btmsg></p>
+</section>
+<section>
+ <h2>Saved reports</h2>
+ <p class=hint>For each network this board has been on, up to four, the device
+ list as it last stood: saved every 15 minutes, before every restart, and when
+ you ask. Devices not seen since the board last started are kept from the
+ report before. Download one as JSON or as CSV for a spreadsheet.</p>
+ <table class=nets id=reptbl hidden><thead><tr><th>Network</th><th>Devices</th>
+ <th>Saved</th><th aria-label="Action"></th></tr></thead><tbody id=reprows></tbody></table>
+ <p class=hint id=repnote>Reading&hellip;</p>
+ <div class=btrow><button type=button id=repsave onclick=repsavenow()>Save this network now</button></div>
+ <p id=repmsg></p>
 </section>
 <section>
  <h2>Firmware update</h2>
@@ -568,8 +614,121 @@ function waitback(t0){setTimeout(function poll(){
     fwsay('No answer from the board after two and a half minutes. If it does not '
      +'come back, reflash it over USB.','err');return}
    setTimeout(poll,2000)})},4000)}
-loadcfg();loadnets();loaddhcp();
+// Bluetooth. Polled every two seconds while a pairing window is open, so the
+// countdown runs and "paired" shows as soon as the phone is done.
+var bt=null,btT=0,btarm=null,btarmT=0;
+function btsay(m,c){btmsg.textContent=m;btmsg.className=c||''}
+function mmss(s){return Math.floor(s/60)+':'+('0'+s%60).slice(-2)}
+function btshow(b){bt=b;
+ var state=!b.available?'Not running: Bluetooth could not start on this board'
+  :!b.enabled?'Off':'On, advertising as '+b.name;
+ btinfo.innerHTML=row('Link',state)+row('Address',b.addr||'-')
+  +row('Paired phones',b.bonds+' of '+b.max_bonds)
+  +row('Connected now',b.connected?b.connected+(b.secure<b.connected?' ('+b.secure+' paired)':''):'none');
+ btonoff.textContent=b.enabled?'Switch off':'Switch on';
+ btpair.disabled=!b.available||!b.enabled;
+ btpair.textContent=b.pairing?'Cancel pairing':'Pair a phone';
+ btcode.hidden=!b.pairing;
+ if(b.pairing){btdigits.textContent=b.code.slice(0,3)+' '+b.code.slice(3);
+  btsteps.textContent='In the netmon app choose Settings, Bluetooth, Pair this phone, or tap '
+   +'this board under Bluetooth when finding a monitor. When the phone asks, type this code. '
+   +'It works for one phone, for the next '+mmss(b.left_s)+'.'}
+ else if(b.result=='paired'&&b.result_age_s<120)btsay('Paired. That phone can now use the app over Bluetooth.','ok');
+ else if(b.result=='failed'&&b.result_age_s<120)btsay('Pairing failed: a wrong code, or the phone gave up. '
+  +'Pair again for a new code.','err');
+ clearTimeout(btT);btT=setTimeout(loadble,b.pairing?2000:10000)}
+function loadble(){fetch('/api/ble').then(function(r){if(!r.ok)throw r.status;return r.json()})
+ .then(btshow)
+ .catch(function(e){btinfo.innerHTML=row('Link',e==404?'Needs firmware 0.12 or later':'Unavailable');
+  btpair.disabled=true})}
+function btpost(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body||{})})
+ .then(function(r){return r.json().then(function(j){if(!r.ok)throw j.error||'The board refused.';return j})})}
+function btpairing(){btsay('');
+ btpost('/api/ble/pair',bt&&bt.pairing?{stop:true}:{}).then(btshow)
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+function btswitch(){btsay('');if(!bt)return;
+ btpost('/api/ble',{enabled:!bt.enabled}).then(btshow)
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+// Two taps, like forgetting a network: the first arms the button for four seconds.
+function btforgetall(){
+ if(btarm!==btforget){btarm=btforget;btforget.textContent='Confirm: every phone pairs again';
+  btforget.className='arm';btarmT=setTimeout(btdisarm,4000);return}
+ btdisarm();btsay('');
+ btpost('/api/ble/forget').then(function(b){btshow(b);btsay('Forgot every paired phone.','ok')})
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+function btdisarm(){clearTimeout(btarmT);btarm=null;btforget.textContent='Forget paired phones';
+ btforget.className=''}
+// Saved reports. CSV is made here from the board's JSON, the same columns as
+// the app's export.
+var reps=[],reparm=null,reparmT=0,repclock=false;
+function repsay(m,c){repmsg.textContent=m;repmsg.className=c||''}
+function agetext(s){return s<0?'before the last restart':s<90?'just now'
+ :s<5400?Math.round(s/60)+' min ago':s<172800?Math.round(s/3600)+' h ago':Math.round(s/86400)+' days ago'}
+function whentext(r){var d=r.saved_unix?new Date(r.saved_unix*1000):null;
+ return (d?d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'})+' \u00b7 ':'')+agetext(r.age_s)}
+function fname(r,ext){return 'netmon-'+(r.ssid||'network').replace(/[^A-Za-z0-9._-]+/g,'_')+'-'
+ +(r.saved_unix?new Date(r.saved_unix*1000).toISOString().slice(0,10):'report')+'.'+ext}
+function showreps(l){reps=l.reports||[];repclock=!!l.clock;
+ if(l.clock===false)sendclock();
+ reptbl.hidden=!reps.length;
+ reps.sort(function(a,b){return (b.current-a.current)||((b.saved_unix||0)-(a.saved_unix||0))});
+ reprows.innerHTML=reps.map(function(r,i){
+  return '<tr><td><span class=ss>'+esc(r.ssid)+'</span>'+(r.current?' <span class=pill>On it now</span>':'')
+   +'<span class=sub>'+esc(r.subnet)+(r.gateway?' \u00b7 router '+esc(r.gateway):'')+'</span></td>'
+   +'<td>'+r.count+'<span class=sub>'+r.online+' online</span></td>'
+   +'<td>'+esc(whentext(r))+'</td>'
+   +'<td class=a><div class=acts><a class=dl href="/api/reports/get?slot='+r.slot+'" download="'+esc(fname(r,'json'))+'">JSON</a>'
+   +'<button type=button data-csv='+i+'>CSV</button><button type=button data-del='+i+'>Delete</button></div></td></tr>'}).join('');
+ repnote.textContent=(reps.length?'':'No report saved yet. ')
+  +(l.network?'This board is on '+l.network.ssid+'.':'This board is not on a network now.')
+  +' Room for '+l.max+' networks; a fifth replaces the one saved longest ago.'
+  +(l.clock?'':' The board does not know the time yet, so reports say how long ago devices were seen rather than when.');
+ repsave.disabled=!l.network}
+function loadreps(){fetch('/api/reports').then(function(r){if(!r.ok)throw r.status;return r.json()})
+ .then(showreps)
+ .catch(function(e){repnote.textContent=e==404?'Saved reports need firmware 0.12 or later.':'Saved reports unavailable.';
+  repsave.disabled=true})}
+var clockSent=false;
+function sendclock(){if(clockSent)return;clockSent=true;
+ fetch('/api/clock',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({unix:Math.floor(Date.now()/1000)})}).catch(function(){})}
+function repsavenow(){repsay('Saving\u2026');
+ btpost('/api/reports/save').then(function(l){showreps(l);repsay('Saved.','ok')})
+ .catch(function(e){repsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+// One value for a CSV cell. A cell a spreadsheet would run as a formula is
+// written as text: names come from what devices broadcast about themselves.
+function csvcell(v){v=v==null?'':String(v);
+ if(/^[=+\-@\t\r]/.test(v))v="'"+v;
+ return /[",\r\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v}
+function iso(t){if(!t)return '';var d=new Date(t*1000),p=function(n){return ('0'+n).slice(-2)};
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+function tocsv(j){
+ var rows=[['network','subnet','saved','mac','ip','hostname','vendor','status','private_mac','online',
+  'last_seen','last_seen_s_before_save','first_seen','uptime_s','carried_over']];
+ (j.devices||[]).forEach(function(d){
+  var seen=d.seen_unix||(j.saved_unix?j.saved_unix-d.last_seen_s:0);
+  rows.push([j.ssid,j.subnet,iso(j.saved_unix),d.mac,d.ip,d.hostname,d.vendor,d.status,
+   d.randomised?'yes':'no',d.online?'yes':'no',iso(seen),d.last_seen_s,iso(d.first_unix),d.up_s,d.carried?'yes':'no'])});
+ return rows.map(function(r){return r.map(csvcell).join(',')}).join('\r\n')+'\r\n'}
+function repcsv(r,b){b.disabled=true;
+ fetch('/api/reports/get?slot='+r.slot).then(function(x){if(!x.ok)throw 0;return x.json()})
+ .then(function(j){var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob(['\ufeff'+tocsv(j)],{type:'text/csv'}));a.download=fname(r,'csv');
+  document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000);
+  b.disabled=false})
+ .catch(function(){b.disabled=false;repsay('Could not read that report.','err')})}
+function repdisarm(){clearTimeout(reparmT);if(reparm){reparm.textContent='Delete';reparm.className=''}reparm=null}
+reprows.onclick=function(e){var t=e.target.closest&&e.target.closest('button');if(!t)return;
+ if(t.hasAttribute('data-csv')){repcsv(reps[+t.getAttribute('data-csv')],t);return}
+ var r=reps[+t.getAttribute('data-del')];if(!r)return;
+ if(reparm!==t){repdisarm();reparm=t;t.textContent='Confirm';t.className='arm';reparmT=setTimeout(repdisarm,4000);return}
+ repdisarm();repsay('');
+ btpost('/api/reports/delete',{slot:r.slot}).then(function(l){showreps(l);repsay('Deleted.','ok')})
+ .catch(function(x){repsay(typeof x=='string'?x:'Could not reach the board.','err')})};
+loadcfg();loadnets();loaddhcp();loadble();loadreps();
 setInterval(function(){if(!busy)loaddhcp()},10000);
+setInterval(function(){if(!busy)loadreps()},60000);
 </script>
 )HTML";
 

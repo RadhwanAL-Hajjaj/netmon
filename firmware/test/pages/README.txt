@@ -10,6 +10,8 @@ The web pages, loaded in headless Chromium against a simulated board.
   python check_states.py
   python check_finder.py shots
   python check_map.py shots
+  python check_bluetooth.py shots
+  python check_reports.py shots
 
 mock_nearby.py serves the pages straight out of pages.h and fakes the
 endpoints they call: a house's worth of Wi-Fi networks and Bluetooth devices
@@ -29,6 +31,12 @@ check_finder.py the tabs and their addresses; finding from a list, from the
                 two pages at once; the phone layout
 check_map.py    the map's groups, choosing each kind of thing on it, offline
                 devices, grouping by status, the keyboard, phone width
+check_bluetooth.py  Settings, Bluetooth: the link's state, a pairing window
+                with its code, pairing well and badly, off and on, forgetting
+                every phone, a board before 0.12, phone width
+check_reports.py    Settings, Saved reports: the list, the clock sent from the
+                dashboard, JSON and CSV downloads (formulas written as text),
+                saving now, deleting, a board before 0.12, phone width
 
 Each prints what it found and lists any script errors; screenshots go in the
 folder given.

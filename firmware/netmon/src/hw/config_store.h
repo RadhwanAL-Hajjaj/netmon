@@ -31,6 +31,10 @@ struct Settings {
     bool air_wifi;
     bool air_ble;
     uint32_t air_background_s;
+
+    // The Bluetooth link (ble_link.h): the API for paired phones. On unless
+    // switched off; pairing still needs the code from the Settings page.
+    bool ble_link;
 };
 
 void settings_defaults(Settings& s);

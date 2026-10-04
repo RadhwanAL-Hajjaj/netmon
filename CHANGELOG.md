@@ -3,14 +3,60 @@
 Firmware releases, newest first. The Android app's notes are in
 [android/README.md](android/README.md).
 
-## Unreleased
+## 0.12.0-bluetooth
 
-- The update password no longer sits in `netmon.ino`. It now lives in
-  `firmware/netmon/secrets.h`, which git ignores: copy `secrets.example.h` and
-  set your own. The build stops with a clear message if the file is missing,
-  still holds the placeholder, or the password is shorter than 8 characters.
-  Nothing else in the firmware changes.
-- 1331 host checks.
+The board's API now also answers over Bluetooth, to phones paired with a
+6-digit code, and the board keeps a saved report of each network it has been
+on.
+
+- **Bluetooth link.** The board advertises as `netmon` and carries every
+  `/api/` endpoint over Bluetooth LE, so the Android app (1.2.0) works away
+  from the board's Wi-Fi: walking with the Finder, in setup mode, or from the
+  next room. One GATT service: the app writes requests to one characteristic
+  and the board answers with notifications on the other, both as numbered
+  frames that carry the same request and the same status and body as over
+  Wi-Fi (`src/core/ble_link.h`). Firmware updates stay Wi-Fi only.
+- **Pairing with a code.** The request characteristic takes writes only over a
+  link encrypted with keys from a passkey pairing (bonded, with protection
+  against a man in the middle, LE Secure Connections where the phone has
+  them). The board has no screen, so the code is shown on the Settings page,
+  or in the app over Wi-Fi: only someone on the board's network can see it. A
+  window lasts two minutes and one attempt; outside one, every attempt is
+  given a code nobody was shown. Up to three phones stay paired. A pairing
+  made without the code is dropped at once, and room for a new pairing (by
+  forgetting the phone paired longest ago) is made only for one with the code,
+  so a stranger in range cannot push a paired phone out. Connections that do
+  not encrypt within 20 seconds are let go.
+- **Saved reports.** For each network the board has been on, up to four, the
+  device list as it last stood is kept in flash (`src/core/report.h`): saved
+  two sweeps after joining, then every 15 minutes, before every restart the
+  board makes on purpose, and on request. A network is its name and subnet; a
+  fifth replaces the one saved longest ago. Devices in the last report of the
+  same network that have not been seen since the board started are carried
+  over, so a power cut does not shrink the report. A report is never written
+  when it would leave the file system short for settings and names.
+- **A clock.** The board learns the time from the Date header of the provider
+  lookup it already makes, or from the app or a page, which send their own
+  clock when the board has none. Reports saved before then say how long before
+  the save each device was seen, not when.
+- **Settings page.** A Bluetooth section (state, *Pair a phone* with the code
+  and a countdown, on and off, *Forget paired phones*) and a Saved reports
+  section (download as JSON, or as CSV made in the page, with cells a
+  spreadsheet would run as formulas written as text; delete; *Save this
+  network now*).
+- **API.** `GET`/`POST /api/ble`, `POST /api/ble/pair`, `POST /api/ble/forget`,
+  `GET /api/reports`, `GET /api/reports/get?slot=N`, `POST /api/reports/save`,
+  `POST /api/reports/delete` and `POST /api/clock` are new. `/api/health` gains
+  `mac`, `ble_link` and `clock`. The API handlers no longer talk to the web
+  server directly, so the same code answers both ways in.
+- The update password now lives in `firmware/netmon/secrets.h`, which git
+  ignores: copy `secrets.example.h` and set your own. The build stops with a
+  clear message if the file is missing, still holds the placeholder, or the
+  password is shorter than 8 characters.
+- **Upgrade.** From 0.10.x or 0.11.x over the air; the partition scheme is
+  unchanged. Settings, saved networks and learned names are kept.
+- 1574 host checks, clean under AddressSanitizer and UBSan. Image: 1,551,427
+  bytes, 78% of the 1.9 MB app partition.
 
 ## 0.11.0-finder
 

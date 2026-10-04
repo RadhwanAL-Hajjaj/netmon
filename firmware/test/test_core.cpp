@@ -1873,6 +1873,684 @@ static void test_air_table_get() {
     CHECK(w.get(test_mac_n(5))->last_seen_s == 115);
 }
 
+// --- The Bluetooth link ------------------------------------------------------
+
+#include "../netmon/src/core/ble_link.h"
+#include <string>
+#include <vector>
+
+static std::vector<uint8_t> test_hex(const char* hex) {
+    std::vector<uint8_t> out;
+    int hi = -1;
+    for (const char* p = hex; *p; ++p) {
+        const int v = link_hex(*p);
+        if (v < 0) continue;
+        if (hi < 0) {
+            hi = v;
+        } else {
+            out.push_back(static_cast<uint8_t>(hi * 16 + v));
+            hi = -1;
+        }
+    }
+    return out;
+}
+
+static std::string test_hex_of(const uint8_t* b, size_t n) {
+    static const char* d = "0123456789abcdef";
+    std::string s;
+    for (size_t i = 0; i < n; ++i) {
+        if (i) s += ' ';
+        s += d[b[i] >> 4];
+        s += d[b[i] & 15];
+    }
+    return s;
+}
+
+// Frames split from a request the way the app splits them (LinkCodec.kt):
+// as much as fits in each, first and last flags.
+static std::vector<std::vector<uint8_t>> test_request_frames(const std::string& text, uint8_t id, size_t cap) {
+    std::vector<std::vector<uint8_t>> frames;
+    const size_t room = cap - kLinkHeader;
+    size_t off = 0;
+    do {
+        const size_t n = std::min(room, text.size() - off);
+        std::vector<uint8_t> f;
+        uint8_t flags = 0;
+        if (off == 0) flags |= kLinkFirst;
+        if (off + n == text.size()) flags |= kLinkLast;
+        f.push_back(flags);
+        f.push_back(id);
+        f.insert(f.end(), text.begin() + static_cast<long>(off), text.begin() + static_cast<long>(off + n));
+        frames.push_back(f);
+        off += n;
+    } while (off < text.size());
+    return frames;
+}
+
+struct TestChunks {
+    std::vector<std::string> parts;
+    size_t count() const { return parts.size(); }
+    const uint8_t* data(size_t i) const { return reinterpret_cast<const uint8_t*>(parts[i].data()); }
+    size_t size(size_t i) const { return parts[i].size(); }
+};
+
+// Every frame of an answer, cut the way the board's pump cuts them.
+static std::vector<std::vector<uint8_t>> test_answer_frames(const TestChunks& c, uint8_t id, uint16_t status,
+                                                            size_t cap) {
+    std::vector<std::vector<uint8_t>> frames;
+    size_t chunk = 0, offset = 0;
+    bool first = true;
+    for (int guard = 0; guard < 100000; ++guard) {
+        std::vector<uint8_t> buf(cap);
+        const LinkCut cut = link_cut(c, chunk, offset, first, true, id, status, buf.data(), cap);
+        if (cut.len == 0) break;
+        buf.resize(cut.len);
+        frames.push_back(buf);
+        chunk = cut.chunk;
+        offset = cut.offset;
+        first = false;
+        if (cut.last) break;
+    }
+    return frames;
+}
+
+// The vectors below are repeated, byte for byte, in the app's own tests
+// (android/tools/test/CoreTest.kt, linkTests), so the two ends agree on the
+// format and not merely each with itself.
+static void test_link_vectors() {
+    // A request that fits one 20-byte frame (an ATT MTU of 23, the smallest).
+    {
+        const auto f = test_request_frames("GET /api/health\n\n", 7, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) ==
+              "03 07 47 45 54 20 2f 61 70 69 2f 68 65 61 6c 74 68 0a 0a");
+    }
+    // One that takes two.
+    {
+        const auto f = test_request_frames("POST /api/nearby/find\n\n{\"stop\":true}", 0x2a, 20);
+        CHECK(f.size() == 2);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) ==
+              "01 2a 50 4f 53 54 20 2f 61 70 69 2f 6e 65 61 72 62 79 2f 66");
+        CHECK(test_hex_of(f[1].data(), f[1].size()) ==
+              "02 2a 69 6e 64 0a 0a 7b 22 73 74 6f 70 22 3a 74 72 75 65 7d");
+    }
+    // An answer in one frame: status 200, least significant byte first.
+    {
+        TestChunks c{{"{\"ok\":true}"}};
+        const auto f = test_answer_frames(c, 7, 200, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "03 07 c8 00 7b 22 6f 6b 22 3a 74 72 75 65 7d");
+    }
+    // An answer in two, with a frame of 8 bytes.
+    {
+        TestChunks c{{"not found"}};
+        const auto f = test_answer_frames(c, 9, 404, 8);
+        CHECK(f.size() == 2);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "01 09 94 01 6e 6f 74 20");
+        CHECK(test_hex_of(f[1].data(), f[1].size()) == "02 09 66 6f 75 6e 64");
+    }
+    // An empty answer is one frame: both flags, the status, nothing else.
+    {
+        TestChunks c;
+        const auto f = test_answer_frames(c, 1, 204, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "03 01 cc 00");
+    }
+    // And the hex helper reads what it writes.
+    const auto back = test_hex("03 07 c8 00");
+    CHECK(back.size() == 4 && back[2] == 0xc8);
+}
+
+static void test_link_assembler() {
+    LinkAssembler<64> a;
+    // Too short to be a frame, or with a bit nobody defined.
+    const uint8_t tiny[1] = {0x03};
+    CHECK(a.feed(tiny, 1) == LinkAssembler<64>::Step::Ignored);
+    const uint8_t odd[4] = {0x07, 1, 'x', 'y'};
+    CHECK(a.feed(odd, 4) == LinkAssembler<64>::Step::Ignored);
+    CHECK(a.feed(nullptr, 9) == LinkAssembler<64>::Step::Ignored);
+
+    // One frame, both flags.
+    for (const auto& f : test_request_frames("GET /api/map\n\n", 5, 20)) {
+        CHECK(a.feed(f.data(), f.size()) == LinkAssembler<64>::Step::Done);
+    }
+    CHECK(a.id() == 5);
+    CHECK(a.size() == 14);
+    CHECK_STR(a.data(), "GET /api/map\n\n");
+    CHECK(!a.busy());
+
+    // Several frames.
+    const std::string text = "POST /api/config\n\n{\"ssid\":\"Home\",\"pass\":\"\"}";
+    const auto frames = test_request_frames(text, 200, 9);
+    CHECK(frames.size() > 3);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto step = a.feed(frames[i].data(), frames[i].size());
+        CHECK(step == (i + 1 < frames.size() ? LinkAssembler<64>::Step::More : LinkAssembler<64>::Step::Done));
+        if (i + 1 < frames.size()) CHECK(a.busy());
+    }
+    CHECK(a.id() == 200);
+    CHECK(std::string(a.data(), a.size()) == text);
+
+    // A continuation with no message open, or with another number, is dropped.
+    const uint8_t stray[4] = {kLinkLast, 200, 'z', 'z'};
+    CHECK(a.feed(stray, 4) == LinkAssembler<64>::Step::Ignored);
+    const auto f1 = test_request_frames(text, 1, 9);
+    CHECK(a.feed(f1[0].data(), f1[0].size()) == LinkAssembler<64>::Step::More);
+    const uint8_t other[4] = {kLinkLast, 2, 'z', 'z'};
+    CHECK(a.feed(other, 4) == LinkAssembler<64>::Step::Ignored);
+    CHECK(a.busy());
+
+    // A new first frame drops the half-received request and starts over.
+    for (const auto& f : test_request_frames("GET /api/ble\n\n", 3, 20)) a.feed(f.data(), f.size());
+    CHECK(a.id() == 3);
+    CHECK_STR(a.data(), "GET /api/ble\n\n");
+
+    // Longer than the buffer: swallowed to the end, then reported once, with
+    // its number, for a 413.
+    const std::string big(100, 'a');
+    const auto bf = test_request_frames("POST /api/config\n\n" + big, 77, 20);
+    LinkAssembler<64>::Step last = LinkAssembler<64>::Step::Ignored;
+    int too = 0;
+    for (const auto& f : bf) {
+        last = a.feed(f.data(), f.size());
+        if (last == LinkAssembler<64>::Step::TooLarge) ++too;
+    }
+    CHECK(last == LinkAssembler<64>::Step::TooLarge);
+    CHECK(too == 1);
+    CHECK(a.id() == 77);
+    CHECK(a.size() == 0);
+    // And the next request is fine.
+    for (const auto& f : test_request_frames("GET /api/health\n\n", 78, 20)) {
+        CHECK(a.feed(f.data(), f.size()) == LinkAssembler<64>::Step::Done);
+    }
+    CHECK_STR(a.data(), "GET /api/health\n\n");
+
+    // Exactly the buffer's size fits; the NUL is extra.
+    LinkAssembler<16> small;
+    const std::string exact = "GET /api/x?a=1\n\n";
+    CHECK(exact.size() == 16);
+    for (const auto& f : test_request_frames(exact, 1, 6)) small.feed(f.data(), f.size());
+    CHECK(std::string(small.data(), small.size()) == exact);
+    const std::string over = "GET /api/x?ab=1\n\n";
+    LinkAssembler<16>::Step st = LinkAssembler<16>::Step::Ignored;
+    for (const auto& f : test_request_frames(over, 2, 6)) st = small.feed(f.data(), f.size());
+    CHECK(st == LinkAssembler<16>::Step::TooLarge);
+}
+
+static void test_link_parse() {
+    LinkRequest r{};
+    const char* g = "GET /api/nearby/find?after=12\n\n";
+    CHECK(link_parse(g, std::strlen(g), r) == LinkParse::Ok);
+    CHECK(!r.post);
+    CHECK_STR(r.path, "/api/nearby/find");
+    CHECK_STR(r.query, "after=12");
+    CHECK(r.body_len == 0);
+    CHECK_STR(r.key, "");
+
+    const char* p = "POST /api/config\r\nContent-Type: application/json\r\n\r\n{\"ssid\":\"a b\"}";
+    CHECK(link_parse(p, std::strlen(p), r) == LinkParse::Ok);
+    CHECK(r.post);
+    CHECK_STR(r.path, "/api/config");
+    CHECK_STR(r.query, "");
+    CHECK(r.body_len == 14);
+    CHECK(std::string(r.body, r.body_len) == "{\"ssid\":\"a b\"}");
+
+    // The update password, whatever the case of its name.
+    const char* k = "POST /api/update/check\nx-netmon-key:   s3cret pass\nOther: 1\n\n";
+    CHECK(link_parse(k, std::strlen(k), r) == LinkParse::Ok);
+    CHECK_STR(r.key, "s3cret pass");
+    CHECK(r.body_len == 0);
+
+    // " HTTP/1.1" after the target is allowed and ignored; so is a missing
+    // blank line.
+    const char* h = "GET /api/isp?force HTTP/1.1";
+    CHECK(link_parse(h, std::strlen(h), r) == LinkParse::Ok);
+    CHECK_STR(r.path, "/api/isp");
+    CHECK_STR(r.query, "force");
+    CHECK(r.body_len == 0);
+
+    // A body may carry blank lines of its own.
+    const char* b = "POST /api/x\n\nline1\n\nline3";
+    CHECK(link_parse(b, std::strlen(b), r) == LinkParse::Ok);
+    CHECK(std::string(r.body, r.body_len) == "line1\n\nline3");
+
+    const char* bad[] = {"", "GET", "PUT /api/x\n\n", "get /api/x\n\n", "GET api/x\n\n", "GET \n\n",
+                         "GET /api/\x01x\n\n"};
+    CHECK(link_parse(bad[0], 0, r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[1], 3, r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[2], std::strlen(bad[2]), r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[3], std::strlen(bad[3]), r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[4], std::strlen(bad[4]), r) == LinkParse::BadTarget);
+    CHECK(link_parse(bad[5], std::strlen(bad[5]), r) == LinkParse::BadTarget);
+    CHECK(link_parse(bad[6], std::strlen(bad[6]), r) == LinkParse::BadTarget);
+
+    std::string longpath = "GET /api/" + std::string(60, 'a') + "\n\n";
+    CHECK(link_parse(longpath.c_str(), longpath.size(), r) == LinkParse::TooLong);
+    std::string longq = "GET /api/x?" + std::string(200, 'q') + "\n\n";
+    CHECK(link_parse(longq.c_str(), longq.size(), r) == LinkParse::TooLong);
+    std::string longkey = "POST /api/x\nX-Netmon-Key: " + std::string(100, 'k') + "\n\n";
+    CHECK(link_parse(longkey.c_str(), longkey.size(), r) == LinkParse::TooLong);
+}
+
+static void test_link_arg() {
+    char v[16];
+    CHECK(link_arg("after=12", "after", v, sizeof(v)));
+    CHECK_STR(v, "12");
+    CHECK(link_arg("force", "force", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(link_arg("a=1&b=2&c", "b", v, sizeof(v)));
+    CHECK_STR(v, "2");
+    CHECK(link_arg("a=1&b=2&c", "c", v, sizeof(v)));
+    CHECK(!link_arg("a=1&b=2&c", "d", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(!link_arg("ab=1", "a", v, sizeof(v)));
+    CHECK(!link_arg("", "a", v, sizeof(v)));
+    CHECK(!link_arg(nullptr, "a", v, sizeof(v)));
+    CHECK(link_arg("n=a%20b+c%2Fd", "n", v, sizeof(v)));
+    CHECK_STR(v, "a b c/d");
+    // A broken escape is kept as it came.
+    CHECK(link_arg("n=50%", "n", v, sizeof(v)));
+    CHECK_STR(v, "50%");
+    CHECK(link_arg("n=%zz", "n", v, sizeof(v)));
+    CHECK_STR(v, "%zz");
+    // Cut short, never overrun.
+    char s[4];
+    CHECK(link_arg("n=abcdefg", "n", s, sizeof(s)));
+    CHECK_STR(s, "abc");
+    // The first of a repeated name wins.
+    CHECK(link_arg("x=1&x=2", "x", v, sizeof(v)));
+    CHECK_STR(v, "1");
+}
+
+static uint32_t g_link_rng = 12345;
+static uint32_t test_link_rand() {
+    g_link_rng = g_link_rng * 1103515245u + 12345u;
+    return g_link_rng >> 8;
+}
+
+// Answers cut from bodies split every which way come back whole, whatever the
+// frame size, with the flags in the right places and no empty frame in the
+// middle.
+static void test_link_cut() {
+    bool all_ok = true;
+    for (int round = 0; round < 400; ++round) {
+        const size_t len = test_link_rand() % 3000;
+        std::string body;
+        for (size_t i = 0; i < len; ++i) body += static_cast<char>('a' + test_link_rand() % 26);
+        TestChunks c;
+        size_t at = 0;
+        while (at < len) {
+            size_t n = test_link_rand() % 600;
+            if (n > len - at) n = len - at;
+            c.parts.push_back(body.substr(at, n));     // empty pieces too
+            at += n;
+        }
+        if (test_link_rand() % 4 == 0) c.parts.push_back("");
+        const size_t cap = 5 + test_link_rand() % 250;
+        const uint16_t status = static_cast<uint16_t>(100 + test_link_rand() % 500);
+        const uint8_t id = static_cast<uint8_t>(test_link_rand());
+        const auto frames = test_answer_frames(c, id, status, cap);
+        bool ok = !frames.empty();
+        std::string got;
+        uint16_t st = 0;
+        for (size_t i = 0; ok && i < frames.size(); ++i) {
+            const auto& f = frames[i];
+            const bool first = i == 0, last = i + 1 == frames.size();
+            ok = f.size() <= cap && f[1] == id &&
+                 f[0] == ((first ? kLinkFirst : 0) | (last ? kLinkLast : 0));
+            size_t from = kLinkHeader;
+            if (first) {
+                st = static_cast<uint16_t>(f[2] | (f[3] << 8));
+                from += kLinkStatus;
+            }
+            // Only the last frame may be short of data; none but it empty.
+            if (!last) ok = ok && f.size() == cap;
+            got.append(reinterpret_cast<const char*>(f.data() + from), f.size() - from);
+        }
+        all_ok = all_ok && ok && st == status && got == body;
+    }
+    CHECK(all_ok);
+
+    // While the handler is still producing, a used-up body means wait, not
+    // an empty frame; and nothing is marked last.
+    TestChunks c{{"abc"}};
+    uint8_t buf[32];
+    LinkCut cut = link_cut(c, 0, 0, true, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 7);
+    CHECK(buf[0] == kLinkFirst);
+    CHECK(!cut.last);
+    cut = link_cut(c, cut.chunk, cut.offset, false, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 0);
+    // More arrives, then the handler finishes.
+    c.parts.push_back("de");
+    cut = link_cut(c, 1, 0, false, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 4);
+    CHECK(buf[0] == 0);
+    cut = link_cut(c, cut.chunk, cut.offset, false, true, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 2);
+    CHECK(buf[0] == kLinkLast);
+    CHECK(cut.last);
+    // A frame too small to carry anything is never cut.
+    cut = link_cut(c, 0, 0, true, true, 4, 200, buf, 4);
+    CHECK(cut.len == 0);
+}
+
+static void test_link_pairing() {
+    PairWindow w{};
+    CHECK(!pair_live(w, 0));
+    CHECK(pair_left_ms(w, 0) == 0);
+    pair_open(w, 1000, 4123456);
+    CHECK(pair_live(w, 1000));
+    CHECK(w.code == 123456);
+    CHECK(pair_left_ms(w, 1000) == kPairWindowMs);
+    CHECK(pair_passkey(w, 5000, 999) == 123456);
+    // Asking again while open keeps the code and restarts the two minutes.
+    pair_open(w, 61000, 777777);
+    CHECK(w.code == 123456);
+    CHECK(pair_left_ms(w, 61000) == kPairWindowMs);
+    CHECK(pair_live(w, 61000 + kPairWindowMs - 1));
+    CHECK(!pair_live(w, 61000 + kPairWindowMs));
+    // Closed: any other attempt gets a code nobody was shown.
+    CHECK(pair_passkey(w, 61000 + kPairWindowMs, 2000042) == 42);
+    // Reopened later: a fresh code.
+    pair_open(w, 400000, 31);
+    CHECK(w.code == 31);
+    char t[7];
+    pair_code_text(w.code, t);
+    CHECK_STR(t, "000031");
+    pair_code_text(999999, t);
+    CHECK_STR(t, "999999");
+    pair_code_text(1000001, t);
+    CHECK_STR(t, "000001");
+    // One attempt closes it, whatever the outcome.
+    pair_done(w, 410000, false);
+    CHECK(!pair_live(w, 410000));
+    CHECK_STR(pair_result_text(w.result), "failed");
+    pair_open(w, 420000, 5);
+    CHECK_STR(pair_result_text(w.result), "");
+    pair_done(w, 421000, true);
+    CHECK_STR(pair_result_text(w.result), "paired");
+    pair_open(w, 430000, 6);
+    pair_close(w);
+    CHECK(!pair_live(w, 430001));
+    // The clock wrapping is no different from any other two minutes.
+    PairWindow z{};
+    pair_open(z, 0xFFFFFF00u, 9);
+    CHECK(pair_live(z, 0x00000100u));
+    CHECK(pair_left_ms(z, 0x00000100u) == kPairWindowMs - 0x200);
+
+    // Unpaired connections are let go; paired ones never.
+    CHECK(!link_drop_unpaired(false, 0, kLinkUnpairedMs, false));
+    CHECK(link_drop_unpaired(false, 0, kLinkUnpairedMs + 1, false));
+    CHECK(!link_drop_unpaired(false, 0, kLinkUnpairedMs + 1, true));
+    CHECK(link_drop_unpaired(false, 0, kLinkPairingMs + 1, true));
+    CHECK(!link_drop_unpaired(true, 0, 10 * kLinkPairingMs, false));
+}
+
+// --- Saved reports -------------------------------------------------------------
+
+#include "../netmon/src/core/report.h"
+
+static void test_clock() {
+    Clock c{};
+    CHECK(!clock_known(c));
+    CHECK(clock_now(c, 100) == 0);
+    // Too early, too late, before the board even started, or no source.
+    CHECK(!clock_set(c, 1600000000u, 10, ClockSource::Client));
+    CHECK(!clock_set(c, 4200000000u, 10, ClockSource::Client));
+    CHECK(!clock_set(c, 1791136862u, 10, ClockSource::None));
+    CHECK(!clock_known(c));
+    // A phone's clock, read at uptime 100.
+    CHECK(clock_set(c, 1791136862u, 100, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136762u);
+    CHECK(clock_now(c, 160) == 1791136922u);
+    // Another client may correct it; then the internet's word outranks them.
+    CHECK(clock_set(c, 1791136900u, 100, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136800u);
+    CHECK(clock_set(c, 1791136950u, 200, ClockSource::Internet));
+    CHECK(c.boot_unix == 1791136750u);
+    CHECK(!clock_set(c, 1791139999u, 200, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136750u);
+    CHECK(clock_set(c, 1791136960u, 205, ClockSource::Internet));
+    CHECK_STR(clock_source_text(c.source), "internet");
+    CHECK_STR(clock_source_text(ClockSource::Client), "client");
+    CHECK_STR(clock_source_text(ClockSource::None), "none");
+}
+
+static void test_http_date() {
+    uint32_t t = 0;
+    CHECK(http_date_parse("Sun, 04 Oct 2026 18:01:02 GMT", t));
+    CHECK(t == 1791136862u);
+    CHECK(http_date_parse("Thu, 29 Feb 2024 12:00:00 GMT", t));
+    CHECK(t == 1709208000u);
+    CHECK(http_date_parse("Thu, 01 Jan 1970 00:00:00 GMT", t));
+    CHECK(t == 0);
+    CHECK(http_date_parse("Fri, 31 Dec 2099 23:59:59 GMT", t));
+    CHECK(t == 4102444799u);
+    // The obsolete forms, and broken ones, are refused.
+    CHECK(!http_date_parse("Sunday, 04-Oct-26 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun Oct  4 18:01:02 2026", t));
+    CHECK(!http_date_parse("Sun, 04 Okt 2026 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 04 Oct 2026 24:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 4 Oct 2026 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 04 Oct 2026 18:01:02 UTC", t));
+    CHECK(!http_date_parse("", t));
+    CHECK(!http_date_parse(nullptr, t));
+
+    const char* h = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nX-Date: nope\r\n"
+                    "date:  Sun, 04 Oct 2026 18:01:02 GMT\r\nContent-Length: 12\r\n";
+    CHECK(http_date_header(h, std::strlen(h), t));
+    CHECK(t == 1791136862u);
+    const char* none = "HTTP/1.0 200 OK\r\nUpdated: Sun, 04 Oct 2026 18:01:02 GMT\r\n";
+    CHECK(!http_date_header(none, std::strlen(none), t));
+    // Only within the length given.
+    CHECK(!http_date_header(h, 40, t));
+    CHECK(!http_date_header(nullptr, 10, t));
+}
+
+static ReportSlot test_slot(const char* ssid, const char* subnet, uint32_t seq) {
+    ReportSlot s{};
+    s.used = true;
+    std::strncpy(s.ssid, ssid, sizeof(s.ssid) - 1);
+    std::strncpy(s.subnet, subnet, sizeof(s.subnet) - 1);
+    s.seq = seq;
+    return s;
+}
+
+static void test_report_slots() {
+    ReportSlot s[4]{};
+    CHECK(report_slot_for(s, 4, "Home", "192.168.2.0/24") == 0);
+    CHECK(report_next_seq(s, 4) == 1);
+    s[0] = test_slot("Home", "192.168.2.0/24", 5);
+    s[2] = test_slot("Office", "10.0.0.0/16", 9);
+    // Its own slot, else the first empty one.
+    CHECK(report_slot_for(s, 4, "Home", "192.168.2.0/24") == 0);
+    CHECK(report_slot_for(s, 4, "Office", "10.0.0.0/16") == 2);
+    CHECK(report_slot_for(s, 4, "Home", "192.168.3.0/24") == 1);   // same name, another subnet
+    CHECK(report_slot_for(s, 4, "home", "192.168.2.0/24") == 1);   // names are case sensitive
+    CHECK(report_next_seq(s, 4) == 10);
+    // All four used: the one saved longest ago gives way.
+    s[1] = test_slot("Cafe", "192.168.1.0/24", 7);
+    s[3] = test_slot("Lab", "172.16.0.0/24", 3);
+    CHECK(report_slot_for(s, 4, "Friend", "192.168.0.0/24") == 3);
+    s[3].seq = 11;
+    CHECK(report_slot_for(s, 4, "Friend", "192.168.0.0/24") == 0);
+    CHECK(report_slot_for(s, 4, "Lab", "172.16.0.0/24") == 3);
+    CHECK(!report_same(s[0], nullptr, "x"));
+
+    // Ages and gaps: from the uptime this boot, else from the clock.
+    ReportSlot r = test_slot("Home", "192.168.2.0/24", 1);
+    r.this_boot = true;
+    r.saved_up_s = 1000;
+    CHECK(report_age_s(r, 1600, 0) == 600);
+    uint32_t gap = 0;
+    CHECK(report_gap_s(r, 1600, 0, gap) && gap == 600);
+    r.this_boot = false;
+    r.saved_unix = 1791130000u;
+    CHECK(report_age_s(r, 50, 0) == -1);
+    CHECK(!report_gap_s(r, 50, 0, gap));
+    CHECK(report_age_s(r, 50, 1791136862u) == 6862);
+    CHECK(report_gap_s(r, 50, 1791136862u, gap) && gap == 6862);
+    r.saved_unix = 0;
+    CHECK(report_age_s(r, 50, 1791136862u) == -1);
+    CHECK(!report_gap_s(r, 50, 1791136862u, gap));
+    ReportSlot empty{};
+    CHECK(report_age_s(empty, 50, 1791136862u) == -1);
+}
+
+static ReportRow test_row(uint8_t n, uint32_t ago, uint32_t seen_unix, const char* name = "") {
+    ReportRow r{};
+    r.mac = test_mac_n(n);
+    r.ip = 0xC0A80200u + n;
+    r.status = Status::Known;
+    r.online = true;
+    r.up_s = 50;
+    r.ago_s = ago;
+    r.seen_unix = seen_unix;
+    std::strncpy(r.hostname, name, sizeof(r.hostname) - 1);
+    return r;
+}
+
+static void test_report_rows() {
+    // A device from the board's table, saved at uptime 1000 with the clock
+    // known: dated, and aged from the uptime.
+    Device d{};
+    d.mac = test_mac_n(4);
+    d.ip = 0xC0A8022Du;
+    d.first_seen = 100;
+    d.online_since = 400;
+    d.last_seen = 990;
+    d.status = Status::Private;
+    d.online = true;
+    std::strncpy(d.hostname, "Pixel-7", sizeof(d.hostname) - 1);
+    Clock clk{};
+    clock_set(clk, 1791136862u, 1000, ClockSource::Client);
+    ReportRow r{};
+    report_row_from(d, 1000, clk, false, r);
+    CHECK(r.ago_s == 10);
+    CHECK(r.up_s == 600);
+    CHECK(r.seen_unix == 1791136852u);
+    CHECK(r.first_unix == 1791135962u);
+    CHECK(!r.carried);
+    CHECK_STR(r.hostname, "Pixel-7");
+    // Without a clock: ages only. Offline: no uptime.
+    d.online = false;
+    report_row_from(d, 1000, Clock{}, true, r);
+    CHECK(r.seen_unix == 0 && r.first_unix == 0);
+    CHECK(r.up_s == 0);
+    CHECK(r.self);
+
+    // Merging: this boot's rows 1 and 2; the last report had 2, 3, 4 and 5.
+    ReportRow rows[8]{};
+    rows[0] = test_row(1, 5, 0, "desk");
+    rows[1] = test_row(2, 0, 0, "");
+    rows[2] = test_row(2, 30, 1791130000u, "nas");      // the same device: its name fills the gap
+    rows[2].first_unix = 1700000000u;
+    rows[3] = test_row(3, 900, 1791129000u, "tv");
+    rows[4] = test_row(4, 60, 1791129900u, "phone");
+    rows[5] = test_row(5, 200, 0, "");
+    rows[5].self = true;
+    size_t n = report_merge(rows, 2, 4, true, 600, 8);
+    CHECK(n == 5);
+    CHECK(mac_equal(rows[0].mac, test_mac_n(1)) && !rows[0].carried);
+    CHECK(mac_equal(rows[1].mac, test_mac_n(2)) && !rows[1].carried);
+    CHECK_STR(rows[1].hostname, "nas");
+    CHECK(rows[1].first_unix == 1700000000u);
+    CHECK(rows[1].ago_s == 0);                       // this boot's sighting stands
+    // Carried over, most recently seen first, aged by the gap, offline.
+    CHECK(mac_equal(rows[2].mac, test_mac_n(4)) && rows[2].carried && rows[2].ago_s == 660);
+    CHECK(mac_equal(rows[3].mac, test_mac_n(5)) && rows[3].ago_s == 800 && !rows[3].self);
+    CHECK(mac_equal(rows[4].mac, test_mac_n(3)) && rows[4].ago_s == 1500);
+    CHECK(!rows[2].online && rows[2].up_s == 0);
+    CHECK(rows[2].seen_unix == 1791129900u);         // a date stays as it was
+
+    // A gap that cannot be told leaves the ages as they were; a cap drops the
+    // oldest; a device twice in the old report is kept once.
+    ReportRow r2[6]{};
+    r2[0] = test_row(1, 0, 0);
+    r2[1] = test_row(7, 100, 0);
+    r2[2] = test_row(8, 50, 0);
+    r2[3] = test_row(7, 100, 0);
+    r2[4] = test_row(9, 400, 0);
+    n = report_merge(r2, 1, 4, false, 0, 3);
+    CHECK(n == 3);
+    CHECK(mac_equal(r2[1].mac, test_mac_n(8)) && r2[1].ago_s == 50);
+    CHECK(mac_equal(r2[2].mac, test_mac_n(7)) && r2[2].ago_s == 100);
+    // Ages never wrap.
+    ReportRow r3[2]{};
+    r3[0] = test_row(1, 0xFFFFFF00u, 0);
+    n = report_merge(r3, 0, 1, true, 0x1000, 2);
+    CHECK(n == 1 && r3[0].ago_s == 0xFFFFFFFFu);
+    // Nothing from before: this boot's rows as they are.
+    ReportRow r4[2]{};
+    r4[0] = test_row(1, 3, 0);
+    CHECK(report_merge(r4, 1, 0, true, 10, 2) == 1);
+}
+
+static void test_report_lines() {
+    ReportMeta m{};
+    std::strcpy(m.ssid, "Home \"5\"");
+    std::strcpy(m.subnet, "192.168.2.0/24");
+    std::strcpy(m.gateway, "192.168.2.1");
+    std::strcpy(m.gateway_mac, "50:91:E3:12:34:56");
+    std::strcpy(m.board_ip, "192.168.2.27");
+    std::strcpy(m.board_mac, "D4:E9:F4:12:34:56");
+    std::strcpy(m.version, "0.12.0-bluetooth");
+    m.seq = 7;
+    m.saved_unix = 1791136862u;
+    m.saved_up_s = 5400;
+    m.clock = ClockSource::Client;
+    m.passes = 88;
+    m.learning = false;
+    m.count = 2;
+    m.online = 1;
+    char buf[kReportLineMax];
+    const size_t n = report_header_line(m, buf, sizeof(buf));
+    CHECK(n == std::strlen(buf));
+    CHECK_STR(buf, "{\"report\":1,\"ssid\":\"Home \\\"5\\\"\",\"subnet\":\"192.168.2.0/24\","
+                   "\"gateway\":\"192.168.2.1\",\"gateway_mac\":\"50:91:E3:12:34:56\","
+                   "\"board_ip\":\"192.168.2.27\",\"board_mac\":\"D4:E9:F4:12:34:56\","
+                   "\"version\":\"0.12.0-bluetooth\",\"seq\":7,\"saved_unix\":1791136862,"
+                   "\"saved_up_s\":5400,\"clock\":\"client\",\"passes\":88,\"learning\":false,"
+                   "\"count\":2,\"online\":1,\"devices\":[\n");
+    // Too small a buffer: nothing, never a broken line.
+    char tiny[40];
+    CHECK(report_header_line(m, tiny, sizeof(tiny)) == 0);
+
+    ReportRow r = test_row(4, 10, 1791136852u, "Desk\\PC\x01");
+    r.mac.b[0] = 0xDA;                      // a private address
+    r.status = Status::Private;
+    r.first_unix = 1791135962u;
+    const size_t k = report_row_line(r, "Acme \"Co\"", false, buf, sizeof(buf));
+    CHECK(k == std::strlen(buf));
+    CHECK_STR(buf, "{\"mac\":\"DA:00:00:00:00:04\",\"ip\":\"192.168.2.4\",\"hostname\":\"Desk\\\\PC\","
+                   "\"vendor\":\"Acme \\\"Co\\\"\",\"status\":\"private\",\"randomised\":true,"
+                   "\"self\":false,\"online\":true,\"up_s\":50,\"last_seen_s\":10,"
+                   "\"seen_unix\":1791136852,\"first_unix\":1791135962,\"carried\":false},\n");
+    r.carried = true;
+    report_row_line(r, nullptr, true, buf, sizeof(buf));
+    CHECK(std::strstr(buf, "\"vendor\":\"\"") != nullptr);
+    CHECK(std::strstr(buf, "\"carried\":true}\n") != nullptr);
+    // The longest a row can be still fits a line.
+    ReportRow big{};
+    big.mac = test_mac_n(1);
+    big.ip = 0xFFFFFFFFu;
+    std::memset(big.hostname, '"', sizeof(big.hostname) - 1);
+    big.ago_s = big.up_s = big.seen_unix = big.first_unix = 0xFFFFFFFFu;
+    char vendor[64];
+    std::memset(vendor, '"', sizeof(vendor) - 1);
+    vendor[sizeof(vendor) - 1] = '\0';
+    CHECK(report_row_line(big, vendor, false, buf, sizeof(buf)) > 0);
+
+    CHECK(report_status_of("known") == Status::Known);
+    CHECK(report_status_of("private") == Status::Private);
+    CHECK(report_status_of("unknown") == Status::Unknown);
+    CHECK(report_status_of(nullptr) == Status::Unknown);
+    CHECK(report_clock_of("internet") == ClockSource::Internet);
+    CHECK(report_clock_of("client") == ClockSource::Client);
+    CHECK(report_clock_of("x") == ClockSource::None);
+}
+
 int main() {
     test_mac();
     test_event_log();
@@ -1911,6 +2589,17 @@ int main() {
     test_air_find_hold();
     test_air_plan_find();
     test_air_table_get();
+    test_link_vectors();
+    test_link_assembler();
+    test_link_parse();
+    test_link_arg();
+    test_link_cut();
+    test_link_pairing();
+    test_clock();
+    test_http_date();
+    test_report_slots();
+    test_report_rows();
+    test_report_lines();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

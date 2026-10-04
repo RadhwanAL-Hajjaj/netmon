@@ -26,6 +26,7 @@ void settings_defaults(Settings& s) {
     s.air_wifi = true;
     s.air_ble = true;
     s.air_background_s = 120;
+    s.ble_link = true;
 }
 
 bool settings_load(Settings& s) {
@@ -75,6 +76,8 @@ bool settings_load(Settings& s) {
     s.air_ble = doc["air_ble"] | true;
     s.air_background_s = doc["air_background_s"] | 120u;
     if (!air_background_valid(s.air_background_s)) s.air_background_s = 120;
+    // Absent before 0.12.0: on, like a new board.
+    s.ble_link = doc["ble_link"] | true;
     return true;
 }
 
@@ -100,6 +103,7 @@ bool settings_save(const Settings& s) {
     doc["air_wifi"] = s.air_wifi;
     doc["air_ble"] = s.air_ble;
     doc["air_background_s"] = s.air_background_s;
+    doc["ble_link"] = s.ble_link;
 
     File f = LittleFS.open(kPath, "w");
     if (!f) {

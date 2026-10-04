@@ -22,12 +22,56 @@ from extract_pages import extract
 
 PAGES_H = sys.argv[1] if len(sys.argv) > 1 else __file__.rsplit('/', 1)[0] + '/../../netmon/src/hw/pages.h'
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
-VERSION = "0.11.0-finder"
+VERSION = "0.12.0-bluetooth"
 BOOT = time.time() - 5400
 LOCK = threading.Lock()
 LOG = []
 CFG = {"wifi": True, "ble": True, "ble_ready": True, "background_s": 120}
 SIM = {"unavailable": False, "requested": False}
+# The Bluetooth link, as GET /api/ble reports it; see ble_status().
+# Saved reports (firmware 0.12): slot -> the report as the board keeps it.
+CLOCK = {"boot_unix": 0}
+REPORTS = {}
+
+
+def report_of(ssid, subnet, seq, saved_unix, devices):
+    return {"report": 1, "ssid": ssid, "subnet": subnet, "gateway": subnet.rsplit(".", 1)[0] + ".1",
+            "gateway_mac": "50:91:E3:12:34:56", "board_ip": subnet.rsplit(".", 1)[0] + ".27",
+            "board_mac": "D4:E9:F4:12:34:56", "version": VERSION, "seq": seq, "saved_unix": saved_unix,
+            "saved_up_s": 3600, "clock": "client" if saved_unix else "none", "passes": 60, "learning": False,
+            "count": len(devices), "online": sum(1 for d in devices if d["online"]), "devices": devices}
+
+
+def report_rows(saved_unix):
+    out = []
+    for i, d in enumerate(devices()):
+        ago = d["last_seen_s"]
+        out.append(dict(d, seen_unix=(saved_unix - ago) if saved_unix else 0,
+                        first_unix=(saved_unix - 86400) if saved_unix else 0, carried=i % 9 == 8))
+    return out
+
+
+def reports_list():
+    now = int(time.time())
+    out = []
+    for slot, r in sorted(REPORTS.items()):
+        out.append({"slot": slot, "ssid": r["ssid"], "subnet": r["subnet"], "gateway": r["gateway"],
+                    "count": r["count"], "online": r["online"], "saved_unix": r["saved_unix"],
+                    "age_s": (now - r["saved_unix"]) if r["saved_unix"] else -1,
+                    "bytes": len(json.dumps(r)), "current": r["ssid"] == "HOME-2.4"})
+    return {"max": 4, "every_s": 900, "clock": CLOCK["boot_unix"] != 0, "now_unix": now if CLOCK["boot_unix"] else 0,
+            "free_bytes": 120000, "network": {"ssid": "HOME-2.4", "subnet": "192.168.2.0/24"}, "reports": out}
+
+
+def reports_reset():
+    now = int(time.time())
+    REPORTS.clear()
+    REPORTS[0] = report_of("HOME-2.4", "192.168.2.0/24", 5, now - 300, report_rows(now - 300))
+    REPORTS[2] = report_of("Office =Guest", "10.20.0.0/16", 3, 0, report_rows(0)[:6])
+
+
+LINK = {"enabled": True, "bonds": 1, "open": 0.0, "code": "", "result": "", "result_at": 0.0,
+       "connected": 0, "secure": 0}
 
 
 def up():
@@ -268,7 +312,19 @@ def health():
             "pass_seen": sum(1 for d in LAN if d[5]), "pass_merges": 120, "arp_cache": 10, "latency_valid": True,
             "latency_ms": 4, "latency_age_s": 12, "dhcp_packets": 3, "events": 2,
             "baseline_open": False, "baseline_anchored": True, "baseline_closes_in_s": 0,
-            "names_known": 4}
+            "names_known": 4, "mac": "D4:E9:F4:12:34:56", "ble_link": LINK["enabled"],
+            "clock": CLOCK["boot_unix"] != 0}
+
+
+def ble_status():
+    now = time.time()
+    live = LINK["open"] and now - LINK["open"] < 120
+    return {"link": 1, "available": True, "enabled": LINK["enabled"], "on": LINK["enabled"],
+            "name": "netmon", "addr": "D4:E9:F4:12:34:58", "bonds": LINK["bonds"], "max_bonds": 3,
+            "connected": LINK["connected"], "secure": LINK["secure"], "pairing": bool(live),
+            "code": LINK["code"] if live else "", "left_s": int(120 - (now - LINK["open"]) + 0.999) if live else 0,
+            "result": LINK["result"], "result_age_s": int(now - LINK["result_at"]) if LINK["result"] else 0,
+            "served": 0, "via": "wifi"}
 
 
 LAN = [
@@ -368,6 +424,8 @@ class H(BaseHTTPRequestHandler):
                                     "gateway": "192.168.2.1", "gateway_mac": "", "gateway_vendor": ""},
                "/api/latency": lambda: {"valid": True, "rtt_ms": 4, "checked_s": up() - 5, "age_s": 5,
                                         "failures": 0, "method": "tcp"},
+               "/api/ble": ble_status,
+               "/api/reports": reports_list,
                "/__log": lambda: LOG[-200:]}
         if u.path == "/api/nearby/find":
             q = parse_qs(u.query)
@@ -377,6 +435,17 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, find_body(int(q.get("after", ["0"])[0] or 0)))
         if u.path == "/__find":
             return self.send(200, {"t": FIND["t"], "seq": FIND["seq"], "turn": FIND["turn"]})
+        if u.path == "/api/reports/get":
+            q = parse_qs(u.query)
+            slot = q.get("slot", [""])[0]
+            if not slot.isdigit() or int(slot) not in REPORTS:
+                return self.send(404, {"error": "No report is saved there."})
+            # As the board lays it out: one device a line.
+            r = dict(REPORTS[int(slot)])
+            devs = r.pop("devices")
+            head = json.dumps(r, separators=(",", ":"))[:-1] + ',"devices":[\n'
+            body = head + ",\n".join(json.dumps(d, separators=(",", ":")) for d in devs) + "\n]}\n"
+            return self.send(200, body)
         if u.path == "/api/map":
             return self.send(200, mapdata())
         if u.path in api:
@@ -416,6 +485,75 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 code, out = find_start(j)
             return self.send(code, out)
+        if u.path in ("/api/ble", "/api/ble/pair", "/api/ble/forget"):
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            with LOCK:
+                if u.path == "/api/ble":
+                    if not isinstance(j.get("enabled"), bool):
+                        return self.send(400, {"error": "enabled must be true or false"})
+                    LINK["enabled"] = j["enabled"]
+                    if not LINK["enabled"]:
+                        LINK["open"] = 0.0
+                elif u.path == "/api/ble/pair":
+                    if j.get("stop") is True:
+                        LINK["open"] = 0.0
+                    elif not LINK["enabled"]:
+                        return self.send(409, {"error": "The Bluetooth link is switched off. Switch it on first."})
+                    else:
+                        if not (LINK["open"] and time.time() - LINK["open"] < 120):
+                            LINK["code"] = "%06d" % random.randint(0, 999999)
+                        LINK["open"] = time.time()
+                        LINK["result"] = ""
+                else:
+                    LINK["bonds"] = 0
+                return self.send(200, ble_status())
+        if u.path == "/api/clock":
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            t = j.get("unix")
+            if not isinstance(t, int) or not (1704067200 <= t <= 4102444800):
+                return self.send(400, {"error": "that time is not plausible"})
+            CLOCK["boot_unix"] = t - up()
+            return self.send(200, {"clock": True, "unix": t, "source": "client"})
+        if u.path == "/api/reports/save":
+            now = int(time.time()) if CLOCK["boot_unix"] else 0
+            seq = max([r["seq"] for r in REPORTS.values()] + [0]) + 1
+            REPORTS[0] = report_of("HOME-2.4", "192.168.2.0/24", seq, now, report_rows(now))
+            return self.send(200, reports_list())
+        if u.path == "/api/reports/delete":
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            if j.get("slot") not in REPORTS:
+                return self.send(404, {"error": "No report is saved there."})
+            del REPORTS[j["slot"]]
+            return self.send(200, reports_list())
+        if u.path == "/__reports":
+            reports_reset()
+            CLOCK["boot_unix"] = 0
+            return self.send(200, {"ok": True})
+        if u.path == "/__ble":
+            # Test hooks: back to one paired phone (?reset=1), or a phone
+            # finishing pairing, well or badly.
+            q = parse_qs(u.query)
+            if "reset" in q:
+                with LOCK:
+                    LINK.update(enabled=True, bonds=1, open=0.0, code="", result="", result_at=0.0)
+                return self.send(200, {"ok": True})
+            with LOCK:
+                ok = q.get("paired", ["1"])[0] == "1"
+                LINK["open"] = 0.0
+                LINK["result"] = "paired" if ok else "failed"
+                LINK["result_at"] = time.time()
+                if ok:
+                    LINK["bonds"] = min(3, LINK["bonds"] + 1)
+            return self.send(200, {"ok": True})
         if u.path == "/__find":
             q = parse_qs(u.query)
             if "walk" in q:
@@ -434,5 +572,6 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    reports_reset()
     print("mock board on http://127.0.0.1:%d" % PORT, flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

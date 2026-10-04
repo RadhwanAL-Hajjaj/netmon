@@ -4,7 +4,9 @@
 // from 0.10.0, the Wi-Fi + BLE scanner: the Nearby page, with a radar for
 // Wi-Fi networks and one for Bluetooth devices. From 0.11.0 those are tabs of
 // their own, beside a Finder for walking up to one device, and the Map page
-// draws the local network.
+// draws the local network. From 0.12.0 the API also answers over Bluetooth,
+// to phones paired with a 6-digit code (src/core/ble_link.h), and the board
+// keeps a saved report of each network it has been on (src/core/report.h).
 //
 // Board:     ESP32 Dev Module
 // Partition: Minimal SPIFFS (1.9MB APP with OTA)
@@ -22,14 +24,18 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <esp_ota_ops.h>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "src/core/air_ble.h"
 #include "src/core/air_find.h"
 #include "src/core/air_plan.h"
 #include "src/core/air_wifi.h"
+#include "src/core/ble_link.h"
 #include "src/core/ble_type.h"
 #include "src/core/ble_vendor.h"
 #include "src/core/cidr.h"
@@ -41,17 +47,20 @@
 #include "src/core/origin.h"
 #include "src/core/oui_table.h"
 #include "src/core/refresh.h"
+#include "src/core/report.h"
 #include "src/core/scan_list.h"
 #include "src/core/sweep.h"
 #include "src/core/validate.h"
 #include "src/hw/air_scan.h"
 #include "src/hw/arp_scan.h"
+#include "src/hw/ble_link.h"
 #include "src/hw/config_store.h"
 #include "src/hw/dhcp_capture.h"
 #include "src/hw/isp_lookup.h"
 #include "src/hw/latency.h"
 #include "src/hw/name_store.h"
 #include "src/hw/pages.h"
+#include "src/hw/report_store.h"
 #include "src/hw/scanner_import.h"
 #include "src/hw/uptime.h"
 #include "src/hw/wifi_manager.h"
@@ -68,12 +77,98 @@ static_assert(sizeof(NETMON_UPDATE_PASSWORD) > 8,
 static_assert(!same_text(NETMON_UPDATE_PASSWORD, "change-me"),
               "netmon: choose your own NETMON_UPDATE_PASSWORD in secrets.h");
 
-static const char* kFirmwareVersion = "0.11.0-finder";
+static const char* kFirmwareVersion = "0.12.0-bluetooth";
 static const char* kOtaHostname = "netmon";
 static const char* kOtaPassword = NETMON_UPDATE_PASSWORD;
 
 static Settings g_settings;
 static WebServer g_server(80);
+
+// --- One API, two ways in ------------------------------------------------------
+//
+// Every /api/ endpoint answers the same over Wi-Fi, through the web server,
+// and over the Bluetooth link (src/hw/ble_link.h) to a paired phone. The
+// handlers never talk to either directly: they read the request and answer
+// through the few functions here, which go to whichever the request came in
+// on. The pages themselves are Wi-Fi only.
+enum class Via : uint8_t { Http, Link };
+static Via g_via = Via::Http;
+static const LinkIncoming* g_link_req = nullptr;    // while serving the link
+
+static bool api_has_arg(const char* name) {
+    if (g_via == Via::Link) {
+        char v[2];
+        return link_arg(g_link_req->req.query, name, v, sizeof(v));
+    }
+    return g_server.hasArg(name);
+}
+
+static String api_arg(const char* name) {
+    if (g_via == Via::Link) {
+        char v[64];
+        return link_arg(g_link_req->req.query, name, v, sizeof(v)) ? String(v) : String();
+    }
+    return g_server.arg(name);
+}
+
+static String api_body() {
+    if (g_via == Via::Link) {
+        return String(g_link_req->req.body, static_cast<unsigned int>(g_link_req->req.body_len));
+    }
+    return g_server.arg("plain");
+}
+
+// Only Origin, Host and X-Netmon-Key are ever asked for. Nothing on the link
+// has an Origin or a Host: no web page sends over it.
+static String api_header(const char* name) {
+    if (g_via == Via::Link) {
+        if (strcasecmp(name, "X-Netmon-Key") == 0) return String(g_link_req->req.key);
+        return String();
+    }
+    return g_server.header(name);
+}
+
+static void api_send(int code, const char* type, const String& body) {
+    if (g_via == Via::Link) {
+        ble_link_answer_status(static_cast<uint16_t>(code));
+        ble_link_answer_add(body);
+        return;
+    }
+    g_server.send(code, type, body);
+}
+
+// An answer sent in pieces, so a long one never needs one long allocation.
+static void api_begin_pieces(int code, const char* type) {
+    if (g_via == Via::Link) {
+        ble_link_answer_status(static_cast<uint16_t>(code));
+        return;
+    }
+    g_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    g_server.send(code, type, "");
+}
+
+static void api_piece(const String& part) {
+    if (part.length() == 0) return;
+    if (g_via == Via::Link) {
+        ble_link_answer_add(part);
+        return;
+    }
+    g_server.sendContent(part);
+}
+
+static void api_end_pieces() {
+    if (g_via == Via::Http) g_server.sendContent("");    // the terminating empty chunk
+}
+
+// Before a deliberate restart: lets the answer reach whoever asked.
+static void api_settle(uint32_t http_ms) {
+    if (g_via == Via::Link) {
+        ble_link_answer_end();
+        ble_link_flush(2000);
+        return;
+    }
+    delay(http_ms);
+}
 
 // Only runs in setup mode. Android and iOS both probe a known URL after
 // joining a network and, finding no internet, quietly route everything over
@@ -131,6 +226,15 @@ static uint32_t g_isp_try_s = 0;
 static uint32_t g_isp_ok_s = 0;
 static const uint32_t kIspIntervalS = 21600;   // six hours
 static const uint32_t kIspBackoffS = 120;      // floor between attempts
+
+// Saved reports, one per network (src/core/report.h), and the clock that
+// dates them. The board has no clock of its own: it learns the time from the
+// provider lookup's Date header, or from the app or a page.
+static Clock g_clock{};
+static ReportSlot g_reports[kReportSlots];
+static const size_t kReportReserve = 24576;     // left free for settings and names
+static bool g_report_first_done = false;
+static uint32_t g_report_last_ms = 0;
 
 static const uint32_t kSettleMs = 150;   // let ARP replies land before reading
 
@@ -192,6 +296,7 @@ static const uint32_t kAirBleForgetS = 300;
 static uint32_t now_s() { return uptime_s(); }
 
 static void append_json_escaped(String& out, const char* s);
+static void before_restart();
 
 // Who has the radio. A pass is in flight from its first batch until the last
 // batch's replies are read. See air_plan.h for why the two never overlap.
@@ -387,9 +492,20 @@ static void handle_health() {
     body += String(baseline_remaining_s());
     body += F(",\"names_known\":");
     body += String(g_names.size());
+    // From 0.12: who this board is, so a phone that reaches it both over
+    // Wi-Fi and over Bluetooth knows the two are one board, and whether the
+    // Bluetooth link is on.
+    body += F(",\"mac\":\"");
+    body += WiFi.macAddress();
+    body += F("\",\"ble_link\":");
+    body += (ble_link_enabled() ? F("true") : F("false"));
+    // Whether the board knows the time, from 0.12. The app and the pages
+    // send theirs when it does not; see POST /api/clock.
+    body += F(",\"clock\":");
+    body += (clock_known(g_clock) ? F("true") : F("false"));
     body += F("}");
 
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void handle_root() {
@@ -430,7 +546,7 @@ static void handle_scan() {
     if (!fresh) {
         const int n = air_wifi_scan_blocking(kAirWifiLimitMs);
         if (n < 0) {
-            g_server.send(503, "application/json",
+            api_send(503, "application/json",
                           F("{\"error\":\"Wi-Fi scan failed or is busy\"}"));
             return;
         }
@@ -456,18 +572,19 @@ static void handle_scan() {
         body += '}';
     }
     body += ']';
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 // Settings, forget and restart are refused when a page on another site sent
-// them; see origin.h. The Android app sends no Origin and is not affected.
+// them; see origin.h. The Android app sends no Origin and is not affected, and
+// nothing that comes over the Bluetooth link has one.
 static bool refuse_other_site() {
-    const String origin = g_server.header("Origin");
-    const String host = g_server.hostHeader();
+    const String origin = api_header("Origin");
+    const String host = g_via == Via::Http ? g_server.hostHeader() : String();
     if (origin_allowed(origin.c_str(), host.c_str())) return false;
     Serial.print(F("[http] refused a POST sent from "));
     Serial.println(origin);
-    g_server.send(403, "application/json",
+    api_send(403, "application/json",
                   F("{\"error\":\"refused: the request came from a page on "
                     "another site\"}"));
     return true;
@@ -477,13 +594,13 @@ static void send_config_error(const char* text) {
     String body = F("{\"error\":\"");
     body += text;
     body += F("\"}");
-    g_server.send(400, "application/json", body);
+    api_send(400, "application/json", body);
 }
 
 static void handle_config_post() {
     if (refuse_other_site()) return;
     JsonDocument doc;
-    if (deserializeJson(doc, g_server.arg("plain"))) {
+    if (deserializeJson(doc, api_body())) {
         send_config_error("request body is not valid JSON");
         return;
     }
@@ -543,14 +660,14 @@ static void handle_config_post() {
     s.learning_window_s = learn_s;
 
     if (!settings_save(s)) {
-        g_server.send(500, "application/json",
+        api_send(500, "application/json",
                       F("{\"error\":\"could not write settings to flash\"}"));
         return;
     }
     g_settings = s;
     Serial.print(F("[cfg] saved, networks remembered: "));
     Serial.println(g_settings.net_count);
-    g_server.send(200, "application/json", F("{\"status\":\"saved\"}"));
+    api_send(200, "application/json", F("{\"status\":\"saved\"}"));
 }
 
 // --- discovery / events -------------------------------------------------
@@ -859,7 +976,7 @@ static void handle_dhcp() {
     local["hostname"] = kOtaHostname;
     String body;
     serializeJson(doc, body);
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static bool probe_due() {
@@ -900,7 +1017,7 @@ static void handle_latency() {
     body += F(",\"method\":\"");
     body += g_latency.method;
     body += F("\"}");
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 // --- Nearby ----------------------------------------------------------------
@@ -1034,9 +1151,9 @@ static const char* find_kind_text(FindKind k) {
 // that in one block every three seconds while the Nearby page is open is how
 // an ESP32 runs out of memory with plenty free in total.
 static void chunk_flush(String& part, bool last) {
-    if (part.length() > 0) g_server.sendContent(part);
+    api_piece(part);
     part = "";
-    if (last) g_server.sendContent("");      // the terminating empty chunk
+    if (last) api_end_pieces();
 }
 
 static void chunk_maybe(String& part) {
@@ -1058,8 +1175,7 @@ static void handle_nearby() {
         }
     }
 
-    g_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    g_server.send(200, "application/json", "");
+    api_begin_pieces(200, "application/json");
     String body;
     body.reserve(1700);
     body += F("{\"version\":\"");
@@ -1202,7 +1318,7 @@ static void handle_nearby_scan() {
     body += F(",\"ble\":");
     body += (ble ? F("true") : F("false"));
     body += '}';
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void send_air_config() {
@@ -1213,7 +1329,7 @@ static void send_air_config() {
     doc["background_s"] = g_settings.air_background_s;
     String body;
     serializeJson(doc, body);
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void handle_nearby_config_get() { send_air_config(); }
@@ -1224,7 +1340,7 @@ static void handle_nearby_config_get() { send_air_config(); }
 static void handle_nearby_config_post() {
     if (refuse_other_site()) return;
     JsonDocument doc;
-    if (deserializeJson(doc, g_server.arg("plain"))) {
+    if (deserializeJson(doc, api_body())) {
         send_config_error("request body is not valid JSON");
         return;
     }
@@ -1252,7 +1368,7 @@ static void handle_nearby_config_post() {
         s.air_background_s = doc["background_s"].as<uint32_t>();
     }
     if (!settings_save(s)) {
-        g_server.send(500, "application/json",
+        api_send(500, "application/json",
                       F("{\"error\":\"could not write settings to flash\"}"));
         return;
     }
@@ -1314,7 +1430,7 @@ static void send_find(uint32_t after) {
         body += F("{\"active\":false,\"seq\":");
         body += String(g_find_trace.last_seq());
         body += '}';
-        g_server.send(200, "application/json", body);
+        api_send(200, "application/json", body);
         return;
     }
     char m[18];
@@ -1375,14 +1491,14 @@ static void send_find(uint32_t after) {
         body += ']';
     }
     body += F("]}");
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void send_find_error(int code, const char* text) {
     String body = F("{\"error\":\"");
     body += text;
     body += F("\"}");
-    g_server.send(code, "application/json", body);
+    api_send(code, "application/json", body);
 }
 
 
@@ -1398,7 +1514,7 @@ static void handle_find_get() {
         }
     }
     const uint32_t after =
-        g_server.hasArg("after") ? strtoul(g_server.arg("after").c_str(), nullptr, 10) : 0;
+        api_has_arg("after") ? strtoul(api_arg("after").c_str(), nullptr, 10) : 0;
     send_find(after);
 }
 
@@ -1412,7 +1528,7 @@ static void handle_find_get() {
 static void handle_find_post() {
     if (refuse_other_site()) return;
     JsonDocument doc;
-    if (deserializeJson(doc, g_server.arg("plain"))) {
+    if (deserializeJson(doc, api_body())) {
         send_config_error("request body is not valid JSON");
         return;
     }
@@ -1590,7 +1706,7 @@ static void handle_map() {
     }
     String body;
     serializeJson(doc, body);
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void handle_events() {
@@ -1616,7 +1732,7 @@ static void handle_events() {
         body += F("\"}");
     }
     body += ']';
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void append_json_escaped(String& out, const char* s) {
@@ -1672,7 +1788,7 @@ static void handle_devices() {
         body += '}';
     }
     body += ']';
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static uint32_t update_max_bytes() {
@@ -1763,7 +1879,7 @@ static void handle_config_get() {
              : g_settings.use_dhcp                ? F("dhcp")
                                                   : F("static"));
     body += F("\"}}");
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 // The remembered networks in the order the board tries them, with how each
@@ -1789,13 +1905,13 @@ static void handle_networks() {
     }
     String body;
     serializeJson(doc, body);
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void handle_network_forget() {
     if (refuse_other_site()) return;
     JsonDocument doc;
-    if (deserializeJson(doc, g_server.arg("plain"))) {
+    if (deserializeJson(doc, api_body())) {
         send_config_error("request body is not valid JSON");
         return;
     }
@@ -1814,30 +1930,33 @@ static void handle_network_forget() {
     }
     Settings s = g_settings;
     if (!netlist_forget(s.nets, s.net_count, ssid)) {
-        g_server.send(404, "application/json",
+        api_send(404, "application/json",
                       F("{\"error\":\"that network is not remembered\"}"));
         return;
     }
     if (!settings_save(s)) {
-        g_server.send(500, "application/json",
+        api_send(500, "application/json",
                       F("{\"error\":\"could not write settings to flash\"}"));
         return;
     }
     g_settings = s;
     Serial.print(F("[cfg] forgot a network, remembered now: "));
     Serial.println(g_settings.net_count);
-    g_server.send(200, "application/json", F("{\"status\":\"forgotten\"}"));
+    api_send(200, "application/json", F("{\"status\":\"forgotten\"}"));
 }
 
 static void handle_isp() {
     const uint32_t now = now_s();
     // "Check again" overrides the six-hour cache but not the two-minute floor.
     // Someone leaning on the button should not turn into a request storm.
-    const bool forced = g_server.hasArg("force");
+    const bool forced = api_has_arg("force");
     if (should_refresh(now, g_isp_try_s, g_isp_ok_s,
                        forced ? 0u : kIspIntervalS, kIspBackoffS)) {
         g_isp_try_s = now;
         if (isp_fetch(g_isp)) g_isp_ok_s = now;
+        if (g_isp.date_unix != 0 && clock_set(g_clock, g_isp.date_unix, now_s(), ClockSource::Internet)) {
+            Serial.println(F("[clock] set from the provider lookup"));
+        }
     }
 
     // The router's own identity comes from our sweep, not from the lookup.
@@ -1891,7 +2010,7 @@ static void handle_isp() {
     body += F("\",\"gateway_vendor\":\"");
     append_json_escaped(body, gw_vendor);
     body += F("\"}");
-    g_server.send(200, "application/json", body);
+    api_send(200, "application/json", body);
 }
 
 static void handle_isp_page() {
@@ -1912,8 +2031,8 @@ static size_t g_http_update_bytes = 0;
 static char g_http_update_error[64] = "";
 
 static bool update_key_ok() {
-    return g_server.hasHeader("X-Netmon-Key") &&
-           g_server.header("X-Netmon-Key") == kOtaPassword;
+    const String key = api_header("X-Netmon-Key");
+    return key.length() > 0 && key == kOtaPassword;
 }
 
 static void update_fail(const char* why) {
@@ -2019,7 +2138,7 @@ static void handle_update_result() {
 
     g_server.send(200, "application/json",
                   F("{\"status\":\"updated\",\"restarting\":true}"));
-    names_flush();
+    before_restart();
     delay(500);
     ESP.restart();
 }
@@ -2028,19 +2147,493 @@ static void handle_update_result() {
 // upload finding out it was wrong.
 static void handle_update_check() {
     if (!update_key_ok()) {
-        g_server.send(401, "application/json",
+        api_send(401, "application/json",
                       F("{\"error\":\"invalid update key\"}"));
         return;
     }
-    g_server.send(200, "application/json", F("{\"status\":\"ok\"}"));
+    api_send(200, "application/json", F("{\"status\":\"ok\"}"));
+}
+
+// --- Bluetooth link -----------------------------------------------------------
+
+// The link as it stands: on or off, this board's Bluetooth address, how many
+// phones are paired and connected, and the pairing window with its code
+// while one is open. Over Wi-Fi the code is only ever shown to somebody on
+// the board's own network, which is the point of it.
+static void send_ble_status() {
+    char code[7];
+    uint32_t left_ms = 0;
+    uint32_t result_age_s = 0;
+    const char* result = "";
+    const bool pairing = ble_link_pairing(code, left_ms, result, result_age_s);
+    JsonDocument doc;
+    doc["link"] = kLinkVersion;
+    doc["available"] = ble_link_ready();
+    doc["enabled"] = g_settings.ble_link;
+    doc["on"] = ble_link_enabled();
+    doc["name"] = kOtaHostname;
+    doc["addr"] = ble_link_address();
+    doc["bonds"] = ble_link_bonds();
+    doc["max_bonds"] = ble_link_max_bonds();
+    doc["connected"] = ble_link_connected();
+    doc["secure"] = ble_link_secure();
+    doc["pairing"] = pairing;
+    doc["code"] = code;
+    doc["left_s"] = (left_ms + 999) / 1000;
+    doc["result"] = result;
+    doc["result_age_s"] = result_age_s;
+    doc["served"] = ble_link_served();
+    doc["via"] = g_via == Via::Link ? "bluetooth" : "wifi";
+    String body;
+    serializeJson(doc, body);
+    api_send(200, "application/json", body);
+}
+
+static void handle_ble_get() { send_ble_status(); }
+
+// {"enabled":true|false}: the link on or off, kept across restarts. Off, the
+// board stops advertising and lets every phone go; paired phones stay paired.
+static void handle_ble_post() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    if (!doc["enabled"].is<bool>()) {
+        send_config_error("enabled must be true or false");
+        return;
+    }
+    Settings s = g_settings;
+    s.ble_link = doc["enabled"].as<bool>();
+    if (!settings_save(s)) {
+        api_send(500, "application/json", F("{\"error\":\"could not write settings to flash\"}"));
+        return;
+    }
+    g_settings = s;
+    if (s.ble_link) {
+        if (!ble_link_ready()) {
+            Serial.println(ble_link_begin(true) ? F("[link] Bluetooth link up")
+                                                : F("[link] Bluetooth link could not start"));
+        } else {
+            ble_link_enable(true);
+        }
+    } else {
+        ble_link_enable(false);
+        ble_link_pair(false);
+    }
+    send_ble_status();
+}
+
+// {} opens a pairing window for two minutes, or keeps the open one going, and
+// answers with its code; {"stop":true} closes it.
+static void handle_ble_pair() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    const String raw = api_body();
+    if (raw.length() > 0 && deserializeJson(doc, raw)) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    const bool stop = doc["stop"].is<bool>() && doc["stop"].as<bool>();
+    if (!stop) {
+        if (!ble_link_ready()) {
+            api_send(409, "application/json",
+                     F("{\"error\":\"Bluetooth is not running on this board.\"}"));
+            return;
+        }
+        if (!ble_link_enabled()) {
+            api_send(409, "application/json",
+                     F("{\"error\":\"The Bluetooth link is switched off. Switch it on first.\"}"));
+            return;
+        }
+    }
+    ble_link_pair(!stop);
+    if (!stop) Serial.println(F("[link] pairing window open for two minutes"));
+    send_ble_status();
+}
+
+// Forgets every paired phone. Each has to pair again with a new code; the
+// one asking, if it asked over Bluetooth, is let go once it has the answer.
+static void handle_ble_forget() {
+    if (refuse_other_site()) return;
+    if (!ble_link_ready()) {
+        send_ble_status();
+        return;
+    }
+    if (!ble_link_forget_all()) {
+        api_send(500, "application/json", F("{\"error\":\"could not forget the paired phones\"}"));
+        return;
+    }
+    send_ble_status();
 }
 
 static void handle_reboot() {
     if (refuse_other_site()) return;
-    g_server.send(200, "application/json", F("{\"status\":\"restarting\"}"));
-    names_flush();       // names heard in the last 30 s are not on flash yet
-    delay(250);          // let the response flush before the reset
+    api_send(200, "application/json", F("{\"status\":\"restarting\"}"));
+    before_restart();    // names heard in the last 30 s, and this network's report
+    api_settle(250);     // let the answer reach whoever asked before the reset
     ESP.restart();
+}
+
+// --- Saved reports -------------------------------------------------------------
+
+static uint32_t clock_unix() { return clock_now(g_clock, now_s()); }
+
+static const char* vendor_of_mac(const Mac& m) {
+    return oui_lookup(mac_oui(m), BUILTIN_OUI, BUILTIN_OUI_COUNT);
+}
+
+// Saves the report of the network the board is on: its device table, with
+// what the last report of this network had and this boot has not seen.
+// False, saying why, when there is nothing to save or the flash would not
+// take it.
+static bool report_save(const char*& why) {
+    why = "";
+    if (wifi_state() != WifiState::Connected) {
+        why = "The board is not on a network, so there is nothing to save.";
+        return false;
+    }
+    if (g_passes_done == 0) {
+        why = "No sweep has finished yet. Try again in a minute.";
+        return false;
+    }
+    char cidr[20];
+    cidr_format(derived_subnet(), derived_mask(), cidr);
+    const char* ssid = wifi_current_ssid();
+    const size_t slot = report_slot_for(g_reports, kReportSlots, ssid, cidr);
+    const bool same = report_same(g_reports[slot], ssid, cidr);
+    const uint32_t up = now_s();
+    const uint32_t now_unix = clock_unix();
+
+    // This boot's devices, then room for the last report's: freed on return.
+    std::unique_ptr<ReportRow[]> rows(new (std::nothrow) ReportRow[kMaxDevices + kReportRows]);
+    if (!rows) {
+        why = "Not enough memory to put the report together.";
+        return false;
+    }
+    const Mac self = wifi_mac();
+    size_t ncur = 0;
+    for (size_t i = 0; i < g_devices.size() && ncur < kMaxDevices; ++i) {
+        const Device& d = g_devices.at(i);
+        report_row_from(d, up, g_clock, mac_equal(d.mac, self), rows[ncur++]);
+    }
+    size_t nprev = 0;
+    uint32_t gap = 0;
+    bool gap_known = false;
+    if (same) {
+        nprev = report_read_rows(slot, rows.get() + ncur, kReportRows);
+        gap_known = report_gap_s(g_reports[slot], up, now_unix, gap);
+    }
+    const size_t n = report_merge(rows.get(), ncur, nprev, gap_known, gap, kReportRows);
+    // Never at the cost of the settings and the learned names, which share
+    // the 190 KB file system: a report that would leave it short waits.
+    if (reports_free_bytes() < n * 300 + 4096 + kReportReserve) {
+        why = "The board's storage is nearly full. Delete a saved report to make room.";
+        return false;
+    }
+
+    ReportMeta m{};
+    std::strncpy(m.ssid, ssid, sizeof(m.ssid) - 1);
+    std::strncpy(m.subnet, cidr, sizeof(m.subnet) - 1);
+    ipv4_format(wifi_gateway(), m.gateway);
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        if (g_devices.at(i).ip == wifi_gateway()) {
+            mac_format(g_devices.at(i).mac, m.gateway_mac);
+            break;
+        }
+    }
+    ipv4_format(wifi_local_ip(), m.board_ip);
+    mac_format(self, m.board_mac);
+    std::strncpy(m.version, kFirmwareVersion, sizeof(m.version) - 1);
+    m.seq = report_next_seq(g_reports, kReportSlots);
+    m.saved_unix = now_unix;
+    m.saved_up_s = up;
+    m.clock = g_clock.source;
+    m.passes = g_passes_done;
+    m.learning = in_learning_window(up, g_first_scan_s, g_settings.learning_window_s);
+    m.count = n;
+    for (size_t i = 0; i < n; ++i) {
+        if (rows[i].online) ++m.online;
+    }
+    if (!report_write(slot, m, rows.get(), n, vendor_of_mac, g_reports[slot])) {
+        why = "The flash would not take the report.";
+        Serial.println(F("[report] could not write it"));
+        return false;
+    }
+    g_reports[slot].this_boot = true;
+    g_reports[slot].saved_up_s = up;
+    Serial.print(F("[report] saved "));
+    Serial.print(n);
+    Serial.print(F(" devices for "));
+    Serial.println(ssid);
+    return true;
+}
+
+// The first report two sweeps after joining a network, then every 15
+// minutes, between radio jobs: writing flash holds up both cores for moments.
+static void report_tick() {
+    if (wifi_state() != WifiState::Connected || g_updating) return;
+    if (!g_report_first_done) {
+        if (g_passes_done < kReportFirstPasses) return;
+    } else if (millis() - g_report_last_ms < kReportEveryMs) {
+        return;
+    }
+    if (sweep_running() || air_busy()) return;
+    g_report_first_done = true;
+    g_report_last_ms = millis();
+    const char* why = "";
+    if (!report_save(why)) {
+        Serial.print(F("[report] not saved: "));
+        Serial.println(why);
+    }
+}
+
+// Before every restart the board makes on purpose: what is only in memory,
+// written down.
+static void before_restart() {
+    names_flush();
+    const char* why = "";
+    if (wifi_state() == WifiState::Connected && g_passes_done > 0 && !report_save(why)) {
+        Serial.print(F("[report] not saved before the restart: "));
+        Serial.println(why);
+    }
+}
+
+static void send_reports() {
+    const uint32_t up = now_s();
+    const uint32_t now_unix = clock_unix();
+    const bool on = wifi_state() == WifiState::Connected;
+    char cidr[20];
+    cidr_format(derived_subnet(), derived_mask(), cidr);
+    JsonDocument doc;
+    doc["max"] = kReportSlots;
+    doc["every_s"] = kReportEveryMs / 1000;
+    doc["clock"] = clock_known(g_clock);
+    doc["now_unix"] = now_unix;
+    doc["free_bytes"] = reports_free_bytes();
+    if (on) {
+        JsonObject net = doc["network"].to<JsonObject>();
+        net["ssid"] = wifi_current_ssid();
+        net["subnet"] = cidr;
+    } else {
+        doc["network"] = nullptr;
+    }
+    JsonArray list = doc["reports"].to<JsonArray>();
+    for (size_t i = 0; i < kReportSlots; ++i) {
+        const ReportSlot& r = g_reports[i];
+        if (!r.used) continue;
+        JsonObject o = list.add<JsonObject>();
+        o["slot"] = i;
+        o["ssid"] = r.ssid;
+        o["subnet"] = r.subnet;
+        o["gateway"] = r.gateway;
+        o["count"] = r.count;
+        o["online"] = r.online;
+        o["saved_unix"] = r.saved_unix;
+        o["age_s"] = report_age_s(r, up, now_unix);
+        o["bytes"] = r.bytes;
+        o["current"] = on && report_same(r, wifi_current_ssid(), cidr);
+    }
+    String body;
+    serializeJson(doc, body);
+    api_send(200, "application/json", body);
+}
+
+static void handle_reports() { send_reports(); }
+
+static int report_slot_arg(const String& a) {
+    if (a.length() != 1 || a[0] < '0' || a[0] >= static_cast<char>('0' + kReportSlots)) return -1;
+    return a[0] - '0';
+}
+
+// One saved report, the file as it is: a JSON document. Over the link it is
+// read into memory first, so it cannot change under an answer still going out.
+static void handle_report_get() {
+    const int slot = report_slot_arg(api_arg("slot"));
+    if (slot < 0 || !g_reports[slot].used) {
+        api_send(404, "application/json", F("{\"error\":\"No report is saved there.\"}"));
+        return;
+    }
+    File f = LittleFS.open(report_path(static_cast<size_t>(slot)), "r");
+    if (!f) {
+        api_send(404, "application/json", F("{\"error\":\"No report is saved there.\"}"));
+        return;
+    }
+    if (g_via == Via::Http) {
+        g_server.streamFile(f, "application/json");
+        f.close();
+        return;
+    }
+    ble_link_answer_status(200);
+    char buf[1024];
+    while (f.available()) {
+        const size_t n = f.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf));
+        if (n == 0) break;
+        ble_link_answer_add(String(buf, n));
+    }
+    f.close();
+}
+
+static void handle_report_save() {
+    if (refuse_other_site()) return;
+    const char* why = "";
+    if (!report_save(why)) {
+        String body = F("{\"error\":\"");
+        append_json_escaped(body, why);
+        body += F("\"}");
+        api_send(409, "application/json", body);
+        return;
+    }
+    send_reports();
+}
+
+// {"slot":N}: forgets one network's report.
+static void handle_report_delete() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    const int slot = doc["slot"].is<int>() ? doc["slot"].as<int>() : -1;
+    if (slot < 0 || slot >= static_cast<int>(kReportSlots) || !g_reports[slot].used) {
+        api_send(404, "application/json", F("{\"error\":\"No report is saved there.\"}"));
+        return;
+    }
+    if (!report_remove(static_cast<size_t>(slot))) {
+        api_send(500, "application/json", F("{\"error\":\"could not delete the report\"}"));
+        return;
+    }
+    std::memset(&g_reports[slot], 0, sizeof(g_reports[slot]));
+    send_reports();
+}
+
+// {"unix":seconds}: the time from the app or a page, which dates saved
+// reports. Refused when implausible; ignored, though answered, when the board
+// already has the time from the provider lookup.
+static void handle_clock() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    if (!doc["unix"].is<uint32_t>()) {
+        send_config_error("unix must be the time in seconds since 1970");
+        return;
+    }
+    const uint32_t t = doc["unix"].as<uint32_t>();
+    if (t < kClockMin || t > kClockMax) {
+        send_config_error("that time is not plausible");
+        return;
+    }
+    if (clock_set(g_clock, t, now_s(), ClockSource::Client)) Serial.println(F("[clock] set by a client"));
+    JsonDocument out;
+    out["clock"] = clock_known(g_clock);
+    out["unix"] = clock_unix();
+    out["source"] = clock_source_text(g_clock.source);
+    String body;
+    serializeJson(out, body);
+    api_send(200, "application/json", body);
+}
+
+// --- Routes -------------------------------------------------------------------
+//
+// Every API endpoint, for the web server and the Bluetooth link alike. The
+// firmware upload is not here: it streams a megabyte through the web server's
+// upload handler, so it is Wi-Fi only, and the link says so.
+static const uint8_t kGet = 1;
+static const uint8_t kPost = 2;
+static const uint8_t kAny = kGet | kPost;
+
+struct ApiRoute {
+    const char* path;
+    uint8_t methods;
+    void (*handler)();
+};
+
+static const ApiRoute kApiRoutes[] = {
+    {"/api/health", kAny, handle_health},
+    {"/api/devices", kAny, handle_devices},
+    {"/api/latency", kAny, handle_latency},
+    {"/api/dhcp", kAny, handle_dhcp},
+    {"/api/events", kAny, handle_events},
+    {"/api/scan", kAny, handle_scan},
+    {"/api/isp", kAny, handle_isp},
+    {"/api/nearby", kGet, handle_nearby},
+    {"/api/nearby/scan", kPost, handle_nearby_scan},
+    {"/api/nearby/config", kGet, handle_nearby_config_get},
+    {"/api/nearby/config", kPost, handle_nearby_config_post},
+    {"/api/nearby/find", kGet, handle_find_get},
+    {"/api/nearby/find", kPost, handle_find_post},
+    {"/api/map", kGet, handle_map},
+    {"/api/config", kGet, handle_config_get},
+    {"/api/config", kPost, handle_config_post},
+    {"/api/networks", kGet, handle_networks},
+    {"/api/networks/forget", kPost, handle_network_forget},
+    {"/api/update/check", kPost, handle_update_check},
+    {"/api/reboot", kPost, handle_reboot},
+    {"/api/ble", kGet, handle_ble_get},
+    {"/api/ble", kPost, handle_ble_post},
+    {"/api/ble/pair", kPost, handle_ble_pair},
+    {"/api/ble/forget", kPost, handle_ble_forget},
+    {"/api/reports", kGet, handle_reports},
+    {"/api/reports/get", kGet, handle_report_get},
+    {"/api/reports/save", kPost, handle_report_save},
+    {"/api/reports/delete", kPost, handle_report_delete},
+    {"/api/clock", kPost, handle_clock},
+};
+
+static const char* link_status_text(uint16_t status) {
+    switch (status) {
+        case 413: return "{\"error\":\"request too large\"}";
+        case 414: return "{\"error\":\"request path or query too long\"}";
+        default: return "{\"error\":\"request not understood\"}";
+    }
+}
+
+// Answers one request that came over the Bluetooth link, with the same
+// handler the web server would have used.
+static void serve_link(const LinkIncoming& in) {
+    g_via = Via::Link;
+    g_link_req = &in;
+    if (in.status != 0) {
+        api_send(in.status, "application/json", link_status_text(in.status));
+    } else if (std::strcmp(in.req.path, "/api/update") == 0) {
+        api_send(501, "application/json",
+                 F("{\"error\":\"Firmware updates go over Wi-Fi, not Bluetooth.\"}"));
+    } else {
+        const uint8_t method = in.req.post ? kPost : kGet;
+        const ApiRoute* route = nullptr;
+        for (const ApiRoute& r : kApiRoutes) {
+            if ((r.methods & method) && std::strcmp(r.path, in.req.path) == 0) {
+                route = &r;
+                break;
+            }
+        }
+        if (route != nullptr) {
+            route->handler();
+        } else {
+            api_send(404, "text/plain", F("not found"));
+        }
+    }
+    ble_link_answer_end();
+    g_link_req = nullptr;
+    g_via = Via::Http;
+}
+
+// One request off the link per pass of loop(), then whatever the phones
+// will take of the answers. While a firmware upload has the board, requests
+// wait.
+static void link_tick() {
+    if (!ble_link_ready()) return;
+    ble_link_tick();
+    if (!g_updating) {
+        LinkIncoming in;
+        if (ble_link_next(in)) serve_link(in);
+    }
+    ble_link_pump();
 }
 
 // Setup mode is entered only at start-up, when no remembered network answered
@@ -2099,6 +2692,12 @@ void setup() {
     names_load(g_names);
     Serial.print(F("[boot] remembered names: "));
     Serial.println(g_names.size());
+    reports_load(g_reports);
+    for (const ReportSlot& r : g_reports) {
+        if (!r.used) continue;
+        Serial.print(F("[boot] saved report: "));
+        Serial.println(r.ssid);
+    }
     // A board that ran the Wi-Fi + BLE scanner sketch: join the network that
     // sketch was set up on rather than opening netmon-setup.
     if (scanner_import(g_settings)) {
@@ -2110,8 +2709,9 @@ void setup() {
     ArduinoOTA.setHostname(kOtaHostname);
     ArduinoOTA.setPassword(kOtaPassword);
     // ArduinoOTA restarts the board as soon as the image is written, so any
-    // unsaved names have to be written here or not at all.
-    ArduinoOTA.onEnd([]() { names_flush(); });
+    // unsaved names, and this network's report, have to be written here or
+    // not at all.
+    ArduinoOTA.onEnd([]() { before_restart(); });
     ArduinoOTA.onStart([]() {
         g_updating = true;
         air_ble_stop();
@@ -2146,25 +2746,25 @@ void setup() {
                            : F("[ble] Bluetooth could not start"));
     }
 
+    // The Bluetooth link: the same API, for phones paired with a 6-digit code.
+    // Off in settings, the stack is not started for it at all.
+    if (g_settings.ble_link) {
+        Serial.println(ble_link_begin(true)
+                           ? F("[link] Bluetooth link up, advertising as netmon")
+                           : F("[link] Bluetooth link could not start"));
+    }
+
     g_server.on("/", handle_dashboard);
     g_server.on("/about", handle_root);
-    g_server.on("/api/devices", handle_devices);
-    g_server.on("/api/health", handle_health);
-    g_server.on("/api/latency", handle_latency);
-    g_server.on("/api/dhcp", handle_dhcp);
-    g_server.on("/api/events", handle_events);
     g_server.on("/events", []() { g_server.send_P(200, "text/html", EVENTS_HTML); });
     g_server.on("/settings", handle_settings_page);
     g_server.on("/nearby", handle_nearby_page);
-    g_server.on("/api/nearby", HTTP_GET, handle_nearby);
-    g_server.on("/api/nearby/scan", HTTP_POST, handle_nearby_scan);
-    g_server.on("/api/nearby/config", HTTP_GET, handle_nearby_config_get);
-    g_server.on("/api/nearby/config", HTTP_POST, handle_nearby_config_post);
-    g_server.on("/api/nearby/find", HTTP_GET, handle_find_get);
-    g_server.on("/api/nearby/find", HTTP_POST, handle_find_post);
     g_server.on("/map", []() { g_server.send_P(200, "text/html", MAP_HTML); });
-    g_server.on("/api/map", HTTP_GET, handle_map);
-    g_server.on("/api/scan", handle_scan);
+    g_server.on("/isp", handle_isp_page);
+    for (const ApiRoute& r : kApiRoutes) {
+        const HTTPMethod m = r.methods == kAny ? HTTP_ANY : r.methods == kGet ? HTTP_GET : HTTP_POST;
+        g_server.on(r.path, m, r.handler);
+    }
     // In setup mode anything unrecognised is a captive-portal probe, so send
     // it to the page the person actually needs. In normal operation a 404 has
     // to stay a 404, or a mistyped API path would silently return HTML.
@@ -2176,18 +2776,10 @@ void setup() {
         g_server.sendHeader("Location", "http://192.168.4.1/settings", true);
         g_server.send(302, "text/plain", "");
     });
-    g_server.on("/isp", handle_isp_page);
-    g_server.on("/api/isp", handle_isp);
-    g_server.on("/api/config", HTTP_GET, handle_config_get);
-    g_server.on("/api/config", HTTP_POST, handle_config_post);
-    g_server.on("/api/networks", HTTP_GET, handle_networks);
-    g_server.on("/api/networks/forget", HTTP_POST, handle_network_forget);
     // X-Netmon-Key for the update endpoints, Origin for refuse_other_site().
     const char* header_keys[] = {"X-Netmon-Key", "Origin"};
     g_server.collectHeaders(header_keys, 2);
     g_server.on("/api/update", HTTP_POST, handle_update_result, handle_update_upload);
-    g_server.on("/api/update/check", HTTP_POST, handle_update_check);
-    g_server.on("/api/reboot", HTTP_POST, handle_reboot);
     g_server.begin();
     Serial.println(F("[boot] http server up on :80"));
 }
@@ -2196,6 +2788,8 @@ void loop() {
     ArduinoOTA.handle();
     if (g_portal) g_dns.processNextRequest();
     g_server.handleClient();
+    link_tick();
+    report_tick();
     dhcp_listener_tick();
     dhcp_tick();
     names_tick();

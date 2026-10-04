@@ -143,8 +143,14 @@ class OverviewScreen(host: MainActivity) : Screen(host) {
         val base = Board.base
         lostCard.visibility = if (link == Board.Link.LOST) View.VISIBLE else View.GONE
         if (base != null) {
-            lostText.text = "No answer from ${NetmonClient.display(base)}. Make sure this phone is on the same Wi-Fi as the monitor. " +
-                "If the monitor lost its Wi-Fi, it opens a network called netmon-setup."
+            lostText.text = if (com.example.netmon.LinkCodec.isBle(base)) {
+                com.example.netmon.Board.lastProblem ?: ("No answer over Bluetooth. Make sure the monitor is " +
+                    "switched on and within about 10 metres, or join its Wi-Fi.")
+            } else {
+                "No answer from ${NetmonClient.display(base)}. Make sure this phone is on the same Wi-Fi as the monitor" +
+                    (if (com.example.netmon.Board.bleBase == null) ", or pair it in Settings, Bluetooth, to reach it from further away." else ".") +
+                    " If the monitor lost its Wi-Fi, it opens a network called netmon-setup."
+            }
         }
 
         val prefs = AppState.prefs

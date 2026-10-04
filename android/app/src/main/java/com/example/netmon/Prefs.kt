@@ -8,9 +8,31 @@ class Prefs(context: Context) {
 
     private val sp: SharedPreferences = context.getSharedPreferences("netmon", Context.MODE_PRIVATE)
 
+    /** The board's address on Wi-Fi: "http://192.168.2.27". */
     var boardUrl: String?
         get() = sp.getString("board_url", null)
         set(v) = sp.edit().putString("board_url", v).apply()
+
+    // --- The Bluetooth link (app 1.2) --------------------------------------------
+
+    /** The same board over Bluetooth, once this phone is paired with it: "ble://D4:E9:F4:A3:B8:AE". */
+    var boardBle: String?
+        get() = sp.getString("board_ble", null)
+        set(v) = sp.edit().putString("board_ble", v).apply()
+
+    /** The board's Wi-Fi MAC, which tells it apart however it is reached. */
+    var boardMac: String?
+        get() = sp.getString("board_mac", null)
+        set(v) = sp.edit().putString("board_mac", v).apply()
+
+    /** The route that answered last, to start on next time. */
+    var lastRoute: String?
+        get() = sp.getString("last_route", null)
+        set(v) = sp.edit().putString("last_route", v).apply()
+
+    var linkMode: LinkMode
+        get() = LinkMode.of(sp.getString("link_mode", null))
+        set(v) = sp.edit().putString("link_mode", v.key).apply()
 
     var updateKey: String?
         get() = sp.getString("update_key", null)

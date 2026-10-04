@@ -8,6 +8,19 @@
     <!-- The Finder buzzes once when you are within arm's reach of the device. -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- The Bluetooth link to the monitor (app 1.2). Android 12 and later ask
+         for "Nearby devices"; scanning never works out where the phone is.
+         Before Android 12, looking for Bluetooth devices needs location. -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+
     <!-- The monitor serves plain HTTP on the local network, so cleartext is allowed. -->
     <application
         android:name=".NetmonApp"

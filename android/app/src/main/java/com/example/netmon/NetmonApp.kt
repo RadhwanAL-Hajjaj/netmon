@@ -7,6 +7,7 @@ class NetmonApp : Application() {
         super.onCreate()
         CrashLog.install(this)
         AppState.init(this)
+        BleLink.init(this)
         Board.init(this)
         Alerts.ensureChannel(this)
         Alerts.schedule(this)

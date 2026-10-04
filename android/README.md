@@ -1,16 +1,16 @@
 # netmon for Android
 
 Companion app for the netmon ESP32 network monitor. It talks to the board's own
-HTTP API on your network: the same readings as the web pages, including the
-Wi-Fi and Bluetooth radars, the Finder and the network map, plus
-notifications, a longer event history kept on the phone, and firmware updates
-from the phone.
+API, over your Wi-Fi or over Bluetooth: the same readings as the web pages,
+including the Wi-Fi and Bluetooth radars, the Finder and the network map, plus
+notifications, a longer event history kept on the phone, the board's saved
+reports, and firmware updates from the phone.
 
-Version 1.1.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
+Version 1.2.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
 and later, and shows what each board has: network history needs firmware 0.9.4
-or later, the DHCP listener status 0.9.6, Nearby 0.10, and the Finder and the
-access points on the map 0.11. On older firmware those screens say what they
-need instead.
+or later, the DHCP listener status 0.9.6, Nearby 0.10, the Finder and the
+access points on the map 0.11, and Bluetooth and saved reports 0.12. On older
+firmware those screens say what they need instead.
 
 ## Install
 
@@ -25,10 +25,34 @@ need instead.
    asks each address for `/api/health`. Tap the monitor it finds, or type its
    address (for example `192.168.2.30`).
 
-The phone has to be on the same Wi-Fi as the monitor. A monitor that could not
-join Wi-Fi opens its own network, `netmon-setup`; join it and the app finds the
-board at 192.168.4.1 (it keeps using Wi-Fi even though that network has no
-internet).
+The phone has to be on the same Wi-Fi as the monitor, or paired with it over
+Bluetooth (below). A monitor that could not join Wi-Fi opens its own network,
+`netmon-setup`; join it and the app finds the board at 192.168.4.1 (it keeps
+using Wi-Fi even though that network has no internet).
+
+## Bluetooth
+
+With firmware 0.12 or later, a phone paired with the monitor reaches it over
+Bluetooth whenever Wi-Fi can't: walking with the Finder, in setup mode, on
+another network. Every screen works the same; firmware updates stay on Wi-Fi.
+
+- **Pairing.** *Settings → Bluetooth → Pair this phone*, on the monitor's
+  Wi-Fi: the app asks the monitor for a pairing window, shows its 6-digit code,
+  and Android asks for it. Away from that Wi-Fi, press *Pair a phone* on the
+  monitor's own Settings page from any device on its network, then use *Find
+  your monitor → Look for monitors over Bluetooth* here and tap it.
+- **Choosing.** *Automatic* uses Wi-Fi when the monitor answers there and
+  Bluetooth when it doesn't, checking Wi-Fi again every 30 seconds while on
+  Bluetooth; *Wi-Fi only* and *Bluetooth only* do what they say. The top bar
+  says *Bluetooth* while it's in use. Over Bluetooth the app also learns the
+  monitor's Wi-Fi address.
+- **Forgetting.** *Forget* drops this phone's pairing; *Forget every paired
+  phone* makes the monitor forget them all. The monitor's link can be switched
+  off here too.
+- The background check for notifications uses Bluetooth the same way, when the
+  phone is paired and in range.
+
+See [Using netmon over Bluetooth](../docs/bluetooth.md) for the security model.
 
 ## What is where
 
@@ -121,6 +145,14 @@ from the readings the phone has collected. Unanswered checks show as red dots.
   whether the new version is running. The password is the update password
   set in `firmware/netmon/secrets.h` when the firmware was built; the app can
   remember it.
+- Bluetooth: pairing, how the app reaches the monitor, and the monitor's own
+  link (see above).
+- Saved reports (firmware 0.12): the device list of each network the monitor
+  has been on, up to four, as it last stood. Tap one to look through it,
+  filtered by online, not recognised or carried over from before a restart,
+  and export it as CSV (the same columns as the Settings page's) or as the
+  JSON the monitor keeps. *Save this network now* saves the current one. See
+  [Saved reports](../docs/saved-reports.md).
 - Notifications: off, unrecognised devices, or every new device, checked every
   15, 30 or 60 minutes.
 - Restart the monitor, or switch to another one.
@@ -164,16 +196,22 @@ Where the toolchain folder is not `../tc`, set `TOOLCHAIN`. kotlinc needs
 about 2 GB of heap for the API 35 jar; the script asks for that unless
 `JAVA_OPTS` says otherwise.
 
-**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 1962 checks of the
+**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2211 checks of the
 parsers, formatting, settings validation, firmware checks, event history,
-alert rules, the Nearby, Finder and map logic, and the HTTP client against
+alert rules, the Nearby, Finder and map logic, the Bluetooth link's frames
+(against the same bytes the firmware's own tests use), the choice between
+Wi-Fi and Bluetooth, saved reports, and the client against
 `tools/mock_board.py`, a stand-in board that answers every endpoint the way
 the firmware does, including uploads and the restart that follows (and, after
-`POST /__fw?v=0.11`, Nearby, the Finder and the map). Where node is installed,
-`tools/test/web_parity.py` first runs the board's own Nearby and Map page
-scripts from `pages.h` and the checks compare the app's distances, bearings,
-trend arrows, smoothing, warmer and colder, directions and map layouts with
-them, number for number. It needs Android's org.json for the JVM
+`POST /__fw?v=0.11` or `0.12`, Nearby, the Finder, the map, the Bluetooth
+link's endpoints, saved reports and the clock). The client runs a second
+time over a simulated Bluetooth link: a stand-in for the board's end that
+takes the request frames, asks the mock board, and answers in frames cut as
+the firmware cuts them. Where node is installed, `tools/test/web_parity.py`
+first runs the board's own Nearby, Map and Settings page scripts from
+`pages.h` and the checks compare the app's distances, bearings, trend arrows,
+smoothing, warmer and colder, directions, map layouts and CSV exports with
+them, number for number and byte for byte. It needs Android's org.json for the JVM
 (`libandroid-json-java` on Debian and Ubuntu). Then `tools/test/beeper` checks
 the Finder's beeps against a stand-in for Android's audio track: one sound at
 a time however quickly they are stopped and started.
@@ -198,17 +236,26 @@ app/src/main/java/com/example/netmon/
   Finder.kt               the Finder's smoothing, trend and direction
   NetMap.kt               the map's groups and layout
   TurnSensor.kt, Beeper.kt   the phone's rotation sensor, the Finder's beeps
+  LinkCodec.kt            the Bluetooth link's frames, as the firmware defines them
+  BleLink.kt              the phone's end of the link: GATT, pairing, looking for boards
+  RoutePlan.kt            Wi-Fi or Bluetooth, and when to change
+  Reports.kt              saved reports as CSV and file names
   CrashLog.kt             keeps a crash report to show on the next start
   MainActivity.kt         top bar, bottom bar, screens
   ui/                     screens, view helpers, charts
   ui/Painters.kt          the drawing of the radars, the Finder and the map
-  ui/NearbyScreen.kt, ui/FinderPane.kt, ui/MapPane.kt   the new screens
+  ui/NearbyScreen.kt, ui/FinderPane.kt, ui/MapPane.kt   Nearby, the Finder, the map
+  ui/LinkCard.kt, ui/ReportsCard.kt   Settings: Bluetooth, saved reports
 ```
 
 ## Notes
 
-- Everything is plain HTTP on your network. Nothing leaves it except the
-  board's own provider lookup.
+- Everything is plain HTTP on your network, or the monitor's own encrypted
+  Bluetooth link. Nothing leaves your network except the board's own provider
+  lookup.
+- Permissions: *Nearby devices* (Android 12 and later) for Bluetooth, asked
+  the first time it's used; before Android 12, location, only to look for the
+  monitor over Bluetooth.
 - The board's web server answers one request at a time, so the app never
   sends requests in parallel, and pauses its readings during a firmware upload.
 - To use it away from home, enter an address you can reach through a VPN.
@@ -221,6 +268,15 @@ app/src/main/java/com/example/netmon/
   page's do, so they sound with the phone on silent once you turn them on.
 
 ## Changes
+
+**1.2.0**
+- Bluetooth: pairing with the monitor's code, Automatic, Wi-Fi only or
+  Bluetooth only, and every screen over Bluetooth (firmware 0.12).
+- Saved reports: browse each network's report, export CSV or JSON.
+- The monitor is told the time when it has none, to date its reports.
+- Find your monitor looks for monitors over Bluetooth too.
+- Choosing another address for the same monitor keeps the event history and
+  notification memory: firmware 0.12 says its MAC, which tells it apart.
 
 **1.1.0**
 - Nearby: the Wi-Fi and Bluetooth radars, lists, live log and scanning

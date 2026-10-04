@@ -5,7 +5,8 @@ Answers every endpoint the firmware serves, with bodies shaped exactly like
 netmon.ino builds them (field names, order, types), accepts firmware uploads
 the way the ESP32 WebServer does, and simulates the restart that follows.
 Test hooks:  GET /__log  (requests seen)   POST /__reset   POST /__mode?x=...
-             POST /__fw?v=0.9|0.11  (0.11 adds update_max, Nearby, the Finder and the map)
+             POST /__fw?v=0.9|0.11|0.12  (0.11 adds update_max, Nearby, the Finder and the map;
+                                          0.12 the Bluetooth link's endpoints, saved reports and the clock)
              POST /__find?idle=1    (the Finder forgets its device, as after 15 s unasked)
              POST /__find?other=1   (another page takes the Finder for another device)
 """
@@ -32,6 +33,11 @@ STATE = {
 LOCK = threading.Lock()
 
 V11 = "0.11.0-finder"
+V12 = "0.12.0-bluetooth"
+# Firmware 0.12: the Bluetooth link, as GET /api/ble reports it, saved reports and the clock.
+LINK = {"enabled": True, "bonds": 1, "open": 0.0, "code": "", "result": "", "result_at": 0.0}
+CLOCK = {"boot_unix": 0}
+REPORTS = {}
 NEARBY = {"wifi": True, "ble": True, "ble_ready": True, "background_s": 120}
 FIND = {"t": None, "prev": None, "started": 0.0, "asked": 0.0, "seq": 0, "floor": 0, "rd": [],
         "last": 0.0, "hold_from": -1e9, "hold_until": -1e9}
@@ -55,8 +61,70 @@ BLE = [
 ]
 
 
+def fwv():
+    return {"0.11": 11, "0.12": 12}.get(STATE["fw"], 9)
+
+
 def v11():
-    return STATE["fw"] == "0.11"
+    return fwv() >= 11
+
+
+def v12():
+    return fwv() >= 12
+
+
+def link_status():
+    now = time.time()
+    live = bool(LINK["open"]) and now - LINK["open"] < 120
+    return {"link": 1, "available": True, "enabled": LINK["enabled"], "on": LINK["enabled"], "name": "netmon",
+            "addr": "D4:E9:F4:12:34:58", "bonds": LINK["bonds"], "max_bonds": 3, "connected": 0, "secure": 0,
+            "pairing": live, "code": LINK["code"] if live else "",
+            "left_s": int(120 - (now - LINK["open"]) + 0.999) if live else 0, "result": LINK["result"],
+            "result_age_s": int(now - LINK["result_at"]) if LINK["result"] else 0, "served": 0, "via": "wifi"}
+
+
+def report_rows(saved_unix):
+    out = []
+    for i, d in enumerate(json.loads(devices())):
+        ago = d["last_seen_s"]
+        out.append(dict(d, seen_unix=(saved_unix - ago) if saved_unix else 0,
+                        first_unix=(saved_unix - 86400) if saved_unix else 0, carried=(i == 5)))
+    return out
+
+
+def report_of(ssid, subnet, seq, saved_unix, rows):
+    return {"report": 1, "ssid": ssid, "subnet": subnet, "gateway": subnet.rsplit(".", 1)[0] + ".1",
+            "gateway_mac": "98:DA:C4:11:22:33", "board_ip": "192.168.2.30", "board_mac": "D4:E9:F4:12:34:56",
+            "version": V12, "seq": seq, "saved_unix": saved_unix, "saved_up_s": 3600,
+            "clock": "client" if saved_unix else "none", "passes": 60, "learning": False, "count": len(rows),
+            "online": sum(1 for d in rows if d["online"]), "devices": rows}
+
+
+def reports_reset():
+    REPORTS.clear()
+    REPORTS[0] = report_of("HOME-5G", "192.168.2.0/24", 4, 1791136862, report_rows(1791136862))
+    REPORTS[3] = report_of("Office-WiFi", "10.20.0.0/16", 2, 0, report_rows(0)[:3])
+
+
+def reports_list():
+    now = int(CLOCK["boot_unix"] + uptime()) if CLOCK["boot_unix"] else 0
+    out = []
+    for slot, r in sorted(REPORTS.items()):
+        out.append({"slot": slot, "ssid": r["ssid"], "subnet": r["subnet"], "gateway": r["gateway"],
+                    "count": r["count"], "online": r["online"], "saved_unix": r["saved_unix"],
+                    "age_s": (now - r["saved_unix"]) if (now and r["saved_unix"]) else -1,
+                    "bytes": len(report_file(r)), "current": r["ssid"] == STATE["active_ssid"]})
+    return json.dumps({"max": 4, "every_s": 900, "clock": CLOCK["boot_unix"] != 0, "now_unix": now,
+                       "free_bytes": 120000, "network": {"ssid": STATE["active_ssid"], "subnet": "192.168.2.0/24"},
+                       "reports": out}, separators=(",", ":"))
+
+
+def report_file(r):
+    """The report as the board keeps it: the header line, one device a line, then ]}."""
+    head = dict(r)
+    rows = head.pop("devices")
+    text = json.dumps(head, separators=(",", ":"))[:-1] + ',"devices":[\n'
+    return text + ",\n".join(json.dumps(d, separators=(",", ":")) for d in rows) + "\n]}\n"
 
 
 def uptime():
@@ -179,12 +247,16 @@ def health():
             '"free_heap":181234,"sweepable":true,"devices":6,"scan_passes":61,"scan_remaining":0,'
             '"last_pass_ms":6512,"pass_seen":5,"pass_merges":212,"arp_cache":10,"latency_valid":true,'
             '"latency_ms":4,"latency_age_s":12,"dhcp_packets":3,"events":9,"baseline_open":false,'
-            '"baseline_anchored":true,"baseline_closes_in_s":0,"names_known":4}'
-            % (version(), STATE["active_ssid"], uptime()))
+            '"baseline_anchored":true,"baseline_closes_in_s":0,"names_known":4%s}'
+            % (version(), STATE["active_ssid"], uptime(),
+               ',"mac":"D4:E9:F4:12:34:56","ble_link":%s,"clock":%s' % (
+                   str(LINK["enabled"]).lower(), str(CLOCK["boot_unix"] != 0).lower()) if v12() else ""))
 
 
 def version():
-    return V11 if v11() and STATE["version"] == "0.9.6-status-hints" else STATE["version"]
+    if STATE["version"] != "0.9.6-status-hints":
+        return STATE["version"]
+    return V12 if v12() else V11 if v11() else STATE["version"]
 
 
 def devices():
@@ -331,6 +403,15 @@ class H(BaseHTTPRequestHandler):
                             find_stop()
                     after = int(parse_qs(u.query).get("after", ["0"])[0] or 0)
                     return self._send(200, json.dumps(find_body(after)))
+            if v12() and u.path == "/api/ble":
+                return self._send(200, json.dumps(link_status()))
+            if v12() and u.path == "/api/reports":
+                return self._send(200, reports_list())
+            if v12() and u.path == "/api/reports/get":
+                slot = parse_qs(u.query).get("slot", [""])[0]
+                if not slot.isdigit() or int(slot) not in REPORTS:
+                    return self._send(404, '{"error":"No report is saved there."}')
+                return self._send(200, report_file(REPORTS[int(slot)]))
             if u.path == "/api/map":
                 return self._send(200, json.dumps(mapdata()))
         if u.path == "/api/latency":
@@ -380,6 +461,9 @@ class H(BaseHTTPRequestHandler):
                              nets=[{"ssid": "Office-WiFi", "pass": "x"}, {"ssid": "HOME-5G", "pass": "y"},
                                    {"ssid": "Cafe Guest", "pass": ""}])
                 NEARBY.update(wifi=True, ble=True, ble_ready=True, background_s=120)
+                LINK.update(enabled=True, bonds=1, open=0.0, code="", result="", result_at=0.0)
+                CLOCK.update(boot_unix=0)
+                reports_reset()
                 FIND.update(t=None, prev=None, started=0.0, asked=0.0, rd=[], last=0.0,
                             hold_from=-1e9, hold_until=-1e9)
             return self._send(200, "{}")
@@ -460,6 +544,14 @@ class H(BaseHTTPRequestHandler):
             with LOCK:
                 code, out = find_post(doc)
             return self._send(code, json.dumps(out))
+        if v12() and u.path in ("/api/ble", "/api/ble/pair", "/api/ble/forget", "/api/clock",
+                                 "/api/reports/save", "/api/reports/delete"):
+            try:
+                doc = json.loads(body.decode("utf-8") or "{}")
+            except Exception:
+                return self._send(400, '{"error":"request body is not valid JSON"}')
+            with LOCK:
+                return self._post12(u.path, doc)
         if u.path == "/api/networks/forget":
             try:
                 doc = json.loads(body.decode("utf-8"))
@@ -476,6 +568,51 @@ class H(BaseHTTPRequestHandler):
                 if len(STATE["nets"]) == before:
                     return self._send(404, '{"error":"that network is not remembered"}')
             return self._send(200, '{"status":"forgotten"}')
+        return self._send(404, "not found", "text/plain")
+
+    def _post12(self, path, doc):
+        if path == "/api/ble":
+            if not isinstance(doc.get("enabled"), bool):
+                return self._send(400, '{"error":"enabled must be true or false"}')
+            LINK["enabled"] = doc["enabled"]
+            if not LINK["enabled"]:
+                LINK["open"] = 0.0
+            return self._send(200, json.dumps(link_status()))
+        if path == "/api/ble/pair":
+            if doc.get("stop") is True:
+                LINK["open"] = 0.0
+            elif not LINK["enabled"]:
+                return self._send(409, '{"error":"The Bluetooth link is switched off. Switch it on first."}')
+            else:
+                if not (LINK["open"] and time.time() - LINK["open"] < 120):
+                    LINK["code"] = "042517"
+                LINK["open"] = time.time()
+                LINK["result"] = ""
+            return self._send(200, json.dumps(link_status()))
+        if path == "/api/ble/forget":
+            LINK["bonds"] = 0
+            return self._send(200, json.dumps(link_status()))
+        if path == "/api/clock":
+            t = doc.get("unix")
+            if isinstance(t, bool) or not isinstance(t, int):
+                return self._send(400, '{"error":"unix must be the time in seconds since 1970"}')
+            if not 1704067200 <= t <= 4102444800:
+                return self._send(400, '{"error":"that time is not plausible"}')
+            CLOCK["boot_unix"] = t - uptime()
+            return self._send(200, json.dumps({"clock": True, "unix": t, "source": "client"}))
+        if path == "/api/reports/save":
+            now = int(CLOCK["boot_unix"] + uptime()) if CLOCK["boot_unix"] else 0
+            slot = next((k for k, r in REPORTS.items() if r["ssid"] == STATE["active_ssid"]), None)
+            if slot is None:
+                slot = next(k for k in range(4) if k not in REPORTS)
+            seq = max([r["seq"] for r in REPORTS.values()] + [0]) + 1
+            REPORTS[slot] = report_of(STATE["active_ssid"], "192.168.2.0/24", seq, now, report_rows(now))
+            return self._send(200, reports_list())
+        if path == "/api/reports/delete":
+            if doc.get("slot") not in REPORTS:
+                return self._send(404, '{"error":"No report is saved there."}')
+            del REPORTS[doc["slot"]]
+            return self._send(200, reports_list())
         return self._send(404, "not found", "text/plain")
 
     def _update(self, key):
@@ -511,6 +648,7 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18080
+    reports_reset()
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     srv.daemon_threads = True
     print("mock board on", port, flush=True)

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Runs the board's own Nearby and Map page scripts (from pages.h) in node and
-writes what they compute for a fixed set of inputs, for CoreTest to compare
-with the app's ports: distances, bearings, trend arrows, the Finder's
-smoothing, trend and direction, and the network map's layout.
+"""Runs the board's own Nearby, Map and Settings page scripts (from pages.h) in
+node and writes what they compute for a fixed set of inputs, for CoreTest to
+compare with the app's ports: distances, bearings, trend arrows, the Finder's
+smoothing, trend and direction, the network map's layout, and the saved
+reports' CSV export and file names.
 
   python3 web_parity.py ../../../firmware/netmon/src/hw/pages.h parity.json
 """
@@ -134,12 +135,53 @@ console.log(JSON.stringify(out));
 """
 
 
-def run(js):
+# Saved reports: one dated, one from a board that had no clock. Names a
+# spreadsheet would run as formulas, commas, quotes and a line break.
+REPORT_DEVICES = [
+    {"mac": "D4:E9:F4:12:34:56", "ip": "10.20.0.27", "hostname": "netmon", "vendor": "Espressif Inc.",
+     "status": "known", "randomised": False, "self": True, "online": True, "up_s": 5400, "last_seen_s": 3,
+     "seen_unix": 1791136859, "first_unix": 1791131462, "carried": False},
+    {"mac": "DA:A1:19:77:88:99", "ip": "10.20.0.45", "hostname": "=HYPERLINK(\"x\")", "vendor": "",
+     "status": "private", "randomised": True, "self": False, "online": True, "up_s": 900, "last_seen_s": 40,
+     "seen_unix": 0, "first_unix": 0, "carried": False},
+    {"mac": "7C:9E:BD:01:02:03", "ip": "10.20.0.77", "hostname": "-cmd", "vendor": "Acme, \"Widgets\" Ltd",
+     "status": "unknown", "randomised": False, "self": False, "online": False, "up_s": 0, "last_seen_s": 7300,
+     "seen_unix": 1791129562, "first_unix": 1791000000, "carried": True},
+    {"mac": "00:11:32:AA:BB:CC", "ip": "10.20.0.20", "hostname": "Desk\nPC", "vendor": "Synology Incorporated",
+     "status": "known", "randomised": False, "self": False, "online": False, "up_s": 0, "last_seen_s": 120,
+     "seen_unix": 0, "first_unix": 0, "carried": False},
+]
+
+
+def report_fixtures():
+    head = {"report": 1, "ssid": "Office =Guest, \"2\"", "subnet": "10.20.0.0/16", "gateway": "10.20.0.1",
+            "gateway_mac": "98:DA:C4:11:22:33", "board_ip": "10.20.0.27", "board_mac": "D4:E9:F4:12:34:56",
+            "version": "0.12.0-bluetooth", "seq": 9, "saved_unix": 1791136862, "saved_up_s": 5400,
+            "clock": "internet", "passes": 88, "learning": False, "count": 4, "online": 2}
+    dated = dict(head, devices=REPORT_DEVICES)
+    undated = dict(head, saved_unix=0, clock="none",
+                   devices=[dict(d, seen_unix=0, first_unix=0) for d in REPORT_DEVICES])
+    return [dated, undated]
+
+
+CSV_VECTORS = r"""
+var out = {csv: [], cells: [], names: []};
+__REPORTS__.forEach(function (r) { out.csv.push(tocsv(r)); });
+['', 'plain', '=1+1', '+x', '-x', '@x', '\tx', '\rx', 'a,b', 'say "hi"', 'two\nlines', "'quoted", 'x=1'].forEach(
+  function (v) { out.cells.push([v, csvcell(v)]); });
+[['HOME-2.4', 1791136862], ['Office =Guest, "2"', 0], ['Café ☕', 1791136862], ['', 5], ['☕', 0]].forEach(
+  function (x) { out.names.push([x[0], x[1], fname({ssid: x[0], saved_unix: x[1]}, 'csv')]); });
+console.log(JSON.stringify(out));
+"""
+
+
+def run(js, env=None):
     with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as f:
         f.write(js)
         name = f.name
     try:
-        r = subprocess.run(['node', name], capture_output=True, text=True, timeout=120)
+        r = subprocess.run(['node', name], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, **(env or {})))
     finally:
         os.unlink(name)
     if r.returncode:
@@ -175,9 +217,19 @@ def main():
              MAP_VECTORS.replace('__MAP__', json.dumps(mock_nearby.mapdata()))
              .replace('__DEVICES__', json.dumps(mock_nearby.devices())))
     netmap = run(mapjs)
-    json.dump({'nearby': nearby, 'map': netmap, 'map_input': {'map': mock_nearby.mapdata(), 'devices': mock_nearby.devices()}},
+    # The Settings page, with its timers stubbed so node can finish, in UTC so
+    # the times it writes do not depend on where the tests run.
+    st = pages['SETTINGS_HTML']
+    fixtures = report_fixtures()
+    csvjs = (PRELUDE.replace('__IDS__', json.dumps(ids(st))) + 'globalThis.setInterval = function () { return 0; };\n'
+             + script(st) + CSV_VECTORS.replace('__REPORTS__', json.dumps(fixtures)))
+    csv = run(csvjs, env={'TZ': 'UTC'})
+    csv['input'] = [json.dumps(f, ensure_ascii=False) for f in fixtures]
+    json.dump({'nearby': nearby, 'map': netmap, 'map_input': {'map': mock_nearby.mapdata(), 'devices': mock_nearby.devices()},
+               'csv': csv},
               open(out_path, 'w', encoding='utf-8'), ensure_ascii=False)
-    print('wrote', out_path, '-', len(netmap['cases']), 'map layouts,', len(nearby['metres']), 'distances')
+    print('wrote', out_path, '-', len(netmap['cases']), 'map layouts,', len(nearby['metres']), 'distances,',
+          len(csv['csv']), 'CSV exports')
 
 
 if __name__ == '__main__':

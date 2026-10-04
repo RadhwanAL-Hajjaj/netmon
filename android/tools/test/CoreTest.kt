@@ -46,8 +46,13 @@ fun main() {
     headingTests()
     mapTests()
     parityTests()
+    linkTests()
+    routeTests()
+    reportTests()
     clientTests()
     nearbyClientTests()
+    client12Tests()
+    linkClientTests()
     println("passed $passed, failed $failed")
     if (failed > 0) System.exit(1)
 }
@@ -937,4 +942,409 @@ fun nearbyClientTests() {
     val plan = NetMap.plan(m, c.devices(), false, false, 360.0)
     check(plan != null && plan.groups.isNotEmpty(), "the mock board's network maps")
     mock("/__reset", "POST")
+}
+
+
+// --- The Bluetooth link, routes and saved reports (1.2.0) ---------------------------
+
+fun hex(b: ByteArray) = b.joinToString(" ") { "%02x".format(it) }
+
+fun unhex(s: String) = s.split(" ").filter { it.isNotEmpty() }.map { it.toInt(16).toByte() }.toByteArray()
+
+fun linkTests() {
+    // The same bytes the firmware's own tests check (firmware/test/test_core.cpp,
+    // test_link_vectors), so the two ends agree on the format, not each with itself.
+    val f1 = LinkCodec.frames(7, LinkCodec.request("GET", "/api/health"), 20)
+    eq(f1.size, 1, "a short request is one frame")
+    eq(hex(f1[0]), "03 07 47 45 54 20 2f 61 70 69 2f 68 65 61 6c 74 68 0a 0a", "health request, as the firmware reads it")
+    val f2 = LinkCodec.frames(0x2a, LinkCodec.request("POST", "/api/nearby/find", body = "{\"stop\":true}".toByteArray()), 20)
+    eq(f2.map { hex(it) }, listOf(
+        "01 2a 50 4f 53 54 20 2f 61 70 69 2f 6e 65 61 72 62 79 2f 66",
+        "02 2a 69 6e 64 0a 0a 7b 22 73 74 6f 70 22 3a 74 72 75 65 7d"), "a request in two frames")
+    val a1 = LinkCodec.Answer(7)
+    check(a1.feed(unhex("03 07 c8 00 7b 22 6f 6b 22 3a 74 72 75 65 7d")), "answer frame taken")
+    eq(a1.done, true, "one-frame answer done")
+    eq(a1.status, 200, "status, low byte first")
+    eq(String(a1.body), "{\"ok\":true}", "answer body")
+    val a2 = LinkCodec.Answer(9)
+    a2.feed(unhex("01 09 94 01 6e 6f 74 20"))
+    eq(a2.done, false, "first of two")
+    a2.feed(unhex("02 09 66 6f 75 6e 64"))
+    eq(a2.status, 404, "404 across frames")
+    eq(String(a2.body), "not found", "body across frames")
+    val a3 = LinkCodec.Answer(1)
+    a3.feed(unhex("03 01 cc 00"))
+    eq(a3.status, 204, "empty answer status")
+    eq(a3.body.size, 0, "empty answer body")
+    // Another request's frames, broken ones, and a middle before any start are ignored.
+    val a4 = LinkCodec.Answer(5)
+    check(!a4.feed(unhex("03 06 c8 00 7b 7d")), "another number ignored")
+    check(!a4.feed(unhex("02 05 7b 7d")), "no start yet")
+    check(!a4.feed(unhex("07 05 c8 00")), "an unknown flag")
+    check(!a4.feed(unhex("01 05 c8")), "a first frame without its status")
+    check(!a4.feed(ByteArray(1)), "too short")
+    a4.feed(unhex("01 05 c8 00 7b"))
+    a4.feed(unhex("00 05 22 61 22 3a"))
+    a4.feed(unhex("02 05 31 7d"))
+    eq(String(a4.body), "{\"a\":1}", "three frames")
+    check(!a4.feed(unhex("03 05 c8 00")), "a finished answer takes nothing more")
+
+    eq(String(LinkCodec.request("POST", "/api/update/check", mapOf("X-Netmon-Key" to "s3cret pw"))),
+        "POST /api/update/check\nX-Netmon-Key: s3cret pw\n\n", "a request with the update password")
+    throws<IllegalArgumentException>("PUT refused") { LinkCodec.request("PUT", "/x") }
+    throws<IllegalArgumentException>("a path without its slash") { LinkCodec.request("GET", "api/x") }
+    throws<IllegalArgumentException>("a space in a path") { LinkCodec.request("GET", "/a b") }
+    throws<IllegalArgumentException>("a line break in a header") { LinkCodec.request("GET", "/x", mapOf("X" to "a\nb")) }
+    throws<IllegalArgumentException>("frames need room") { LinkCodec.frames(1, ByteArray(3), 2) }
+
+    // Every length of request, at every frame size, comes apart and back together.
+    var whole = true
+    for (cap in listOf(3, 5, 20, 23, 64, 244)) for (n in listOf(0, 1, 17, 18, 19, 300, 1000)) {
+        val msg = ByteArray(n) { (it * 7 + n).toByte() }
+        val fr = LinkCodec.frames(200, msg, cap)
+        val back = java.io.ByteArrayOutputStream()
+        fr.forEachIndexed { i, f ->
+            val flags = f[0].toInt()
+            val want = (if (i == 0) LinkCodec.FIRST else 0) or (if (i == fr.size - 1) LinkCodec.LAST else 0)
+            if (flags != want || f.size > cap || (f[1].toInt() and 0xFF) != 200) whole = false
+            if (i < fr.size - 1 && f.size != cap) whole = false
+            back.write(f, 2, f.size - 2)
+        }
+        if (!back.toByteArray().contentEquals(msg)) whole = false
+    }
+    check(whole, "requests survive framing at every size")
+
+    eq(LinkCodec.advert(byteArrayOf('N'.code.toByte(), 'M'.code.toByte(), 1, 1)), LinkCodec.Advert(1, true), "advert: pairing open")
+    eq(LinkCodec.advert(byteArrayOf('N'.code.toByte(), 'M'.code.toByte(), 1, 0))?.pairing, false, "advert: no window")
+    eq(LinkCodec.advert(byteArrayOf(1, 2, 3, 4)), null, "someone else's advert")
+    eq(LinkCodec.advert(null), null, "no manufacturer data")
+
+    eq(NetmonClient.normalize("ble://d4:e9:f4:a3:b8:ae"), "ble://D4:E9:F4:A3:B8:AE", "a Bluetooth base, in capitals")
+    eq(NetmonClient.normalize(" BLE://D4:E9:F4:A3:B8:AE "), "ble://D4:E9:F4:A3:B8:AE", "whatever the case of the scheme")
+    throws<IllegalArgumentException>("not a Bluetooth address") { NetmonClient.normalize("ble://nope") }
+    eq(NetmonClient.display("ble://D4:E9:F4:A3:B8:AE"), "Bluetooth", "shown as Bluetooth")
+    check(NetmonClient("ble://D4:E9:F4:A3:B8:AE").viaBluetooth, "a client over Bluetooth knows it")
+    check(!NetmonClient("192.168.2.30").viaBluetooth, "and one over Wi-Fi")
+    eq(LinkCodec.isBle(null), false, "no base is not Bluetooth")
+    val saved = Link.transport
+    Link.transport = null
+    eq(throws<ApiException>("no transport") { NetmonClient("ble://D4:E9:F4:A3:B8:AE").health() }?.kind,
+        ApiException.Kind.Unreachable, "without Bluetooth on the phone: unreachable")
+    Link.transport = saved
+
+    // A pipe that never answers: a timeout, not a hang.
+    val silent = object : LinkCodec.Pipe {
+        override val frameCap = 20
+        override fun send(frame: ByteArray) {}
+        override fun receive(timeoutMs: Long): ByteArray? { Thread.sleep(minOf(timeoutMs, 20)); return null }
+    }
+    val t0 = System.currentTimeMillis()
+    eq(throws<ApiException>("silent board") { LinkCodec.exchange(silent, 1, LinkCodec.request("GET", "/x"), 300) }?.kind,
+        ApiException.Kind.Timeout, "no answer times out")
+    check(System.currentTimeMillis() - t0 < 2000, "and promptly")
+    eq(throws<ApiException>("too large") { LinkCodec.exchange(silent, 1, ByteArray(LinkCodec.REQUEST_MAX + 1), 300) }?.kind,
+        ApiException.Kind.BadData, "a request too large for the board is not sent")
+}
+
+/**
+ * The board's end of the link, standing in for the firmware: it takes request
+ * frames, turns them back into the HTTP request they carry and asks the mock
+ * board, then answers in frames cut as the firmware cuts them (status first,
+ * least significant byte first). So every client call can run over the
+ * Bluetooth path against the same mock board as over Wi-Fi.
+ */
+class LoopLink(private val http: String, var cap: Int) : LinkTransport {
+    var asked = 0
+    var noise = false          // a stale frame from another request arrives before each answer
+    var drop = false           // the connection drops instead of answering
+    val paths = ArrayList<String>()
+
+    override fun exchange(address: String, message: ByteArray, timeoutMs: Int): LinkReply {
+        val out = java.util.ArrayDeque<ByteArray>()
+        val rx = java.io.ByteArrayOutputStream()
+        var id = -1
+        val pipe = object : LinkCodec.Pipe {
+            override val frameCap get() = cap
+            override fun send(frame: ByteArray) {
+                check(frame.size <= cap, "frame within the MTU")
+                val flags = frame[0].toInt() and 0xFF
+                if (flags and LinkCodec.FIRST != 0) { rx.reset(); id = frame[1].toInt() and 0xFF }
+                rx.write(frame, 2, frame.size - 2)
+                if (flags and LinkCodec.LAST == 0) return
+                if (drop) throw LinkCodec.Closed("dropped")
+                val (status, body) = forward(rx.toByteArray())
+                if (noise) out.add(byteArrayOf(3, ((id + 1) and 0xFF).toByte(), 0xC8.toByte(), 0, '{'.code.toByte(), '}'.code.toByte()))
+                var off = 0
+                var first = true
+                do {
+                    val room = cap - 2 - if (first) 2 else 0
+                    val n = minOf(room, body.size - off)
+                    val last = off + n == body.size
+                    val f = java.io.ByteArrayOutputStream()
+                    f.write((if (first) LinkCodec.FIRST else 0) or (if (last) LinkCodec.LAST else 0))
+                    f.write(id)
+                    if (first) { f.write(status and 0xFF); f.write(status shr 8) }
+                    f.write(body, off, n)
+                    out.add(f.toByteArray())
+                    off += n
+                    first = false
+                } while (off < body.size)
+            }
+            override fun receive(timeoutMs: Long): ByteArray? = out.pollFirst()
+        }
+        asked++
+        try {
+            return LinkCodec.exchange(pipe, asked and 0xFF, message, timeoutMs.toLong())
+        } catch (e: LinkCodec.Closed) {
+            throw ApiException(ApiException.Kind.Unreachable, "The Bluetooth connection to the monitor dropped.")
+        }
+    }
+
+    private fun forward(req: ByteArray): Pair<Int, ByteArray> {
+        var split = -1
+        for (i in 0 until req.size - 1) if (req[i] == '\n'.code.toByte() && req[i + 1] == '\n'.code.toByte()) { split = i; break }
+        val head = String(req, 0, split, Charsets.UTF_8).split("\n")
+        val body = req.copyOfRange(split + 2, req.size)
+        val (method, target) = head[0].split(" ")
+        paths.add("$method $target")
+        val c = URL(http + target).openConnection() as HttpURLConnection
+        c.requestMethod = method
+        c.setRequestProperty("Connection", "close")
+        for (h in head.drop(1)) {
+            val k = h.substringBefore(": ")
+            c.setRequestProperty(k, h.substringAfter(": "))
+        }
+        if (method == "POST") {
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.setFixedLengthStreamingMode(body.size)
+            c.outputStream.use { it.write(body) }
+        }
+        val code = c.responseCode
+        val bytes = (if (code >= 400) c.errorStream else c.inputStream)?.use { it.readBytes() } ?: ByteArray(0)
+        return code to bytes
+    }
+}
+
+fun routeTests() {
+    val w = "http://192.168.2.27"
+    val b = "ble://D4:E9:F4:12:34:58"
+    eq(RoutePlan.initial(LinkMode.AUTO, w, b, null), w, "auto starts on Wi-Fi")
+    eq(RoutePlan.initial(LinkMode.AUTO, w, b, b), b, "or where it last worked")
+    eq(RoutePlan.initial(LinkMode.AUTO, w, b, "http://10.0.0.1"), w, "a last route that is no longer the board's")
+    eq(RoutePlan.initial(LinkMode.AUTO, null, b, null), b, "Bluetooth when that is all there is")
+    eq(RoutePlan.initial(LinkMode.WIFI, w, b, b), w, "Wi-Fi only")
+    eq(RoutePlan.initial(LinkMode.BLUETOOTH, w, b, w), b, "Bluetooth only")
+    eq(RoutePlan.initial(LinkMode.BLUETOOTH, w, null, null), w, "Bluetooth only, but never paired")
+    eq(RoutePlan.initial(LinkMode.AUTO, null, null, null), null, "no board")
+    eq(RoutePlan.fallback(LinkMode.AUTO, w, w, b), b, "Wi-Fi silent: Bluetooth")
+    eq(RoutePlan.fallback(LinkMode.AUTO, b, w, b), w, "Bluetooth silent: Wi-Fi")
+    eq(RoutePlan.fallback(LinkMode.AUTO, w, w, null), null, "not paired: nowhere else")
+    eq(RoutePlan.fallback(LinkMode.WIFI, w, w, b), null, "Wi-Fi only never falls back")
+    eq(RoutePlan.fallback(LinkMode.BLUETOOTH, b, w, b), null, "nor Bluetooth only")
+    check(RoutePlan.recheckWifi(LinkMode.AUTO, b, w, true, 30_000), "on Bluetooth, Wi-Fi is tried again")
+    check(!RoutePlan.recheckWifi(LinkMode.AUTO, b, w, true, 29_999), "but not too often")
+    check(!RoutePlan.recheckWifi(LinkMode.AUTO, b, w, false, 60_000), "nor with the phone off Wi-Fi")
+    check(!RoutePlan.recheckWifi(LinkMode.AUTO, w, w, true, 60_000), "nor when on Wi-Fi already")
+    check(!RoutePlan.recheckWifi(LinkMode.BLUETOOTH, b, w, true, 60_000), "nor when told Bluetooth only")
+    check(!RoutePlan.recheckWifi(LinkMode.AUTO, b, null, true, 60_000), "nor without a Wi-Fi address")
+
+    val h = Parse.health("""{"version":"0.12.0-bluetooth","wifi":"connected","ip":"192.168.2.40","mac":"d4:e9:f4:12:34:56","ble_link":true,"clock":false}""")
+    eq(h.mac, "D4:E9:F4:12:34:56", "health mac, in capitals")
+    eq(h.bleLink, true, "health link")
+    eq(h.clockUnset, true, "health: no clock")
+    eq(Parse.health("""{"version":"0.11.0-finder"}""").clockUnset, false, "an older board is never sent the time")
+    eq(RoutePlan.learnedWifi(h, null), "http://192.168.2.40", "over Bluetooth, where the board is on Wi-Fi")
+    eq(RoutePlan.learnedWifi(h, "http://192.168.2.27"), "http://192.168.2.40", "a new address from the router")
+    eq(RoutePlan.learnedWifi(h, "http://192.168.2.40"), null, "the same address")
+    eq(RoutePlan.learnedWifi(h, "http://netmon.example:8080"), null, "an address chosen by hand stays")
+    eq(RoutePlan.learnedWifi(Parse.health("""{"wifi":"softap","ip":"192.168.4.1"}"""), null), null, "not from setup mode")
+    check(RoutePlan.sameBoard("d4:e9:f4:12:34:56", h), "the same board by its MAC")
+    check(!RoutePlan.sameBoard("", h), "nothing known before")
+    check(!RoutePlan.sameBoard("AA:BB:CC:DD:EE:FF", h), "another board")
+    check(!RoutePlan.sameBoard("D4:E9:F4:12:34:56", Parse.health("""{"version":"0.11.0-finder"}""")), "a board too old to say")
+    eq(LinkMode.of("bluetooth"), LinkMode.BLUETOOTH, "mode key")
+    eq(LinkMode.of(null), LinkMode.AUTO, "mode default")
+    eq(LinkMode.of("nonsense"), LinkMode.AUTO, "mode unknown")
+}
+
+val REPORT_JSON = """{"report":1,"ssid":"HOME-5G","subnet":"192.168.2.0/24","gateway":"192.168.2.1","gateway_mac":"98:da:c4:11:22:33","board_ip":"192.168.2.30","board_mac":"D4:E9:F4:12:34:56","version":"0.12.0-bluetooth","seq":4,"saved_unix":1791136862,"saved_up_s":3600,"clock":"client","passes":60,"learning":true,"count":3,"online":1,"devices":[
+{"mac":"d4:e9:f4:12:34:56","ip":"192.168.2.30","hostname":"netmon","vendor":"Espressif Inc.","status":"known","randomised":false,"self":true,"online":true,"up_s":3600,"last_seen_s":3,"seen_unix":1791136859,"first_unix":1791133262,"carried":false},
+{"mac":"DA:A1:19:77:88:99","ip":"192.168.2.45","hostname":"Pixel-7","vendor":"","status":"private","randomised":true,"self":false,"online":false,"up_s":0,"last_seen_s":40,"seen_unix":0,"first_unix":0,"carried":false},
+{"mac":"7C:9E:BD:01:02:03","ip":"192.168.2.77","hostname":"","vendor":"Espressif Inc.","status":"unknown","randomised":false,"self":false,"online":false,"up_s":0,"last_seen_s":90000,"seen_unix":1791046862,"first_unix":1791000000,"carried":true}
+]}
+"""
+
+fun reportTests() {
+    val b = Parse.ble("""{"link":1,"available":true,"enabled":true,"on":true,"name":"netmon","addr":"d4:e9:f4:12:34:58","bonds":1,"max_bonds":3,"connected":1,"secure":1,"pairing":true,"code":"042517","left_s":97,"result":"","result_age_s":0,"served":12,"via":"bluetooth"}""")
+    eq(b.addr, "D4:E9:F4:12:34:58", "ble addr")
+    eq(b.code, "042517", "ble code keeps its leading zero")
+    eq(b.pairing, true, "ble pairing")
+    eq(b.leftS, 97, "ble left")
+    eq(b.via, "bluetooth", "ble via")
+    eq(Parse.ble("{}").maxBonds, 3, "ble defaults")
+    eq(JSONObject(Parse.bleBody(false)).getBoolean("enabled"), false, "ble body")
+    eq(JSONObject(Parse.clockBody(1791136862L)).getLong("unix"), 1791136862L, "clock body")
+    eq(JSONObject(Parse.slotBody(3)).getInt("slot"), 3, "slot body")
+
+    val l = Parse.reports("""{"max":4,"every_s":900,"clock":true,"now_unix":1791137000,"free_bytes":120000,"network":{"ssid":"HOME-5G","subnet":"192.168.2.0/24"},"reports":[{"slot":0,"ssid":"HOME-5G","subnet":"192.168.2.0/24","gateway":"192.168.2.1","count":6,"online":5,"saved_unix":1791136862,"age_s":138,"bytes":1810,"current":true},{"slot":3,"ssid":"Office","subnet":"10.20.0.0/16","gateway":"10.20.0.1","count":3,"online":3,"saved_unix":0,"age_s":-1,"bytes":900,"current":false},{"ssid":"broken"}]}""")
+    eq(l.reports.size, 2, "a report without a slot is left out")
+    eq(l.networkSsid, "HOME-5G", "the network now")
+    eq(l.reports[1].ageS, -1L, "an age that cannot be told")
+    eq(Parse.reports("""{"network":null,"reports":[]}""").networkSsid, "", "not on a network")
+    val ord = ReportFiles.ordered(listOf(
+        l.reports[1], l.reports[0].copy(current = false, savedUnix = 5), l.reports[0]))
+    eq(ord.map { it.slot to it.current }, listOf(0 to true, 0 to false, 3 to false), "the network now first, then the newest")
+
+    val r = Parse.report(REPORT_JSON)
+    eq(r.ssid, "HOME-5G", "report ssid")
+    eq(r.gatewayMac, "98:DA:C4:11:22:33", "report gateway mac")
+    eq(r.devices.size, 3, "report rows, one a line")
+    eq(r.devices[0].device.mac, "D4:E9:F4:12:34:56", "rows parse like /api/devices")
+    eq(r.devices[0].device.self, true, "the board itself")
+    eq(r.devices[2].carried, true, "kept from an earlier report")
+    eq(r.devices[1].seenAt(r), 1791136822L, "a date worked out from the save")
+    eq(r.devices[2].seenAt(r), 1791046862L, "the board's own date")
+    eq(r.devices[1].seenAt(r.copy(savedUnix = 0)), 0L, "no date at all")
+    eq(r.learning, true, "saved while learning")
+    eq(r.raw, REPORT_JSON, "kept as sent, for export")
+
+    eq(ReportFiles.cell("plain"), "plain", "csv plain")
+    eq(ReportFiles.cell("=1+1"), "'=1+1", "a formula is text")
+    eq(ReportFiles.cell("a,\"b\""), "\"a,\"\"b\"\"\"", "csv quoting")
+    eq(ReportFiles.time(1791136862L, java.util.TimeZone.getTimeZone("UTC")), "2026-10-04 18:01:02", "csv time")
+    eq(ReportFiles.time(1791136862L, java.util.TimeZone.getTimeZone("Asia/Baghdad")), "2026-10-04 21:01:02", "local time")
+    eq(ReportFiles.time(0), "", "no time")
+    val csv = ReportFiles.csv(r, java.util.TimeZone.getTimeZone("UTC"))
+    check(csv.startsWith("﻿network,subnet,saved,mac,"), "csv header, with a byte-order mark")
+    eq(csv.split("\r\n").size, 1 + 3 + 1, "a line a device")
+    check(csv.contains(",yes\r\n"), "carried over")
+    eq(ReportFiles.seenText(r.devices[0]), "online at the save", "seen text online")
+    eq(ReportFiles.seenText(r.devices[2]), "seen 1 days before the save, kept from an earlier report", "seen text carried")
+    eq(ReportFiles.seenText(r.devices[1]), "seen just before the save", "seen text recent")
+    check(ReportFiles.savedText(l.reports[1]).startsWith("Saved before the board"), "saved text without a clock")
+    check(ReportFiles.savedText(l.reports[0], java.util.TimeZone.getTimeZone("UTC")).endsWith("· 2 min ago"), "saved text with a clock")
+
+    // The board's Settings page makes the same CSV and file names (web_parity.py runs it).
+    val path = System.getenv("PARITY") ?: "parity.json"
+    val f = File(path)
+    if (!f.exists()) { println("skip CSV parity: $path missing"); return }
+    val root = JSONObject(f.readText())
+    if (!root.has("csv")) { failed++; println("FAIL: parity file has no CSV section"); return }
+    val c = root.getJSONObject("csv")
+    val inputs = c.getJSONArray("input")
+    val outs = c.getJSONArray("csv")
+    for (i in 0 until inputs.length()) {
+        val mine = ReportFiles.csv(Parse.report(inputs.getString(i)), java.util.TimeZone.getTimeZone("UTC")).removePrefix("﻿")
+        eq(mine, outs.getString(i), "CSV export $i, the page's and the app's")
+    }
+    val cells = c.getJSONArray("cells")
+    for (i in 0 until cells.length()) {
+        val x = cells.getJSONArray(i)
+        eq(ReportFiles.cell(x.getString(0)), x.getString(1), "CSV cell ${JSONObject.quote(x.getString(0))}")
+    }
+    val names = c.getJSONArray("names")
+    for (i in 0 until names.length()) {
+        val x = names.getJSONArray(i)
+        eq(ReportFiles.fileName(x.getString(0), x.getLong(1), "csv"), x.getString(2), "file name for ${x.getString(0)}")
+    }
+}
+
+/** Firmware 0.12's endpoints, over Wi-Fi. */
+fun client12Tests() {
+    try { mock("/__reset", "POST") } catch (e: Exception) { return }
+    val c = NetmonClient(MOCK)
+    eq(throws<ApiException>("ble on 0.11") { mock("/__fw?v=0.11", "POST"); c.ble() }?.status, 404, "no link before 0.12")
+    eq(throws<ApiException>("reports on 0.11") { c.reports() }?.status, 404, "no reports before 0.12")
+    eq(c.health().clockUnset, false, "0.11 is never sent the time")
+    mock("/__fw?v=0.12", "POST")
+    val h = c.health()
+    eq(h.version, "0.12.0-bluetooth", "0.12 board")
+    eq(h.mac, "D4:E9:F4:12:34:56", "health mac")
+    eq(h.clockUnset, true, "no clock yet")
+    c.setClock(1791136862L)
+    eq(c.health().clockUnset, false, "clock set")
+    eq(throws<ApiException>("implausible time") { c.setClock(1000L) }?.message, "that time is not plausible", "clock refused")
+    val b = c.ble()
+    eq(b.enabled, true, "link on")
+    eq(b.bonds, 1, "one phone paired")
+    val p = c.blePair()
+    eq(p.pairing, true, "window open")
+    eq(p.code, "042517", "the code")
+    eq(c.blePair().code, "042517", "asking again keeps the code")
+    eq(c.blePair(stop = true).pairing, false, "window closed")
+    eq(c.setBle(false).enabled, false, "link off")
+    eq(throws<ApiException>("pair while off") { c.blePair() }?.status, 409, "no window while the link is off")
+    c.setBle(true)
+    eq(c.bleForget().bonds, 0, "every phone forgotten")
+    val l = c.reports()
+    eq(l.reports.map { it.slot }, listOf(0, 3), "two saved reports")
+    check(l.reports[0].current && !l.reports[1].current, "the one for this network")
+    val r = c.report(0)
+    eq(r.devices.size, 6, "the whole report")
+    eq(r.devices[5].carried, true, "a device kept from before")
+    eq(r.devices[5].device.hostname, "Desk \"PC\"", "escaped names survive the file")
+    eq(throws<ApiException>("no such report") { c.report(2) }?.status, 404, "an empty slot")
+    val saved = c.saveReport()
+    check(saved.reports.first { it.slot == 0 }.savedUnix > 1791136862L - 10, "saved now, dated by the clock")
+    eq(c.deleteReport(3).reports.map { it.slot }, listOf(0), "deleted")
+    eq(throws<ApiException>("delete twice") { c.deleteReport(3) }?.status, 404, "already gone")
+    mock("/__reset", "POST")
+}
+
+/** Every client call again, over a simulated Bluetooth link to the same mock board. */
+fun linkClientTests() {
+    try { mock("/__reset", "POST") } catch (e: Exception) { return }
+    val saved = Link.transport
+    val loop = LoopLink(MOCK, 20)
+    Link.transport = loop
+    try {
+        mock("/__fw?v=0.12", "POST")
+        val c = NetmonClient("ble://D4:E9:F4:12:34:58")
+        eq(c.health().version, "0.12.0-bluetooth", "health over the link")
+        eq(c.devices().size, 6, "devices over the link")
+        eq(c.devices()[5].hostname, "Desk \"PC\"", "escaped name over the link")
+        eq(c.events().size, 7, "events over the link")
+        eq(c.isp(true).checkedAgeS, 0L, "a query string over the link")
+        eq(c.config().updateMax, 1_966_080L, "config over the link")
+        eq(c.scan().size, 3, "scan over the link")
+        c.saveConfig(ConfigUpdate("HOME-5G", "", true, "", "", "", "", 60, 30, 180, 600))
+        eq(JSONObject(mock("/__config")).getString("ssid"), "HOME-5G", "a POST body over the link")
+        eq(throws<ApiException>("the board's words over the link") { c.forget("HOME-5G") }?.message,
+            "the board is using this network right now", "an error answer over the link")
+        eq(c.checkUpdateKey("wrong"), false, "a header over the link: wrong")
+        eq(c.checkUpdateKey("test-key"), true, "a header over the link: right")
+        val n = c.nearby()
+        eq(n.wifi.size, 6, "a long answer in many frames")
+        eq(n.wifi[2].ssid, "Corner \"Cafe\"", "and intact")
+        eq(c.findStart("ble", "C4:9E:11:22:33:44").name, "Tile", "the Finder over the link")
+        Thread.sleep(700)
+        check(c.find(0).readings.isNotEmpty(), "readings over the link")
+        c.findStop()
+        eq(c.map().aps.size, 2, "the map over the link")
+        eq(c.blePair().code, "042517", "pairing window over the link")
+        eq(c.report(0).devices.size, 6, "a report over the link")
+        c.setClock(1791136862L)
+        eq(c.saveReport().clock, true, "save over the link")
+        eq(throws<ApiException>("no such page") { c.report(2) }?.status, 404, "404 over the link")
+        val up = throws<ApiException>("no update over Bluetooth") { c.uploadFirmware(ByteArray(10), "x.bin", "test-key") { _, _ -> } }
+        eq(up?.status, 501, "firmware updates refused over Bluetooth")
+        check(up?.message?.contains("Wi-Fi") == true, "and saying why")
+        check(loop.paths.none { it.contains("/api/update ") || it.endsWith("/api/update") }, "no upload ever sent")
+        // At the largest frame the board sends, and with stale frames in the way.
+        loop.cap = 244
+        loop.noise = true
+        eq(c.nearby().ble.size, 5, "full-size frames, stale ones ignored")
+        // A connection that drops: unreachable, as when the board is out of range.
+        loop.drop = true
+        eq(throws<ApiException>("dropped") { c.health() }?.kind, ApiException.Kind.Unreachable, "a dropped link")
+        // Restart over the link: the answer arrives before the board goes.
+        loop.drop = false
+        loop.noise = false
+        c.reboot()
+        check(loop.paths.last() == "POST /api/reboot", "restart over the link")
+    } finally {
+        Link.transport = saved
+        mock("/__reset", "POST")
+    }
 }

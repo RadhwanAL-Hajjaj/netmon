@@ -63,6 +63,9 @@ class MainActivity : Activity() {
         private const val POLL_MS = 10_000L
         private const val REQ_FILE = 11
         private const val REQ_NOTIFY = 12
+        private const val REQ_SAVE = 13
+        private const val REQ_BT = 14
+        private const val REQ_BT_ON = 15
         private const val STATE_TAB = "tab"
     }
 
@@ -79,6 +82,10 @@ class MainActivity : Activity() {
     private var showing: Screen? = null
     private var tab = TAB_OVERVIEW
     private var fileCallback: ((Uri) -> Unit)? = null
+    // A file being exported: its bytes wait here while Android asks where to save it.
+    private var saving: Pair<ByteArray, (Boolean?) -> Unit>? = null
+    // What to do once the Bluetooth permissions are granted.
+    private var btThen: (() -> Unit)? = null
 
     private val boardListener: () -> Unit = { onBoardChanged() }
     private val tick = object : Runnable {
@@ -280,8 +287,10 @@ class MainActivity : Activity() {
             Board.Link.NONE -> T.TEXT3 to "Not set up"
             Board.Link.CONNECTING -> T.TEXT3 to "Connecting"
             Board.Link.LOST -> T.BAD to "Not answering"
-            Board.Link.LIVE -> if (h?.inSetupMode == true) T.WARN to "Setup mode"
-                else T.OK to (base?.let { NetmonClient.display(it) } ?: "Live")
+            Board.Link.LIVE -> when {
+                h?.inSetupMode == true -> T.WARN to (if (Board.onBluetooth) "Setup mode, Bluetooth" else "Setup mode")
+                else -> T.OK to (base?.let { NetmonClient.display(it) } ?: "Live")
+            }
         }
         val sb = SpannableStringBuilder("●  ")
         sb.setSpan(ForegroundColorSpan(dot), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -388,10 +397,84 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Saves [bytes] to a file the person picks, with Android's own dialog:
+     * Downloads, Drive, anywhere. [done] gets true when written, false when
+     * it could not be, null when the person cancelled.
+     */
+    fun saveFile(name: String, mime: String, bytes: ByteArray, done: (Boolean?) -> Unit) {
+        val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(mime)
+            .putExtra(Intent.EXTRA_TITLE, name)
+        saving = bytes to done
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, REQ_SAVE)
+        } catch (e: ActivityNotFoundException) {
+            saving = null
+            Toast.makeText(this, "No file picker is available on this phone.", Toast.LENGTH_LONG).show()
+            done(false)
+        }
+    }
+
+    private fun writeSaved(uri: Uri?) {
+        val job = saving ?: return
+        saving = null
+        if (uri == null) {
+            job.second(null)
+            return
+        }
+        Thread({
+            val ok = try {
+                contentResolver.openOutputStream(uri, "w")?.use { it.write(job.first) } != null
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread { job.second(ok) }
+        }, "netmon-save").start()
+    }
+
+    /**
+     * Runs [then] once the app may use Bluetooth: Android 12 and later ask for
+     * "Nearby devices"; before that, looking for devices ([scan]) needs location.
+     */
+    fun askBluetooth(scan: Boolean, then: () -> Unit) {
+        if (BleLink.adapter(this) == null) {
+            Toast.makeText(this, "This phone has no Bluetooth.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val missing = BleLink.missing(this, scan)
+        if (missing.isEmpty()) {
+            then()
+            return
+        }
+        btThen = then
+        requestPermissions(missing, REQ_BT)
+    }
+
+    /** Asks Android to switch Bluetooth on. */
+    fun askBluetoothOn() {
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE), REQ_BT_ON)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Switch Bluetooth on in the phone's settings.", Toast.LENGTH_LONG).show()
+        }
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SAVE) {
+            writeSaved(if (resultCode == RESULT_OK) data?.data else null)
+            return
+        }
+        if (requestCode == REQ_BT_ON) {
+            onBoardChanged()
+            return
+        }
         if (requestCode == REQ_FILE && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
             val cb = fileCallback
@@ -437,6 +520,23 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_BT) {
+            val then = btThen
+            btThen = null
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                then?.invoke()
+            } else {
+                dialog("Bluetooth is not allowed",
+                    label("netmon needs the Nearby devices permission to reach the monitor over Bluetooth" +
+                        (if (Build.VERSION.SDK_INT < 31) ", and location to look for it" else "") +
+                        ". You can allow it in the app's settings.", 15f, T.TEXT2),
+                    "Open settings", {
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+                    }, negative = "Not now")
+            }
+            onBoardChanged()
+            return
+        }
         if (requestCode != REQ_NOTIFY) return
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         if (!granted) {

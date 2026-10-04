@@ -16,10 +16,14 @@ import java.util.concurrent.Executors
  * handles one client at a time, and a burst of parallel requests would only
  * queue up inside it and time out. Results are applied on the main thread,
  * which is the only thread that reads the fields below.
+ *
+ * A board may be reachable two ways: over Wi-Fi at its address, and over the
+ * Bluetooth link once this phone is paired with it. [base] is the one in use;
+ * RoutePlan decides when to change, and the readings carry on either way.
  */
 object Board {
 
-    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP, NEARBY, NEARBY_CONFIG, MAP }
+    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP, NEARBY, NEARBY_CONFIG, MAP, BLE, REPORTS }
 
     enum class Link { NONE, CONNECTING, LIVE, LOST }
 
@@ -32,8 +36,14 @@ object Board {
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
     private var generation = 0
 
+    /** The way to the board in use now: "http://…" over Wi-Fi, "ble://…" over Bluetooth. */
     var base: String? = null
         private set
+    /** The board's address on Wi-Fi, when known. */
+    val wifiBase: String? get() = AppState.prefs.boardUrl
+    /** The board over Bluetooth, once this phone is paired with it. */
+    val bleBase: String? get() = AppState.prefs.boardBle
+    val onBluetooth: Boolean get() = LinkCodec.isBle(base)
     var health: Health? = null
         private set
     var devices: List<Device>? = null
@@ -57,6 +67,10 @@ object Board {
         private set
     var map: MapInfo? = null
         private set
+    var ble: BleStatus? = null
+        private set
+    var reports: ReportList? = null
+        private set
 
     /** Readings that failed for a reason other than the board being unreachable. */
     val partErrors = EnumMap<Part, String>(Part::class.java)
@@ -70,6 +84,15 @@ object Board {
     /** Set while a firmware upload has the board to itself. */
     @Volatile var paused = false
 
+    // Moved to an address not used for this board before: the board's MAC
+    // before the move, "" when none was known. The first health reading
+    // settles whether it is the same board (RoutePlan.sameBoard).
+    private var verifyMac: String? = null
+    private var lastWifiCheckMs = 0L
+    private var wifiChecking = false
+    // The board's clock was set from this phone during this run of the app.
+    private var clockSentFor: String? = null
+
     val link: Link
         get() = when {
             base == null -> Link.NONE
@@ -80,7 +103,8 @@ object Board {
 
     fun init(context: Context) {
         app = context.applicationContext
-        base = AppState.prefs.boardUrl
+        val p = AppState.prefs
+        base = RoutePlan.initial(p.linkMode, p.boardUrl, p.boardBle, p.lastRoute)
     }
 
     fun addListener(l: () -> Unit) { listeners.add(l) }
@@ -88,25 +112,95 @@ object Board {
 
     private fun changed() { for (l in listeners) l() }
 
-    /** Switches to another board. Readings of the old one are dropped, late ones included. */
+    /**
+     * Switches to the board at [address], over Wi-Fi or ("ble://…")
+     * Bluetooth. An address this board is already known by is just a change
+     * of route. Any other may be this board somewhere new or another board:
+     * the first health reading tells, by the board's MAC, and only then is
+     * what the phone learned about the old one let go.
+     */
     fun connect(address: String) {
         val b = NetmonClient.normalize(address)
-        val different = b != base
-        base = b
-        AppState.prefs.boardUrl = b
-        if (different) {
-            AppState.forgetBoardData()
+        val p = AppState.prefs
+        val known = b == p.boardUrl || b == p.boardBle
+        if (!known) {
+            verifyMac = p.boardMac ?: ""
             clear()
         }
+        if (LinkCodec.isBle(b)) p.boardBle = b else p.boardUrl = b
+        base = b
+        p.lastRoute = b
         failures = 0
+        routeChangedAuto = false
         changed()
         Alerts.schedule(app)
         refresh(Part.HEALTH, Part.DEVICES, Part.EVENTS)
     }
 
+    /**
+     * Uses another route to the same board: no readings are dropped.
+     * [auto] marks a change RoutePlan made rather than the person.
+     */
+    fun useRoute(route: String, auto: Boolean = false) {
+        if (route == base) return
+        base = route
+        AppState.prefs.lastRoute = route
+        failures = 0
+        routeChangedAuto = auto
+        changed()
+        refresh(Part.HEALTH)
+    }
+
+    /** True when the last change of route was RoutePlan's own doing. */
+    var routeChangedAuto = false
+        private set
+
+    /** Why Bluetooth was given up, for the screens to say once; cleared when read. */
+    var lostReason: String? = null
+
+    /** The last error reaching the board, in the board's or the link's own words. */
+    val lastProblem: String? get() = lastError
+
+    /** Changes how the app reaches the board, and the route now if the new mode rules this one out. */
+    fun setLinkMode(mode: LinkMode) {
+        val p = AppState.prefs
+        p.linkMode = mode
+        val w = p.boardUrl
+        val bl = p.boardBle
+        when (mode) {
+            LinkMode.WIFI -> if (w != null) useRoute(w)
+            LinkMode.BLUETOOTH -> if (bl != null) useRoute(bl)
+            LinkMode.AUTO -> {}
+        }
+        changed()
+    }
+
+    /** Pairing done: the board is now reachable over Bluetooth too. */
+    fun paired(bleAddress: String) {
+        AppState.prefs.boardBle = NetmonClient.normalize(LinkCodec.SCHEME + bleAddress)
+        changed()
+    }
+
+    /** This phone is no longer paired with the board: Wi-Fi only from now on. */
+    fun unpaired() {
+        val p = AppState.prefs
+        val bl = p.boardBle
+        p.boardBle = null
+        if (p.linkMode == LinkMode.BLUETOOTH) p.linkMode = LinkMode.AUTO
+        if (bl != null && base == bl) {
+            val w = p.boardUrl
+            if (w != null) useRoute(w) else forget()
+        }
+        changed()
+    }
+
     fun forget() {
         base = null
-        AppState.prefs.boardUrl = null
+        val p = AppState.prefs
+        p.boardUrl = null
+        p.boardBle = null
+        p.boardMac = null
+        p.lastRoute = null
         clear()
         changed()
         Alerts.schedule(app)
@@ -116,7 +210,7 @@ object Board {
         generation++
         health = null; devices = null; latency = null; isp = null
         config = null; networks = null; dhcp = null
-        nearby = null; nearbyAtMs = 0L; nearbyConfig = null; map = null
+        nearby = null; nearbyAtMs = 0L; nearbyConfig = null; map = null; ble = null; reports = null
         partErrors.clear()
         partStatus.clear()
         lastOkMs = 0L; lastError = null; failures = 0
@@ -128,6 +222,7 @@ object Board {
     fun refresh(parts: Collection<Part>) {
         val b = base ?: return
         if (paused || parts.isEmpty()) return
+        recheckWifi()
         val start: Boolean
         synchronized(queued) {
             start = queued.isEmpty()
@@ -141,7 +236,9 @@ object Board {
 
     private fun drain(b: String, gen: Int) {
         NetRoute.pinIfNeeded(app)
-        val client = NetmonClient(b)
+        var route = b
+        var client = NetmonClient(route)
+        var switched = false
         while (true) {
             if (paused) {
                 synchronized(queued) { queued.clear() }
@@ -153,12 +250,36 @@ object Board {
                 p
             } ?: return
             try {
-                fetch(client, part, gen)
+                fetch(client, part, gen, route)
             } catch (e: ApiException) {
-                main.post { if (gen == generation) failed(part, e) }
+                val unreachable = e.kind == ApiException.Kind.Unreachable || e.kind == ApiException.Kind.Timeout
+                // Not answering this way: once per round, the other way, if
+                // there is one this phone can use.
+                if (unreachable && !switched) {
+                    val alt = fallback(route)
+                    if (alt != null) {
+                        switched = true
+                        route = alt
+                        client = NetmonClient(alt)
+                        main.post { if (gen == generation) useRoute(alt, auto = true) }
+                        synchronized(queued) { queued.add(part) }
+                        continue
+                    }
+                }
+                main.post {
+                    if (gen != generation) return@post
+                    failed(part, e)
+                    // The monitor no longer knows this phone, or Android no
+                    // longer holds the pairing: stop using Bluetooth until it
+                    // is paired again, and say so where the app was.
+                    if (e.kind == ApiException.Kind.NotPaired && LinkCodec.isBle(route)) {
+                        unpaired()
+                        lostReason = e.message
+                    }
+                }
                 // An unreachable board would only time out again for each
                 // remaining reading; the next poll tries afresh.
-                if (e.kind == ApiException.Kind.Unreachable || e.kind == ApiException.Kind.Timeout) {
+                if (unreachable || e.kind == ApiException.Kind.NotPaired) {
                     synchronized(queued) { queued.clear() }
                     return
                 }
@@ -169,13 +290,84 @@ object Board {
         }
     }
 
-    private fun fetch(c: NetmonClient, part: Part, gen: Int) {
+    /** The other route to the board, when there is one this phone can use now. */
+    private fun fallback(failed: String): String? {
+        val p = AppState.prefs
+        val alt = RoutePlan.fallback(p.linkMode, failed, p.boardUrl, p.boardBle) ?: return null
+        // Only a board Android is paired with, with Bluetooth on: anything
+        // else would fail at once, or bring up a pairing prompt unasked.
+        if (LinkCodec.isBle(alt) && (!BleLink.switchedOn(app) || !BleLink.bonded(app, LinkCodec.address(alt)))) return null
+        return alt
+    }
+
+    /**
+     * While on Bluetooth, looks for the board over Wi-Fi now and then, in
+     * the background: when it answers there, Wi-Fi takes over again.
+     */
+    private fun recheckWifi() {
+        val p = AppState.prefs
+        val w = p.boardUrl ?: return
+        val now = System.currentTimeMillis()
+        if (wifiChecking) return
+        if (!RoutePlan.recheckWifi(p.linkMode, base, w, NetRoute.local(app) != null, now - lastWifiCheckMs)) return
+        wifiChecking = true
+        lastWifiCheckMs = now
+        val gen = generation
+        val mac = p.boardMac
+        Thread({
+            NetRoute.pinIfNeeded(app)
+            val h = try {
+                val c = NetmonClient(w)
+                c.connectTimeoutMs = 1500
+                c.readTimeoutMs = 3000
+                c.identify()
+            } catch (e: RuntimeException) {
+                null
+            }
+            main.post {
+                wifiChecking = false
+                if (gen != generation || h == null) return@post
+                // An answer from some other board at that address is no way back.
+                if (mac != null && h.mac.isNotEmpty() && !h.mac.equals(mac, ignoreCase = true)) return@post
+                if (onBluetooth && AppState.prefs.linkMode == LinkMode.AUTO) useRoute(w, auto = true)
+            }
+        }, "netmon-wifi-check").start()
+    }
+
+    /**
+     * What a health reading teaches about the board's routes: whether a new
+     * address is the same board, its MAC, and over Bluetooth where it is on
+     * Wi-Fi now. Main thread.
+     */
+    private fun learn(h: Health, route: String) {
+        val p = AppState.prefs
+        val before = verifyMac
+        if (before != null) {
+            verifyMac = null
+            if (!RoutePlan.sameBoard(before, h)) {
+                // Another board: the other route and what the phone learned
+                // belonged to the old one.
+                if (LinkCodec.isBle(route)) p.boardUrl = null else p.boardBle = null
+                AppState.forgetBoardData()
+            }
+        }
+        if (h.mac.isNotEmpty()) p.boardMac = h.mac
+        if (LinkCodec.isBle(route)) RoutePlan.learnedWifi(h, p.boardUrl)?.let { p.boardUrl = it }
+        // The board has no clock of its own: it dates its saved reports by
+        // this phone's, given once per run of the app (firmware 0.12).
+        if (h.clockUnset && clockSentFor != route) {
+            clockSentFor = route
+            run({ it.setClock(System.currentTimeMillis() / 1000) }) { _, _ -> }
+        }
+    }
+
+    private fun fetch(c: NetmonClient, part: Part, gen: Int, route: String) {
         val now = System.currentTimeMillis()
         when (part) {
             Part.HEALTH -> {
                 val h = c.health()
                 AppState.absorbHealth(now, h)
-                publish(gen, part) { health = h }
+                publish(gen, part) { health = h; learn(h, route) }
             }
             Part.DEVICES -> {
                 val d = c.devices()
@@ -225,6 +417,14 @@ object Board {
                 val m = c.map()
                 publish(gen, part) { map = m }
             }
+            Part.BLE -> {
+                val b = c.ble()
+                publish(gen, part) { ble = b }
+            }
+            Part.REPORTS -> {
+                val r = c.reports()
+                publish(gen, part) { reports = r }
+            }
         }
     }
 
@@ -243,7 +443,7 @@ object Board {
 
     private fun failed(part: Part, e: ApiException) {
         when (e.kind) {
-            ApiException.Kind.Unreachable, ApiException.Kind.Timeout -> {
+            ApiException.Kind.Unreachable, ApiException.Kind.Timeout, ApiException.Kind.NotPaired -> {
                 failures++
                 lastError = e.message
             }
@@ -260,8 +460,11 @@ object Board {
      * lookup) on the same worker as the readings, and reports on the main
      * thread. [done] gets the result or the error, never both.
      */
-    fun <T> run(work: (NetmonClient) -> T, done: (T?, ApiException?) -> Unit) {
-        val b = base
+    fun <T> run(work: (NetmonClient) -> T, done: (T?, ApiException?) -> Unit) = runVia(base, work, done)
+
+    /** As [run], over a route of the caller's choosing: Wi-Fi for pairing, say. */
+    fun <T> runVia(route: String?, work: (NetmonClient) -> T, done: (T?, ApiException?) -> Unit) {
+        val b = route
         if (b == null) {
             done(null, ApiException(ApiException.Kind.Unreachable, "No monitor is set up yet."))
             return
@@ -299,6 +502,8 @@ object Board {
     fun setIsp(i: Isp) { isp = i; changed() }
     fun setNetworks(n: List<SavedNetwork>) { networks = n; changed() }
     fun setNearbyConfig(c: NearbyConfig) { nearbyConfig = c; changed() }
+    fun setBle(b: BleStatus) { ble = b; changed() }
+    fun setReports(r: ReportList) { reports = r; changed() }
 
     /** True when the last try at [part] was answered 404: this board's firmware does not have it. */
     fun missing(part: Part): Boolean = partStatus[part] == 404

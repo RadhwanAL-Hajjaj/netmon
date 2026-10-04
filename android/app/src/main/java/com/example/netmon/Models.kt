@@ -31,6 +31,12 @@ data class Health(
     val baselineAnchored: Boolean,
     val baselineClosesInS: Long,
     val namesKnown: Int,
+    /** The board's Wi-Fi MAC, from firmware 0.12: tells the board apart however it is reached. */
+    val mac: String = "",
+    /** Whether the board's Bluetooth link is on (firmware 0.12). */
+    val bleLink: Boolean = false,
+    /** The board knows no time yet (firmware 0.12); false for older boards, which never ask. */
+    val clockUnset: Boolean = false,
 ) {
     val inSetupMode: Boolean get() = wifi == "softap"
 }
@@ -228,6 +234,87 @@ data class NearbyConfig(
     val bleReady: Boolean,
     val backgroundS: Int,
 )
+
+/** GET /api/ble (firmware 0.12): the board's Bluetooth link and its pairing window. */
+data class BleStatus(
+    val link: Int,                 // the link's version
+    val available: Boolean,        // the stack is running
+    val enabled: Boolean,          // the setting
+    val on: Boolean,               // advertising and taking connections
+    val name: String,
+    val addr: String,              // the board's Bluetooth address
+    val bonds: Int,                // paired phones
+    val maxBonds: Int,
+    val connected: Int,
+    val secure: Int,               // of those connected, paired and encrypted
+    val pairing: Boolean,          // a pairing window is open
+    val code: String,              // its six digits, while open
+    val leftS: Int,
+    val result: String,            // "paired", "failed" or "" for the last attempt in a window
+    val resultAgeS: Long,
+    val via: String,               // "wifi" or "bluetooth": how this reading was asked for
+)
+
+/** GET /api/reports (firmware 0.12): the board's saved report of each network it has been on. */
+data class ReportList(
+    val max: Int,
+    val everyS: Int,
+    val clock: Boolean,
+    val nowUnix: Long,
+    val freeBytes: Long,
+    val networkSsid: String,       // the network the board is on now; "" when none
+    val networkSubnet: String,
+    val reports: List<ReportInfo>,
+)
+
+/** One entry of GET /api/reports. */
+data class ReportInfo(
+    val slot: Int,
+    val ssid: String,
+    val subnet: String,
+    val gateway: String,
+    val count: Int,
+    val online: Int,
+    val savedUnix: Long,           // 0: the board had no clock then
+    val ageS: Long,                // -1: cannot be told
+    val bytes: Long,
+    val current: Boolean,          // the network the board is on now
+)
+
+/** GET /api/reports/get?slot=N: one network's device list as it last stood. */
+data class Report(
+    val ssid: String,
+    val subnet: String,
+    val gateway: String,
+    val gatewayMac: String,
+    val boardIp: String,
+    val boardMac: String,
+    val version: String,
+    val seq: Long,
+    val savedUnix: Long,
+    val savedUpS: Long,
+    val clock: String,             // "internet", "client" or "none": where the board's time came from
+    val passes: Long,
+    val learning: Boolean,
+    val devices: List<ReportDevice>,
+    /** The report as the board sent it, for exporting unchanged. */
+    val raw: String,
+)
+
+/** A device in a saved report: the row GET /api/devices has, last_seen_s counted back from the save. */
+data class ReportDevice(
+    val device: Device,
+    val seenUnix: Long,            // when last seen, 0 when not known
+    val firstUnix: Long,           // when first seen on that network, as far as the board knows
+    val carried: Boolean,          // kept from an earlier report: not seen since the board last started
+) {
+    /** When last seen: the board's date, else worked out from the save, else 0. */
+    fun seenAt(r: Report): Long = when {
+        seenUnix > 0 -> seenUnix
+        r.savedUnix > 0 -> r.savedUnix - device.lastSeenS
+        else -> 0
+    }
+}
 
 /** One raw reading of the device being found: its number, how long before the reply it was heard, dBm. */
 data class FindReading(val seq: Long, val msAgo: Long, val rssi: Int)

@@ -38,23 +38,103 @@ object Parse {
             baselineAnchored = bool("baseline_anchored"),
             baselineClosesInS = long("baseline_closes_in_s"),
             namesKnown = int("names_known"),
+            mac = str("mac").uppercase(),
+            bleLink = bool("ble_link"),
+            clockUnset = has("clock") && !bool("clock"),
         )
     }
 
-    fun devices(text: String): List<Device> = objects(text).map { o ->
-        Device(
-            mac = o.str("mac").uppercase(),
-            ip = o.str("ip"),
-            hostname = o.str("hostname"),
-            vendor = o.str("vendor"),
-            status = o.str("status", "unknown"),
-            randomised = o.bool("randomised"),
-            self = o.bool("self"),
-            online = o.bool("online"),
-            lastSeenS = o.long("last_seen_s"),
-            upS = o.long("up_s"),
+    fun ble(text: String): BleStatus = obj(text).run {
+        BleStatus(
+            link = int("link", 1),
+            available = bool("available"),
+            enabled = bool("enabled"),
+            on = bool("on"),
+            name = str("name", "netmon"),
+            addr = str("addr").uppercase(),
+            bonds = int("bonds"),
+            maxBonds = int("max_bonds", 3),
+            connected = int("connected"),
+            secure = int("secure"),
+            pairing = bool("pairing"),
+            code = str("code"),
+            leftS = int("left_s"),
+            result = str("result"),
+            resultAgeS = long("result_age_s"),
+            via = str("via"),
         )
     }
+
+    fun bleBody(enabled: Boolean): String = JSONObject().put("enabled", enabled).toString()
+
+    fun clockBody(unix: Long): String = JSONObject().put("unix", unix).toString()
+
+    fun slotBody(slot: Int): String = JSONObject().put("slot", slot).toString()
+
+    fun reports(text: String): ReportList = obj(text).run {
+        val net = optJSONObject("network")
+        ReportList(
+            max = int("max", 4),
+            everyS = int("every_s", 900),
+            clock = bool("clock"),
+            nowUnix = long("now_unix"),
+            freeBytes = long("free_bytes"),
+            networkSsid = net?.str("ssid") ?: "",
+            networkSubnet = net?.str("subnet") ?: "",
+            reports = array(this, "reports").map { o ->
+                ReportInfo(
+                    slot = o.int("slot", -1),
+                    ssid = o.str("ssid"),
+                    subnet = o.str("subnet"),
+                    gateway = o.str("gateway"),
+                    count = o.int("count"),
+                    online = o.int("online"),
+                    savedUnix = o.long("saved_unix"),
+                    ageS = o.long("age_s", -1),
+                    bytes = o.long("bytes"),
+                    current = o.bool("current"),
+                )
+            }.filter { it.slot >= 0 },
+        )
+    }
+
+    fun report(text: String): Report = obj(text).run {
+        val list = array(this, "devices").map { o ->
+            ReportDevice(device(o), o.long("seen_unix"), o.long("first_unix"), o.bool("carried"))
+        }
+        Report(
+            ssid = str("ssid"),
+            subnet = str("subnet"),
+            gateway = str("gateway"),
+            gatewayMac = str("gateway_mac").uppercase(),
+            boardIp = str("board_ip"),
+            boardMac = str("board_mac").uppercase(),
+            version = str("version"),
+            seq = long("seq"),
+            savedUnix = long("saved_unix"),
+            savedUpS = long("saved_up_s"),
+            clock = str("clock", "none"),
+            passes = long("passes"),
+            learning = bool("learning"),
+            devices = list,
+            raw = text,
+        )
+    }
+
+    fun devices(text: String): List<Device> = objects(text).map { device(it) }
+
+    private fun device(o: JSONObject): Device = Device(
+        mac = o.str("mac").uppercase(),
+        ip = o.str("ip"),
+        hostname = o.str("hostname"),
+        vendor = o.str("vendor"),
+        status = o.str("status", "unknown"),
+        randomised = o.bool("randomised"),
+        self = o.bool("self"),
+        online = o.bool("online"),
+        lastSeenS = o.long("last_seen_s"),
+        upS = o.long("up_s"),
+    )
 
     fun events(text: String): List<BoardEvent> = objects(text).map { o ->
         BoardEvent(
@@ -315,6 +395,7 @@ object Parse {
     }
 
     const val FIND_STOP_BODY = "{\"stop\":true}"
+    const val STOP_BODY = FIND_STOP_BODY
 
     fun map(text: String): MapInfo = obj(text).run {
         val i = optJSONObject("isp")

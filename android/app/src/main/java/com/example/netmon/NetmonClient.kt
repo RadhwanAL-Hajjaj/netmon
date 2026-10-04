@@ -9,19 +9,33 @@ import java.net.SocketTimeoutException
 import java.net.URL
 
 class ApiException(val kind: Kind, message: String, val status: Int = 0) : Exception(message) {
-    enum class Kind { Unreachable, Timeout, Unauthorized, Http, BadData }
+    /**
+     * NotPaired: the board was reached over Bluetooth but this phone is not
+     * (or no longer) paired with it, so it may not ask anything.
+     */
+    enum class Kind { Unreachable, Timeout, Unauthorized, Http, BadData, NotPaired }
 }
 
 /**
- * Talks to one board over plain HTTP. Blocking: call it from a worker thread.
+ * Talks to one board, over plain HTTP or over the Bluetooth link. Blocking:
+ * call it from a worker thread.
  *
- * The board runs the Arduino WebServer, which serves one client at a time and
- * closes every connection after the answer, so every request asks for
- * "Connection: close" and nothing is ever pooled or pipelined.
+ * Over Wi-Fi the board runs the Arduino WebServer, which serves one client at
+ * a time and closes every connection after the answer, so every request asks
+ * for "Connection: close" and nothing is ever pooled or pipelined.
+ *
+ * Over Bluetooth ([base] is "ble://" and the board's Bluetooth address) the
+ * same request goes as frames over the link (LinkCodec) and the answer comes
+ * back as the same status and body, so everything above this class works the
+ * same either way. The one exception is the firmware upload, which is Wi-Fi
+ * only.
  */
 class NetmonClient(address: String) {
 
     val base: String = normalize(address)
+
+    /** True when this client goes over Bluetooth. */
+    val viaBluetooth: Boolean get() = LinkCodec.isBle(base)
 
     var connectTimeoutMs = 4000
     var readTimeoutMs = 8000
@@ -88,6 +102,39 @@ class NetmonClient(address: String) {
 
     fun map(): MapInfo = Parse.map(get("/api/map"))
 
+    // --- Bluetooth link (firmware 0.12) ------------------------------------------
+
+    fun ble(): BleStatus = Parse.ble(get("/api/ble"))
+
+    /** Switches the board's Bluetooth link on or off. */
+    fun setBle(enabled: Boolean): BleStatus =
+        Parse.ble(post("/api/ble", Parse.bleBody(enabled).toByteArray(Charsets.UTF_8), "application/json"))
+
+    /** Opens a two-minute pairing window, or keeps the open one going; its code comes back. [stop] closes it. */
+    fun blePair(stop: Boolean = false): BleStatus =
+        Parse.ble(post("/api/ble/pair", (if (stop) Parse.STOP_BODY else "{}").toByteArray(Charsets.UTF_8), "application/json"))
+
+    /** Forgets every paired phone, this one included. */
+    fun bleForget(): BleStatus = Parse.ble(post("/api/ble/forget", ByteArray(0), null))
+
+    // --- Saved reports and the board's clock (firmware 0.12) ------------------------
+
+    fun reports(): ReportList = Parse.reports(get("/api/reports"))
+
+    /** One network's report, up to some tens of kilobytes: over Bluetooth it takes a few seconds. */
+    fun report(slot: Int): Report = Parse.report(get("/api/reports/get?slot=$slot", maxOf(readTimeoutMs, 20000)))
+
+    /** Saves the report of the network the board is on now. */
+    fun saveReport(): ReportList = Parse.reports(post("/api/reports/save", ByteArray(0), null))
+
+    fun deleteReport(slot: Int): ReportList =
+        Parse.reports(post("/api/reports/delete", Parse.slotBody(slot).toByteArray(Charsets.UTF_8), "application/json"))
+
+    /** Tells the board the time, which it has no clock of its own to know. */
+    fun setClock(unix: Long) {
+        post("/api/clock", Parse.clockBody(unix).toByteArray(Charsets.UTF_8), "application/json")
+    }
+
     /** True when the board accepts this update password. */
     fun checkUpdateKey(key: String): Boolean = try {
         post("/api/update/check", ByteArray(0), null, mapOf(KEY_HEADER to key))
@@ -108,6 +155,9 @@ class NetmonClient(address: String) {
      * answering, which only a later look at /api/health can settle.
      */
     fun uploadFirmware(image: ByteArray, fileName: String, key: String, progress: (sent: Long, total: Long) -> Unit) {
+        if (viaBluetooth) {
+            throw ApiException(ApiException.Kind.Http, "Firmware updates go over Wi-Fi. Join the monitor's Wi-Fi to update it.", 501)
+        }
         val boundary = "netmon" + java.lang.Long.toHexString(System.nanoTime())
         val safeName = fileName.replace(Regex("[\"\\r\\n\\\\]"), "_").ifBlank { "firmware.bin" }
         val head = ("--$boundary\r\n" +
@@ -154,6 +204,7 @@ class NetmonClient(address: String) {
     // --- plumbing ----------------------------------------------------------
 
     private fun get(path: String, readTimeout: Int = readTimeoutMs): String {
+        if (viaBluetooth) return overLink("GET", path, null, emptyMap(), readTimeout)
         val c = open(path, "GET", readTimeout)
         try {
             return finish(c)
@@ -167,6 +218,7 @@ class NetmonClient(address: String) {
     }
 
     private fun post(path: String, body: ByteArray, contentType: String?, headers: Map<String, String> = emptyMap()): String {
+        if (viaBluetooth) return overLink("POST", path, body, headers, readTimeoutMs)
         val c = open(path, "POST", readTimeoutMs)
         try {
             c.doOutput = true
@@ -200,11 +252,26 @@ class NetmonClient(address: String) {
         return c
     }
 
+    /**
+     * The same request over the Bluetooth link. The link itself says when the
+     * board is out of reach or this phone is not paired; the board's answer
+     * is read exactly as an HTTP one.
+     */
+    private fun overLink(method: String, path: String, body: ByteArray?, headers: Map<String, String>, timeout: Int): String {
+        val t = Link.transport ?: throw ApiException(ApiException.Kind.Unreachable, "Bluetooth is not available on this phone.")
+        val reply = t.exchange(LinkCodec.address(base), LinkCodec.request(method, path, headers, body), timeout)
+        return answer(reply.status, reply.text)
+    }
+
     /** Reads the answer; anything but 2xx becomes an ApiException carrying the board's own words. */
     private fun finish(c: HttpURLConnection): String {
         val code = c.responseCode
         val stream: InputStream? = if (code >= 400) c.errorStream else c.inputStream
         val text = stream?.use { readAll(it) } ?: ""
+        return answer(code, text)
+    }
+
+    private fun answer(code: Int, text: String): String {
         if (code in 200..299) return text
         val said = Parse.errorText(text)
         when {
@@ -234,13 +301,21 @@ class NetmonClient(address: String) {
         private const val CHUNK = 4096
         private const val MAX_REPLY = 512 * 1024
 
+        private val BLE_ADDRESS = Regex("^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+
         /**
          * "192.168.2.30", "netmon.local:80", "http://192.168.2.30/settings"
-         * all become a scheme and authority with no path.
+         * all become a scheme and authority with no path. A board reached over
+         * Bluetooth is "ble://" and its address, in capitals.
          */
         fun normalize(address: String): String {
             var s = address.trim()
             require(s.isNotEmpty()) { "Enter the board's address." }
+            if (s.length >= LinkCodec.SCHEME.length && s.substring(0, LinkCodec.SCHEME.length).lowercase() == LinkCodec.SCHEME) {
+                val mac = s.substring(LinkCodec.SCHEME.length).uppercase()
+                require(BLE_ADDRESS.matches(mac)) { "That is not a Bluetooth address." }
+                return LinkCodec.SCHEME + mac
+            }
             if (!s.contains("://")) s = "http://$s"
             val u = try {
                 URL(s)
@@ -257,8 +332,9 @@ class NetmonClient(address: String) {
             return "${u.protocol}://$host$port"
         }
 
-        /** "http://192.168.2.30" -> "192.168.2.30" for display. */
-        fun display(base: String): String = base.removePrefix("http://").removePrefix("https://")
+        /** "http://192.168.2.30" -> "192.168.2.30" for display; a board over Bluetooth is just "Bluetooth". */
+        fun display(base: String): String =
+            if (LinkCodec.isBle(base)) "Bluetooth" else base.removePrefix("http://").removePrefix("https://")
     }
 }
 

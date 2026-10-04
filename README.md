@@ -3,10 +3,12 @@
 A network monitor that runs on one ESP32 board. It finds every device on your
 LAN, tells you which ones it doesn't recognise, and scans the Wi-Fi and
 Bluetooth around it. You use it through web pages that the board serves
-itself, and those pages never load anything from the internet.
+itself, and those pages never load anything from the internet. It keeps a
+saved report of each network it has been on, and a paired phone can reach it
+over Bluetooth, away from its Wi-Fi.
 
-- **Firmware** 0.11.0-finder for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
-- **Android app** 1.1.0 (optional). It reads the same HTTP API and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications and can update the firmware.
+- **Firmware** 0.12.0-bluetooth for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
+- **Android app** 1.2.0 (optional). It reads the same API, over Wi-Fi or Bluetooth, and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications, browses and exports the saved reports, and can update the firmware.
 
 <table>
   <tr>
@@ -51,6 +53,18 @@ with the board held against your chest and it also gives a direction. In the
 Android app the phone follows that turn with its own rotation sensor, and an
 arrow keeps pointing the way afterwards.
 
+**Saved reports** (in Settings). For each network the board has been on, up
+to four, its device list as it last stood, kept in flash: saved two sweeps
+after joining, then every 15 minutes, before every restart and when you ask.
+Devices not seen since the board last started are carried over from the
+report before, so a power cut doesn't shrink it. Download one as JSON or CSV,
+or browse it in the app. See [Saved reports](docs/saved-reports.md).
+
+**Bluetooth.** A phone paired with the board, once, with a 6-digit code from
+the Settings page, uses the Android app over Bluetooth whenever the board
+doesn't answer on Wi-Fi: within about 10 metres, in setup mode, on another
+network. See [Using netmon over Bluetooth](docs/bluetooth.md).
+
 **Events** (`/events`) lists devices that appeared, went offline or came back.
 **Internet** (`/isp`) shows your public address and provider, plus the
 router's maker and the latency to it. **Settings** (`/settings`) covers Wi-Fi
@@ -77,7 +91,7 @@ intervals and firmware updates from the browser.
    - Board: **ESP32 Dev Module**
    - Partition Scheme: **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**.
      The default 1.2 MB app partition is too small now that Bluetooth is in.
-5. Upload. The image is about 1.5 MB, which is 76% of the app partition.
+5. Upload. The image is about 1.55 MB, which is 78% of the app partition.
 
 To do the same with arduino-cli:
 
@@ -88,6 +102,7 @@ arduino-cli upload  --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -p <port
 
 Coming from firmware 0.9.x or older? Flash over USB once, because 0.10.0
 changed the partition scheme. See the [changelog](CHANGELOG.md#0100-nearby).
+From 0.10 or 0.11, 0.12 goes over the air.
 
 ## First start
 
@@ -140,6 +155,13 @@ settings and learned hostnames survive an update.
   at most every six hours (or when you press *Check again*). This request
   reveals your public IP address to that service. Nothing else leaves your
   network.
+- Bluetooth: the API answers only phones paired with a 6-digit code, over an
+  encrypted link. The code is shown only on the Settings page or in the app
+  over Wi-Fi, so pairing needs someone on the board's network; a window lasts
+  two minutes and one attempt. Up to three phones stay paired, and a stranger
+  in range cannot push one out. Bluetooth can be switched off in Settings.
+- Saved reports stay in the board's flash until replaced or deleted. Anyone
+  who can reach the API, on the LAN or a paired phone, can read them.
 - Don't expose the board to the internet. To check on it from outside, use a
   VPN into your network.
 
@@ -168,6 +190,14 @@ on your network can use it too.
 | `GET`/`POST /api/nearby/config` | Turn Wi-Fi and Bluetooth scanning on or off, and set the background interval |
 | `GET`/`POST /api/nearby/find` | The Finder: start, keep alive, stop, read new signal readings |
 | `GET /api/map` | The board, its access points, the router, the subnet and the provider, for the Map page |
+| `GET`/`POST /api/ble` | The Bluetooth link: on or off, address, paired phones, the pairing window. `{"enabled":false}` switches it off |
+| `POST /api/ble/pair`, `POST /api/ble/forget` | Open a two-minute pairing window and get its code (`{"stop":true}` closes it); forget every paired phone |
+| `GET /api/reports`, `GET /api/reports/get?slot=N` | The saved reports, one per network; one of them, as the JSON document kept in flash |
+| `POST /api/reports/save`, `POST /api/reports/delete` | Save this network's report now; delete one (`{"slot":N}`) |
+| `POST /api/clock` | `{"unix":seconds}`: the time, for dating reports. The app and the pages send it when `/api/health` says `"clock":false` |
+
+Over Bluetooth every endpoint above answers the same, except the firmware
+upload. The framing is described in `firmware/netmon/src/core/ble_link.h`.
 
 The [changelog](CHANGELOG.md) describes each endpoint's fields in the release
 that added it.
@@ -186,6 +216,11 @@ that added it.
   which access point a device uses, or other devices' signal strength.
 - Distances worked out from signal strength are rough. The Finder's direction
   depends on your body blocking the signal, so it's a hint, not a bearing.
+- Bluetooth reaches around 10 metres indoors and is slower than Wi-Fi, so
+  over it the Nearby lists and saved reports take a moment longer. Firmware
+  updates go over Wi-Fi only.
+- Saved reports keep the latest state of each network, not a history, and
+  four networks at most.
 - Map groups are guesses from names and a small built-in list of makers.
 
 ## Tests
@@ -194,7 +229,7 @@ The hardware-independent logic lives in `firmware/netmon/src/core/` and is
 tested on a PC:
 
 ```sh
-cd firmware/test && make test        # 1331 checks, g++ or clang, C++17
+cd firmware/test && make test        # 1574 checks, g++ or clang, C++17
 ```
 
 The web pages are tested in headless Chromium against a simulated board. See

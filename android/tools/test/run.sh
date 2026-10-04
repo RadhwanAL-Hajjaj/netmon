@@ -49,7 +49,8 @@ fi
 JAVA_OPTS="${JAVA_OPTS:--Xmx1g}" "$KOTLINC" -jvm-target 17 -nowarn -classpath "$JSON" -d "$OUT/classes" \
     "$SRC/Models.kt" "$SRC/Parse.kt" "$SRC/NetmonClient.kt" "$SRC/Format.kt" "$SRC/Firmware.kt" \
     "$SRC/Validate.kt" "$SRC/Subnet.kt" "$SRC/EventHistory.kt" "$SRC/AlertRules.kt" "$SRC/LatencyLog.kt" \
-    "$SRC/Nearby.kt" "$SRC/Finder.kt" "$SRC/NetMap.kt" "$HERE/CoreTest.kt" 2>&1 | grep -v JAVA_TOOL_OPTIONS || true
+    "$SRC/Nearby.kt" "$SRC/Finder.kt" "$SRC/NetMap.kt" "$SRC/LinkCodec.kt" "$SRC/RoutePlan.kt" "$SRC/Reports.kt" \
+    "$HERE/CoreTest.kt" 2>&1 | grep -v JAVA_TOOL_OPTIONS || true
 
 BINS="$OUT/bins" MOCK="http://127.0.0.1:$PORT" PARITY="$OUT/parity.json" \
     java -cp "$OUT/classes:$JSON:$STDLIB" CoreTestKt 2>&1 | grep -v JAVA_TOOL_OPTIONS

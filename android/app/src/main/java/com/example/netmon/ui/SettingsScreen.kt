@@ -35,7 +35,11 @@ import com.example.netmon.WifiNetwork
 
 class SettingsScreen(host: MainActivity) : Screen(host) {
 
-    override val parts = listOf(Board.Part.HEALTH, Board.Part.CONFIG, Board.Part.NETWORKS, Board.Part.DHCP)
+    override val parts = listOf(Board.Part.HEALTH, Board.Part.CONFIG, Board.Part.NETWORKS, Board.Part.DHCP,
+        Board.Part.BLE, Board.Part.REPORTS)
+
+    private val linkCard = LinkCard(host)
+    private val reportsCard = ReportsCard(host)
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -113,6 +117,8 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         val col = c.column()
         col.add(buildBoardCard(), top = 8)
         col.add(buildWifiCard(), top = 16)
+        col.add(linkCard.build(), top = 16)
+        col.add(reportsCard.build(), top = 16)
         col.add(buildHistoryCard(), top = 16)
         col.add(buildDhcpCard(), top = 16)
         col.add(buildFirmwareCard(), top = 16)
@@ -608,6 +614,10 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
             fwKey.requestFocus()
             return
         }
+        if (Board.onBluetooth) {
+            say(fwMsg, "Firmware updates go over Wi-Fi. Join the monitor's Wi-Fi, then try again.", T.BAD)
+            return
+        }
         val base = Board.base ?: return
         val oldVersion = Board.health?.version ?: ""
         val remember = fwRemember.isChecked
@@ -742,7 +752,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         card.addKV("App", top = 10).set("netmon for Android ${BuildInfo.VERSION_NAME}")
         card.add(c.hint("Talks to the monitor's own web API; nothing leaves your network except the monitor's own " +
             "provider lookup. Network history needs firmware 0.9.4 or later, the DHCP listener status 0.9.6, " +
-            "Nearby 0.10, and the Finder and the network map 0.11."), top = 8)
+            "Nearby 0.10, the Finder and the network map 0.11, and Bluetooth and saved reports 0.12."), top = 8)
         return card
     }
 
@@ -773,5 +783,12 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         renderNetworks()
         renderDhcp()
         renderAlerts()
+        linkCard.render()
+        reportsCard.render()
+        fwRunning.text = when {
+            h == null -> "Firmware version not read yet."
+            Board.onBluetooth -> "Running ${h.version}. Updates go over Wi-Fi: join the monitor's Wi-Fi to install one."
+            else -> "Running ${h.version}."
+        }
     }
 }

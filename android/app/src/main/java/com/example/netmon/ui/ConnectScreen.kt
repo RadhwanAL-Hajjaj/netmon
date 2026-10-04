@@ -8,8 +8,16 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.app.AlertDialog
+import android.os.Handler
+import android.os.Looper
+import android.widget.FrameLayout
+import com.example.netmon.ApiException
+import com.example.netmon.AppState
+import com.example.netmon.BleLink
 import com.example.netmon.Board
 import com.example.netmon.Discovery
+import com.example.netmon.LinkCodec
 import com.example.netmon.MainActivity
 import com.example.netmon.NetRoute
 import com.example.netmon.NetmonClient
@@ -32,12 +40,23 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
     private var discovery: Discovery? = null
     private var foundCount = 0
 
+    // Over Bluetooth
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var pairedBox: LinearLayout
+    private lateinit var heardBox: LinearLayout
+    private lateinit var btStatus: TextView
+    private lateinit var btLook: TextView
+    private var scan: BleLink.Scan? = null
+    private val heard = LinkedHashMap<String, BleLink.Heard>()
+    private val stopScan = Runnable { endScan("") }
+
     override fun build(): View {
         val c = ctx
         val col = c.column()
         col.add(c.label("Find your monitor", 26f, T.TEXT, Fonts.light), top = 16)
-        col.add(c.label("This phone needs to be on the same Wi-Fi as the monitor. A monitor that could not join Wi-Fi " +
-            "opens its own network, netmon-setup; join that and it answers at 192.168.4.1.", 14f, T.TEXT2), top = 8)
+        col.add(c.label("On the monitor's Wi-Fi, the app finds it by itself. A monitor that could not join Wi-Fi opens " +
+            "its own network, netmon-setup, at 192.168.4.1. A phone paired with the monitor can also reach it over " +
+            "Bluetooth: see the end of this page.", 14f, T.TEXT2), top = 8)
 
         current = col.add(c.label("", 14f, T.TEXT2, numbers = true), top = 16)
         keep = col.add(c.button("Keep using it", Btn.SECONDARY) { host.closeConnect() }, WRAP, WRAP, top = 8)
@@ -65,7 +84,154 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
         connectBtn = manual.add(c.button("Connect", Btn.PRIMARY) { tryManual() }, MATCH, WRAP, top = 12)
         manualMsg = manual.add(c.label("", 14f, T.BAD), top = 8)
         manualMsg.visibility = View.GONE
+
+        val bt = col.add(c.card(), top = 20)
+        bt.add(c.cardTitle("Over Bluetooth"))
+        bt.add(c.hint("A phone paired with the monitor reaches it away from its Wi-Fi, within about 10 metres. " +
+            "Needs firmware 0.12 or later."), top = 6)
+        pairedBox = bt.add(c.column(), top = 6)
+        btLook = bt.add(c.button("Look for monitors over Bluetooth", Btn.SECONDARY) { startScan() }, MATCH, WRAP, top = 10)
+        btStatus = bt.add(c.label("", 13f, T.TEXT2), top = 8)
+        btStatus.visibility = View.GONE
+        heardBox = bt.add(c.column(), top = 4)
         return c.page(col)
+    }
+
+    // --- Bluetooth -------------------------------------------------------------------
+
+    /** The monitors this phone is paired with: the one the app knows, and any Android holds by the name netmon. */
+    private fun renderPaired() {
+        pairedBox.removeAllViews()
+        val c = ctx
+        val list = LinkedHashMap<String, String>()
+        AppState.prefs.boardBle?.let { list[LinkCodec.address(it)] = "netmon" }
+        for ((addr, name) in BleLink.pairedBoards(c)) list.putIfAbsent(addr, name)
+        list.entries.forEachIndexed { i, (addr, name) ->
+            if (i > 0) pairedBox.addDivider()
+            pairedBox.add(boardRow(name, "$addr · paired", "Use") { choose(LinkCodec.SCHEME + addr) })
+        }
+    }
+
+    private fun boardRow(title: String, detail: String, action: String, onTap: () -> Unit): View {
+        val c = ctx
+        val r = c.row()
+        r.setPadding(c.dp(4), c.dp(12), c.dp(4), c.dp(12))
+        r.background = c.pressable(null, c.dpf(12f))
+        r.isClickable = true
+        val col = c.column()
+        col.add(c.label(title, 17f, T.TEXT, Fonts.medium))
+        col.add(c.label(detail, 13f, T.TEXT2, numbers = true), top = 2)
+        r.add(col, 0, WRAP, weight = 1f)
+        r.add(c.label(action, 15f, T.ACCENT, Fonts.medium), WRAP, WRAP, start = 8)
+        r.setOnClickListener { onTap() }
+        return r
+    }
+
+    private fun startScan() {
+        host.askBluetooth(scan = true) {
+            if (!BleLink.switchedOn(ctx)) {
+                host.askBluetoothOn()
+                return@askBluetooth
+            }
+            endScan("")
+            heard.clear()
+            heardBox.removeAllViews()
+            val sc = BleLink.Scan(ctx) { h -> onHeard(h) }
+            val why = sc.start()
+            if (why != null) {
+                btStatus.text = why
+                btStatus.visibility = View.VISIBLE
+                return@askBluetooth
+            }
+            scan = sc
+            btLook.enabled(false)
+            btStatus.text = "Looking for monitors nearby"
+            btStatus.visibility = View.VISIBLE
+            main.postDelayed(stopScan, 20_000)
+            renderPaired()
+        }
+    }
+
+    private fun endScan(text: String) {
+        main.removeCallbacks(stopScan)
+        val sc = scan ?: return
+        scan = null
+        sc.stop()
+        if (!::btLook.isInitialized) return
+        btLook.enabled(true)
+        btStatus.text = text.ifEmpty {
+            if (heard.isEmpty()) "No monitor answered over Bluetooth. Check it is switched on, nearby, and has its Bluetooth link on."
+            else "Done looking."
+        }
+    }
+
+    private fun onHeard(h: BleLink.Heard) {
+        if (!::heardBox.isInitialized) return
+        heard[h.address] = h
+        heardBox.removeAllViews()
+        heard.values.forEachIndexed { i, x ->
+            if (i > 0) heardBox.addDivider()
+            val what = when {
+                x.paired -> "paired"
+                x.pairing -> "ready to pair"
+                else -> "not paired"
+            }
+            heardBox.add(boardRow(x.name, "${x.address} · $what · ${x.rssi} dBm", if (x.paired) "Use" else "Pair") {
+                if (x.paired) choose(LinkCodec.SCHEME + x.address) else pairWith(x)
+            })
+        }
+    }
+
+    /**
+     * Pairs with a monitor heard over Bluetooth. Its code is on its Settings
+     * page, open on some device on its Wi-Fi; Android asks for it.
+     */
+    private fun pairWith(h: BleLink.Heard) {
+        val c = ctx
+        if (!h.pairing) {
+            c.dialog("Open a pairing window first",
+                c.label("On any phone or computer on the monitor's Wi-Fi, open the monitor's Settings page and press " +
+                    "Pair a phone in the Bluetooth section. It shows a 6-digit code. Then tap Pair here, and type that " +
+                    "code when Android asks.", 15f, T.TEXT2),
+                "Pair now", { runPair(h) }, negative = "Close")
+            return
+        }
+        runPair(h)
+    }
+
+    private fun runPair(h: BleLink.Heard) {
+        endScan("Pairing with ${h.address}")
+        val c = ctx
+        val box = c.column()
+        box.add(c.label("When Android asks, type the 6-digit code the monitor's Settings page shows.", 15f, T.TEXT2))
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val d = AlertDialog.Builder(c)
+            .setTitle("Pairing")
+            .setView(FrameLayout(c).apply {
+                setPadding(c.dp(24), c.dp(8), c.dp(24), c.dp(4))
+                addView(box, FrameLayout.LayoutParams(MATCH, WRAP))
+            })
+            .setNegativeButton("Cancel") { _, _ -> cancelled.set(true) }
+            .setCancelable(false)
+            .create()
+        d.show()
+        Thread({
+            val result: Any = try {
+                BleLink.pair(h.address, 110_000) { cancelled.get() }
+            } catch (e: ApiException) {
+                e
+            }
+            main.post {
+                if (d.isShowing) d.dismiss()
+                when (result) {
+                    BleLink.Paired.YES -> choose(LinkCodec.SCHEME + h.address)
+                    BleLink.Paired.FAILED -> btStatus.text = "Pairing did not finish: a wrong code, no pairing window open, or it took too long."
+                    BleLink.Paired.CANCELLED -> btStatus.text = ""
+                    is ApiException -> btStatus.text = result.message ?: "Pairing did not work."
+                }
+                btStatus.visibility = if (btStatus.text.isEmpty()) View.GONE else View.VISIBLE
+            }
+        }, "netmon-pair").start()
     }
 
     override fun onShown() {
@@ -77,11 +243,13 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
             if (address.text.isEmpty()) address.setText(NetmonClient.display(base))
         }
         startSearch()
+        renderPaired()
     }
 
     override fun onHidden() {
         discovery?.stop()
         discovery = null
+        endScan("")
     }
 
     private fun startSearch() {
@@ -171,6 +339,7 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
     private fun choose(base: String) {
         discovery?.stop()
         discovery = null
+        endScan("")
         Board.connect(base)
         host.closeConnect()
     }

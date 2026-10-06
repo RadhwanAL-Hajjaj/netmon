@@ -8,13 +8,16 @@ two taps, an older board without reports, and the phone layout.
 """
 import asyncio, csv, io, json, sys, urllib.request
 from playwright.async_api import async_playwright
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import signin
 
 BASE = "http://127.0.0.1:8765"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "shots"
 
 
 def get(path):
-    return json.loads(urllib.request.urlopen(BASE + path).read())
+    return signin.api(path)
 
 
 def post(path):
@@ -28,7 +31,7 @@ async def main():
     errors, res = [], {}
     async with async_playwright() as p:
         b = await p.chromium.launch()
-        ctx = await b.new_context(viewport={"width": 1100, "height": 1000}, accept_downloads=True)
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 1000}, accept_downloads=True)
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror", str(e))))
         page.on("console", lambda m: m.type == "error" and errors.append(("console", m.text)))
@@ -88,7 +91,7 @@ async def main():
         await ctx.close()
 
         # A board from before 0.12.
-        ctx = await b.new_context(viewport={"width": 1100, "height": 900})
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 900})
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror old", str(e))))
         await page.route("**/api/reports", lambda r: r.fulfill(status=404, body="not found", content_type="text/plain"))
@@ -100,7 +103,7 @@ async def main():
 
         # Phone width.
         post("/__reports")
-        ctx = await b.new_context(viewport={"width": 360, "height": 780}, device_scale_factor=2,
+        ctx = await signin.context(b, viewport={"width": 360, "height": 780}, device_scale_factor=2,
                                   color_scheme="dark", is_mobile=True, has_touch=True)
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror phone", str(e))))

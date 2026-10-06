@@ -3,6 +3,82 @@
 Firmware releases, newest first. The Android app's notes are in
 [android/README.md](android/README.md).
 
+## 0.13.0-login
+
+Every page and API call now needs signing in, Bluetooth pairing works on the
+phones where it failed, the pairing code can be one of your own, and the
+board's Wi-Fi MAC address can be set. Use it with app 1.3.0: earlier apps
+cannot sign in.
+
+- **Signing in.** Every page and every `/api/` call needs a session, over
+  Wi-Fi and over Bluetooth alike (`src/core/auth.h`). Only the sign-in page,
+  signing in and out, and `GET /api/auth`, which says what the board is,
+  answer without one. The password is the update password from `secrets.h`
+  until you set a login password of your own on the Settings page; the update
+  password keeps working after that, as the way back in. A page opened
+  without a session goes to `/login` and comes back once you have signed in. A
+  session that ends while a page is open does the same at the page's next
+  request.
+- **Remember me.** Ticked, the session lasts 30 days and its cookie outlives
+  the browser. Unticked, it ends with the browser, or after 12 hours unused,
+  and a week at most. Sessions survive restarts and firmware updates. The
+  sign-in page names its fields so the browser's password manager can save the
+  password. In the app, *Save password* keeps it on the phone, encrypted, and
+  the app signs in again by itself when a session ends.
+- **How sessions are kept.** A session is a random 128-bit token: an
+  `HttpOnly`, `SameSite=Lax` cookie (`nm_s`) in a browser, an
+  `Authorization: Bearer` header from the app. The board keeps only each
+  token's SHA-256, eight sessions at most, in `/auth.json`. A login password
+  is kept as PBKDF2-HMAC-SHA256 with a random salt and 4096 rounds. Five wrong
+  passwords from one address (or one Bluetooth connection) are free; after
+  that each costs a wait, 30 seconds doubling up to 15 minutes. More than 30
+  wrong passwords in ten minutes, from anywhere, stop every sign-in for a
+  minute.
+- **Settings, Signing in.** Who is signed in, *Sign out*, *Sign out
+  everywhere*, and setting, changing or removing the login password. A new
+  password signs out every other browser and phone. The dashboard has a *Sign
+  out* link too.
+- **Bluetooth pairing fixed.** Pairing often failed after the code had been
+  typed. The board asked for pairing the moment a phone connected, while the
+  app asked Android to pair at the same time. On many phones the two requests
+  crossed and the link dropped part-way through. The board no longer asks
+  first: the phone pairs over the connection it opens, and a phone that is
+  already paired encrypts by itself with its first request. App 1.3.0 also
+  gives Android the code itself, so no prompt has to be found and typed into.
+- **Three tries per window, and why.** A pairing window now takes three
+  failed attempts before it closes, keeping its code; a dropped connection or
+  a timeout does not count as one. The board records how each attempt ended
+  (paired, wrong code, cancelled, timed out, connection dropped, refused,
+  paired without the code, too many attempts) with the Bluetooth stack's own
+  status number. The Settings page and `GET /api/ble` show it, and the serial
+  log says it. Nearby scans keep off the radio while a phone is pairing.
+- **Your own pairing code.** Settings → Bluetooth → *Pairing code* sets a
+  six-digit code of your own in place of a new random one for each window. It
+  still works only while a window is open, and changing it closes any window
+  open with the old code.
+- **MAC address.** Settings → Address → *MAC address on Wi-Fi* sets the
+  address the board uses on your network, or makes a random locally
+  administered one. It is taken at the restart after saving; *The chip's own*
+  goes back. The router sees a new device and may hand out a new IP address.
+  The Bluetooth address and the board's identity for the app (`mac` in
+  `/api/health`, `id` in `/api/auth`, both the chip's own) stay the same, so
+  paired phones stay paired.
+- **API.** New: `GET /api/auth`, `POST /api/login`, `POST /api/logout`,
+  `POST /api/auth/password`, `POST /api/auth/signout` and `POST /api/mac`.
+  `POST /api/ble` takes `{"own":"123456"}` (`""` for random codes) as well as
+  `enabled`. `GET /api/ble` gains `why`, `why_text`, `tries_left`, `last`,
+  `own_code` and `own`. `/api/health` gains `wifi_mac`, and `/api/config` a
+  `mac` object (`active`, `factory`, `custom`, `applied`). A request without a
+  session is answered `401` with `"login":true` in the body and, over Wi-Fi,
+  an `X-Netmon-Login: required` header. The firmware upload needs a session as
+  well as the update password.
+- **Upgrade.** From 0.10, 0.11 or 0.12 over the air; the partition scheme is
+  unchanged, and settings, networks, names, reports and paired phones are
+  kept. After the update, sign in with the update password, and update the
+  app to 1.3.0.
+- 1940 host checks, clean under AddressSanitizer and UBSan. Image: 1,596,439
+  bytes, 81% of the 1.9 MB app partition.
+
 ## 0.12.0-bluetooth
 
 The board's API now also answers over Bluetooth, to phones paired with a

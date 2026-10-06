@@ -1,20 +1,24 @@
 """The Settings page's Bluetooth section against the mock board: the link's
 state, opening and cancelling a pairing window, a phone pairing well and
-badly, switching the link off and on, forgetting the paired phones, an older
-board without the link, and the phone layout.
+badly (three tries a window, a dropped connection not counted, the reason
+shown), the owner's own pairing code, switching the link off and on,
+forgetting the paired phones, an older board without the link, and the
+phone layout.
 
   python mock_nearby.py ../../netmon/src/hw/pages.h 8765 &
   python check_bluetooth.py shots
 """
 import asyncio, json, re, sys, urllib.request
 from playwright.async_api import async_playwright
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import signin
 
 BASE = "http://127.0.0.1:8765"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "shots"
 
 
-def hook(path):
-    urllib.request.urlopen(urllib.request.Request(BASE + path, data=b"", method="POST")).read()
+hook = signin.hook
 
 
 async def main():
@@ -24,7 +28,7 @@ async def main():
     errors, res = [], {}
     async with async_playwright() as p:
         b = await p.chromium.launch()
-        ctx = await b.new_context(viewport={"width": 1100, "height": 1000})
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 1000})
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror", str(e))))
         page.on("console", lambda m: m.type == "error" and errors.append(("console", m.text)))
@@ -44,9 +48,7 @@ async def main():
         res["cancel_label"] = await page.inner_text("#btpair") == "Cancel pairing"
         await page.screenshot(path=f"{OUT}/settings-bluetooth-code.png", full_page=True)
         # Asking again keeps the same code.
-        again = json.loads(urllib.request.urlopen(urllib.request.Request(
-            BASE + "/api/ble/pair", data=b"{}", method="POST",
-            headers={"Content-Type": "application/json"})).read())
+        again = signin.api("/api/ble/pair", {})
         res["same_code"] = again["code"] == digits.replace(" ", "")
 
         # Cancel.
@@ -63,12 +65,66 @@ async def main():
         res["paired_count"] = "2 of 3" in await page.inner_text("#btinfo")
         res["code_gone_after_pairing"] = await page.is_hidden("#btcode")
 
-        # And one that gets the code wrong.
+        # A wrong code costs one of three tries; the window stays open with
+        # the same code, and the page says why.
         await page.click("#btpair")
         await page.wait_for_timeout(400)
-        hook("/__ble?paired=0")
+        code1 = await page.inner_text("#btdigits")
+        hook("/__ble?paired=0&why=wrong_code&status=1284")
         await page.wait_for_timeout(2600)
-        res["failed_msg"] = "Pairing failed" in await page.inner_text("#btmsg")
+        msg = await page.inner_text("#btmsg")
+        res["try_failed_msg"] = "did not pair" in msg and "The code did not match." in msg
+        res["window_still_open"] = not await page.is_hidden("#btcode") and \
+            await page.inner_text("#btdigits") == code1
+        res["tries_left_shown"] = "2 tries left" in await page.inner_text("#btsteps")
+        info = await page.inner_text("#btinfo")
+        res["last_attempt_row"] = "Last attempt" in info and "0x504" in info
+        # A dropped connection says nothing about the code: no try lost.
+        hook("/__ble?paired=0&why=dropped&status=531")
+        await page.wait_for_timeout(2600)
+        res["dropped_not_counted"] = "2 tries left" in await page.inner_text("#btsteps") and \
+            "connection dropped" in await page.inner_text("#btmsg")
+        hook("/__ble?paired=0&why=wrong_code")
+        hook("/__ble?paired=0&why=wrong_code")
+        await page.wait_for_timeout(2600)
+        msg = await page.inner_text("#btmsg")
+        res["closed_after_three"] = await page.is_hidden("#btcode") and "Pairing failed" in msg and \
+            "Three tries failed" in msg
+        await page.screenshot(path=f"{OUT}/settings-bluetooth-failed.png", full_page=True)
+
+        # The owner's own code: chosen, saved, and used by the next window.
+        res["code_box_shown"] = not await page.is_hidden("#btcodebox")
+        await page.select_option("#btmode", "own")
+        res["own_input_shown"] = not await page.is_hidden("#btownbox")
+        await page.fill("#btown", "48291")
+        await page.click("#btcodebtn")
+        await page.wait_for_timeout(300)
+        res["short_code_refused"] = "six digits" in await page.inner_text("#btcodemsg")
+        await page.fill("#btown", "482916")
+        await page.click("#btcodebtn")
+        await page.wait_for_timeout(500)
+        res["own_saved"] = "Saved." in await page.inner_text("#btcodemsg") and \
+            signin.api("/api/ble")["own"] == "482916"
+        res["own_row"] = "Your own" in await page.inner_text("#btinfo")
+        await page.click("#btpair")
+        await page.wait_for_timeout(500)
+        res["window_uses_own"] = await page.inner_text("#btdigits") == "482 916"
+        await page.click("#btpair")
+        await page.wait_for_timeout(300)
+        # The page keeps the choice over its polls.
+        await page.wait_for_timeout(2300)
+        res["own_kept_after_poll"] = await page.input_value("#btown") == "482916" and \
+            await page.input_value("#btmode") == "own"
+        await page.fill("#btown", "123456")
+        await page.click("#btcodebtn")
+        await page.wait_for_timeout(500)
+        res["weak_code_warned"] = "easy to guess" in await page.inner_text("#btcodemsg")
+        await page.select_option("#btmode", "random")
+        await page.click("#btcodebtn")
+        await page.wait_for_timeout(500)
+        res["back_to_random"] = signin.api("/api/ble")["own_code"] is False and \
+            "random" in await page.inner_text("#btcodemsg")
+        await page.screenshot(path=f"{OUT}/settings-bluetooth-own.png", full_page=True)
 
         # Off and on again.
         await page.click("#btonoff")
@@ -94,7 +150,7 @@ async def main():
         await ctx.close()
 
         # A board from before 0.12 has no /api/ble.
-        ctx = await b.new_context(viewport={"width": 1100, "height": 900})
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 900})
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror old", str(e))))
         await page.route("**/api/ble", lambda r: r.fulfill(status=404, body="not found",
@@ -106,7 +162,7 @@ async def main():
         await ctx.close()
 
         # Phone width, dark, with the code showing.
-        ctx = await b.new_context(viewport={"width": 360, "height": 780}, device_scale_factor=2,
+        ctx = await signin.context(b, viewport={"width": 360, "height": 780}, device_scale_factor=2,
                                   color_scheme="dark", is_mobile=True, has_touch=True)
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror phone", str(e))))

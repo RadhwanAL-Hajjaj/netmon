@@ -17,10 +17,20 @@
 
 // Pairing, as the stack sees it: the board can show a 6-digit code (on the
 // Settings page, or the app, over Wi-Fi) and cannot type one, so a phone
-// pairs by typing the code the board gives. The pairing is bonded (both ends
-// keep the keys, so it happens once per phone), protected against a man in
-// the middle by that code, and uses LE Secure Connections where the phone
+// pairs by entering the code the board gives. The pairing is bonded (both
+// ends keep the keys, so it happens once per phone), protected against a man
+// in the middle by that code, and uses LE Secure Connections where the phone
 // has them.
+//
+// The phone starts pairing, never the board. Until 0.13 the board sent every
+// phone a security request the moment it connected. Android answers one of
+// those from a phone it is not paired with by showing a "Pair with netmon?"
+// prompt of its own, often only as a notification, and the app asked Android
+// to pair at the same moment; the two collided and the link dropped part-way
+// through, after the person had typed the code. Now a phone that is paired
+// encrypts the link by itself the first time it writes a request (Android
+// does that unasked when the board says the request needs it), and a phone
+// that is not pairs only when the app asks it to.
 //
 // The request characteristic takes writes only over a link encrypted with
 // keys from such a pairing (WRITE_AUTHEN): a phone that has not paired, or
@@ -64,25 +74,46 @@ struct Frame {
     uint8_t data[kFrameMax];
 };
 
-// What else the Bluetooth task tells loop(): a connection's encryption
-// settled (a pairing finished, or a paired phone came back), or it went.
-enum class NoteKind : uint8_t { Auth, Gone };
+// What else the Bluetooth task tells loop(): a phone connected, the stack
+// asked for the code a connection is pairing with, a connection's encryption
+// settled (a pairing finished, well or badly, or a paired phone came back),
+// or it went. `status` is the stack's own number for how it ended.
+enum class NoteKind : uint8_t { Connected, Passkey, Enc, Gone };
 
 struct Note {
     NoteKind kind;
     uint16_t conn;
-    bool ok;
+    int32_t status;
+    bool encrypted;
+    bool authenticated;
+    bool in_window;      // Passkey: the code given was the window's
 };
 
 QueueHandle_t g_frames = nullptr;
 QueueHandle_t g_notes = nullptr;
 std::atomic<uint32_t> g_frames_dropped{0};
+std::atomic<uint32_t> g_notes_dropped{0};
 
 // The pairing window, read by the Bluetooth task when a phone asks to pair.
 portMUX_TYPE g_pair_mux = portMUX_INITIALIZER_UNLOCKED;
 PairWindow g_window{};
-std::atomic<bool> g_attempt{false};          // a phone is pairing now
-std::atomic<bool> g_attempt_in_window{false};
+std::atomic<int32_t> g_fixed_code{-1};       // the owner's own code, or -1
+
+// How the last attempt went, in or out of a window, for the pages and the
+// serial log: the window keeps only what happened inside it.
+struct LastAttempt {
+    bool any;
+    uint8_t why;           // PairWhy
+    int32_t status;
+    bool in_window;
+    uint32_t at_ms;
+};
+LastAttempt g_last{};
+
+void note(const Note& n) {
+    if (g_notes == nullptr) return;
+    if (xQueueSend(g_notes, &n, 0) != pdTRUE) g_notes_dropped++;
+}
 
 struct Answer {
     bool active = false;      // handed out, not yet fully sent
@@ -106,6 +137,8 @@ struct Conn {
     bool drop_after = false;  // disconnect once the answer has gone
     bool waiting = false;     // rx holds a request not handed out yet
     uint16_t waiting_status = 0;
+    bool attempt = false;     // pairing: the stack has asked for its code
+    bool attempt_in_window = false;
     LinkAssembler<kLinkRequestMax> rx;
     Answer tx;
 };
@@ -148,6 +181,8 @@ void conn_clear(Conn& c) {
     c.drop_after = false;
     c.waiting = false;
     c.waiting_status = 0;
+    c.attempt = false;
+    c.attempt_in_window = false;
     c.rx.reset();
     answer_clear(c.tx);
 }
@@ -217,40 +252,57 @@ void advertise(bool on) {
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
-        // Asked for encryption at once. A paired phone encrypts with the keys
-        // it kept, before its first request; anyone else is asked to pair,
-        // which fails without the code.
-        NimBLEDevice::startSecurity(info.getConnHandle());
+        // No security request: see the top of this file. The phone decides
+        // when to encrypt or pair.
         s->setDataLen(info.getConnHandle(), 251);
+        note(Note{NoteKind::Connected, info.getConnHandle(), 0, false, false, false});
         // Room for another phone: keep advertising.
         if (g_on && s->getConnectedCount() < kMaxConns) NimBLEDevice::startAdvertising();
     }
 
-    void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int) override {
-        // loop() also checks the stack's own list (poll_conns()), in case
-        // this note is lost to a full queue.
-        Note n{NoteKind::Gone, info.getConnHandle(), false};
-        if (g_notes != nullptr) xQueueSend(g_notes, &n, 0);
-    }
-
-    // The stack wants the code a pairing phone has to type: the window's,
-    // or one nobody was shown.
+    // The stack wants the code a pairing phone has to enter: the window's,
+    // or one nobody was shown. It does not say which connection is pairing,
+    // so every connection not yet encrypted is marked: there is hardly ever
+    // more than one, and a phone that is paired encrypts within a second.
     uint32_t onPassKeyDisplay() override {
         portENTER_CRITICAL(&g_pair_mux);
         const uint32_t now = millis();
         const bool live = pair_live(g_window, now);
         const uint32_t code = pair_passkey(g_window, now, esp_random());
         portEXIT_CRITICAL(&g_pair_mux);
-        g_attempt_in_window = live;
-        g_attempt = true;
+        if (g_srv != nullptr) {
+            for (uint16_t h : g_srv->getPeerDevices()) {
+                ble_gap_conn_desc d;
+                if (ble_gap_conn_find(h, &d) == 0 && !d.sec_state.encrypted) {
+                    note(Note{NoteKind::Passkey, h, 0, false, false, live});
+                }
+            }
+        }
         return code;
     }
-
-    void onAuthenticationComplete(NimBLEConnInfo& info) override {
-        Note n{NoteKind::Auth, info.getConnHandle(), info.isEncrypted() && info.isAuthenticated()};
-        if (g_notes != nullptr) xQueueSend(g_notes, &n, 0);
-    }
 };
+
+// Every GAP event, before the server's own handling: the end of each
+// encryption or pairing attempt, with the stack's status saying how it went
+// (the server's own callback leaves that out), and every disconnection. It
+// also sees every advertisement the Nearby scans hear, so it only ever looks
+// at the type.
+int gap_listener(ble_gap_event* e, void*) {
+    if (e->type == BLE_GAP_EVENT_ENC_CHANGE) {
+        Note n{NoteKind::Enc, e->enc_change.conn_handle, e->enc_change.status, false, false, false};
+        ble_gap_conn_desc d;
+        if (ble_gap_conn_find(n.conn, &d) == 0) {
+            n.encrypted = d.sec_state.encrypted;
+            n.authenticated = d.sec_state.authenticated;
+        }
+        note(n);
+    } else if (e->type == BLE_GAP_EVENT_DISCONNECT) {
+        // loop() also checks the stack's own list (poll_conns()), in case
+        // this note is lost to a full queue.
+        note(Note{NoteKind::Gone, e->disconnect.conn.conn_handle, e->disconnect.reason, false, false, false});
+    }
+    return 0;
+}
 
 class RequestCallbacks : public NimBLECharacteristicCallbacks {
     // Runs in the Bluetooth task: copies the frame for loop() and returns.
@@ -342,42 +394,87 @@ void take_frames() {
     }
 }
 
-// Connections gone, and the outcomes of pairing attempts and of encryption
-// with kept keys.
+// A pairing attempt on `c` has ended: the window learns of it if it was in
+// one, and the log and the pages say how it went.
+void attempt_over(Conn& c, PairWhy why, int32_t status) {
+    const bool ok = why == PairWhy::Paired;
+    const bool in_window = c.attempt_in_window;
+    c.attempt = false;
+    c.attempt_in_window = false;
+    g_last.any = true;
+    g_last.why = static_cast<uint8_t>(why);
+    g_last.status = status;
+    g_last.in_window = in_window;
+    g_last.at_ms = millis();
+    Serial.print(ok ? F("[link] pairing succeeded") : F("[link] pairing failed: "));
+    if (!ok) {
+        Serial.print(pair_why_text(static_cast<uint8_t>(why)));
+        Serial.print(F(" (status 0x"));
+        Serial.print(static_cast<unsigned>(status), HEX);
+        Serial.print(')');
+    }
+    Serial.println(in_window ? F("") : F(" [no pairing window open]"));
+    if (!in_window) return;     // somebody else's attempt, outside a window
+    portENTER_CRITICAL(&g_pair_mux);
+    pair_done(g_window, millis(), ok, why);
+    portEXIT_CRITICAL(&g_pair_mux);
+}
+
+// Phones arriving and going, the stack asking for a code, and the outcomes
+// of pairing attempts and of encryption with kept keys.
 void take_notes() {
     if (g_notes == nullptr) return;
     Note n;
     while (xQueueReceive(g_notes, &n, 0) == pdTRUE) {
         Conn* c = conn_find(n.conn);
-        if (n.kind == NoteKind::Gone) {
-            if (c != nullptr) conn_clear(*c);
-            if (g_attempt.exchange(false)) {
-                // Gone in the middle of pairing: the window stays open for
-                // another try with the same code.
-                g_attempt_in_window = false;
+        switch (n.kind) {
+            case NoteKind::Connected:
+                if (c == nullptr) c = conn_add(n.conn);
+                break;
+            case NoteKind::Passkey:
+                if (c == nullptr) {
+                    poll_conns();
+                    c = conn_find(n.conn);
+                }
+                if (c != nullptr) {
+                    c->attempt = true;
+                    c->attempt_in_window = n.in_window;
+                    Serial.println(n.in_window ? F("[link] a phone is pairing")
+                                               : F("[link] a phone is pairing with no window open"));
+                }
+                break;
+            case NoteKind::Enc: {
+                if (c == nullptr) break;
+                c->secure = n.status == 0 && n.encrypted && n.authenticated;
+                const PairWhy why = pair_why_of(n.status, n.encrypted, n.authenticated);
+                if (why == PairWhy::NoCode) {
+                    // Encrypted without the code: a pairing that skipped it
+                    // ("just works"). Its keys are no use here and must not
+                    // take a place among the three, so they go, and so does
+                    // the connection.
+                    NimBLEConnInfo info = g_srv->getPeerInfoByHandle(n.conn);
+                    if (info.isBonded()) NimBLEDevice::deleteBond(info.getIdAddress());
+                    Serial.println(F("[link] refused a pairing made without the code"));
+                    disconnect(*c);
+                }
+                if (c->attempt) {
+                    attempt_over(*c, why, n.status);
+                } else if (n.status != 0) {
+                    // Kept keys that did not work out.
+                    Serial.print(F("[link] encryption failed, status 0x"));
+                    Serial.println(static_cast<unsigned>(n.status), HEX);
+                }
+                break;
             }
-            continue;
+            case NoteKind::Gone:
+                if (c != nullptr) {
+                    // Gone in the middle of pairing: the window stays open
+                    // for another try with the same code.
+                    if (c->attempt) attempt_over(*c, PairWhy::Dropped, n.status);
+                    conn_clear(*c);
+                }
+                break;
         }
-        if (c != nullptr) c->secure = n.ok;
-        if (!n.ok && c != nullptr) {
-            // Encrypted without the code: a pairing that skipped it ("just
-            // works"). Its keys are no use here and must not take a place
-            // among the three, so they go, and so does the connection.
-            NimBLEConnInfo info = g_srv->getPeerInfoByHandle(n.conn);
-            if (info.isEncrypted() && !info.isAuthenticated()) {
-                if (info.isBonded()) NimBLEDevice::deleteBond(info.getIdAddress());
-                Serial.println(F("[link] refused a pairing made without the code"));
-                disconnect(*c);
-            }
-        }
-        if (!g_attempt.exchange(false)) continue;    // kept keys, not a pairing
-        const bool in_window = g_attempt_in_window.exchange(false);
-        Serial.print(F("[link] pairing "));
-        Serial.println(n.ok ? F("succeeded") : F("failed"));
-        if (!in_window) continue;   // somebody else's attempt, outside a window
-        portENTER_CRITICAL(&g_pair_mux);
-        pair_done(g_window, millis(), n.ok);
-        portEXIT_CRITICAL(&g_pair_mux);
     }
 }
 
@@ -449,6 +546,15 @@ bool ble_link_begin(bool on) {
     NimBLEDevice::setDeviceCallbacks(&g_store_cb);
     NimBLEDevice::setSecurityAuth(true, true, true);       // bond, MITM, Secure Connections
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+    // Both ends hand over their identity keys, so a paired phone is known
+    // again after it changes its private address, every quarter of an hour
+    // or so. NimBLE already asks for them on this chip; said here so it
+    // does not depend on that.
+    NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    if (!NimBLEDevice::setCustomGapHandler(gap_listener)) {
+        Serial.println(F("[link] could not listen for pairing results"));
+    }
 
     g_srv = NimBLEDevice::createServer();
     g_srv->setCallbacks(&g_server_cb, false);
@@ -617,9 +723,10 @@ void ble_link_tick() {
 
 void ble_link_pair(bool open) {
     if (!g_ready) return;
+    const uint32_t r = esp_random();
     portENTER_CRITICAL(&g_pair_mux);
     if (open) {
-        pair_open(g_window, millis(), esp_random());
+        pair_open(g_window, millis(), r, g_fixed_code.load());
     } else {
         pair_close(g_window);
     }
@@ -627,21 +734,51 @@ void ble_link_pair(bool open) {
     update_advert();
 }
 
-bool ble_link_pairing(char code[7], uint32_t& left_ms, const char*& result, uint32_t& result_age_s) {
+void ble_link_set_code(int32_t fixed) {
+    const int32_t was = g_fixed_code.exchange(fixed >= 0 && fixed <= 999999 ? fixed : -1);
+    if (was == g_fixed_code.load()) return;
+    // A window open with the old code would show one thing and take another.
+    portENTER_CRITICAL(&g_pair_mux);
+    pair_close(g_window);
+    portEXIT_CRITICAL(&g_pair_mux);
+    if (g_ready) update_advert();
+}
+
+bool ble_link_pairing(LinkPairing& out) {
     portENTER_CRITICAL(&g_pair_mux);
     const uint32_t now = millis();
     const PairWindow w = g_window;
     portEXIT_CRITICAL(&g_pair_mux);
     const bool live = pair_live(w, now);
-    left_ms = pair_left_ms(w, now);
+    out.left_ms = pair_left_ms(w, now);
     if (live) {
-        pair_code_text(w.code, code);
+        pair_code_text(w.code, out.code);
     } else {
-        code[0] = '\0';
+        out.code[0] = '\0';
     }
-    result = pair_result_text(w.result);
-    result_age_s = w.result != 0 ? (now - w.result_ms) / 1000 : 0;
+    out.result = pair_result_text(w.result);
+    out.why = pair_why_key(w.why);
+    out.why_text = pair_why_text(w.why);
+    out.result_age_s = w.result != 0 ? (now - w.result_ms) / 1000 : 0;
+    out.tries_left = live ? pair_tries_left(w) : 0;
+    out.last_why = g_last.any ? pair_why_key(g_last.why) : "";
+    out.last_text = g_last.any ? pair_why_text(g_last.why) : "";
+    out.last_status = g_last.any ? g_last.status : 0;
+    out.last_in_window = g_last.any && g_last.in_window;
+    out.last_age_s = g_last.any ? (now - g_last.at_ms) / 1000 : 0;
     return live;
+}
+
+bool ble_link_pairing_now() {
+    if (!g_ready) return false;
+    portENTER_CRITICAL(&g_pair_mux);
+    const bool live = pair_live(g_window, millis());
+    portEXIT_CRITICAL(&g_pair_mux);
+    if (!live) return false;
+    for (const auto& c : g_conns) {
+        if (c.used && !c.secure) return true;
+    }
+    return false;
 }
 
 bool ble_link_forget_all() {

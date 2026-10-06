@@ -7,6 +7,9 @@
 // draws the local network. From 0.12.0 the API also answers over Bluetooth,
 // to phones paired with a 6-digit code (src/core/ble_link.h), and the board
 // keeps a saved report of each network it has been on (src/core/report.h).
+// From 0.13.0 everything needs signing in (src/core/auth.h), the owner can set
+// the pairing code and the board's Wi-Fi MAC address, and pairing is started
+// by the phone alone, which is what made it fail before.
 //
 // Board:     ESP32 Dev Module
 // Partition: Minimal SPIFFS (1.9MB APP with OTA)
@@ -35,6 +38,7 @@
 #include "src/core/air_find.h"
 #include "src/core/air_plan.h"
 #include "src/core/air_wifi.h"
+#include "src/core/auth.h"
 #include "src/core/ble_link.h"
 #include "src/core/ble_type.h"
 #include "src/core/ble_vendor.h"
@@ -53,6 +57,7 @@
 #include "src/core/validate.h"
 #include "src/hw/air_scan.h"
 #include "src/hw/arp_scan.h"
+#include "src/hw/auth_store.h"
 #include "src/hw/ble_link.h"
 #include "src/hw/config_store.h"
 #include "src/hw/dhcp_capture.h"
@@ -77,7 +82,7 @@ static_assert(sizeof(NETMON_UPDATE_PASSWORD) > 8,
 static_assert(!same_text(NETMON_UPDATE_PASSWORD, "change-me"),
               "netmon: choose your own NETMON_UPDATE_PASSWORD in secrets.h");
 
-static const char* kFirmwareVersion = "0.12.0-bluetooth";
+static const char* kFirmwareVersion = "0.13.0-login";
 static const char* kOtaHostname = "netmon";
 static const char* kOtaPassword = NETMON_UPDATE_PASSWORD;
 
@@ -118,11 +123,12 @@ static String api_body() {
     return g_server.arg("plain");
 }
 
-// Only Origin, Host and X-Netmon-Key are ever asked for. Nothing on the link
-// has an Origin or a Host: no web page sends over it.
+// Only Origin, Host, X-Netmon-Key and Authorization are ever asked for.
+// Nothing on the link has an Origin or a Host: no web page sends over it.
 static String api_header(const char* name) {
     if (g_via == Via::Link) {
         if (strcasecmp(name, "X-Netmon-Key") == 0) return String(g_link_req->req.key);
+        if (strcasecmp(name, "Authorization") == 0) return String(g_link_req->req.auth);
         return String();
     }
     return g_server.header(name);
@@ -158,6 +164,142 @@ static void api_piece(const String& part) {
 
 static void api_end_pieces() {
     if (g_via == Via::Http) g_server.sendContent("");    // the terminating empty chunk
+}
+
+// --- Signing in (0.13) ------------------------------------------------------------
+//
+// Every page and API call needs a session; see src/core/auth.h. The browser
+// carries it in a cookie, the app as "Authorization: Bearer <token>", over
+// Wi-Fi and over the Bluetooth link alike.
+static AuthState g_auth;
+static LoginThrottle<8> g_throttle;
+static int g_session = -1;                 // the session of the request being served
+static const char* kCookie = "nm_s";
+static uint32_t g_auth_purged_ms = 0;
+
+static uint32_t now_s();
+static uint32_t clock_unix();
+
+// Where a request comes from, for counting wrong passwords: its IPv4
+// address, or the Bluetooth connection it came in on.
+static uint32_t api_client() {
+    if (g_via == Via::Link) return 0xB1E00000u | g_link_req->conn;
+    return static_cast<uint32_t>(g_server.client().remoteIP());
+}
+
+// The session the request carries, or -1. A session used now counts as used.
+static int session_of_request() {
+    char tok[kTokenHex + 8];
+    bool have = false;
+    const String a = api_header("Authorization");
+    if (a.length() > 0) have = bearer_value(a.c_str(), tok, sizeof(tok));
+    if (!have && g_via == Via::Http) {
+        const String c = g_server.header("Cookie");
+        have = c.length() > 0 && cookie_value(c.c_str(), kCookie, tok, sizeof(tok));
+    }
+    if (!have || !token_well_formed(tok)) return -1;
+    uint8_t h[32];
+    token_hash(tok, h);
+    const int i = g_auth.sessions.find(h, now_s(), clock_unix());
+    if (i >= 0) g_auth.sessions.touch(i, now_s());
+    return i;
+}
+
+// 401 with a mark the pages and the app tell apart from a wrong update
+// password: X-Netmon-Login over Wi-Fi, "login" in the body either way (the
+// link carries no headers back).
+static void send_login_required() {
+    if (g_via == Via::Http) {
+        g_server.sendHeader("X-Netmon-Login", "required");
+        g_server.sendHeader("Cache-Control", "no-store");
+    }
+    api_send(401, "application/json",
+             F("{\"error\":\"Sign in to the monitor first.\",\"login\":true,\"netmon\":true}"));
+}
+
+static bool require_session() {
+    g_session = session_of_request();
+    if (g_session >= 0) return true;
+    send_login_required();
+    return false;
+}
+
+static void auth_store() {
+    if (!auth_save(g_auth)) Serial.println(F("[auth] could not write /auth.json"));
+}
+
+// The clock has just been learned: sessions made without it get dated.
+static void clock_learned() {
+    if (g_auth.sessions.date_undated(now_s(), clock_unix())) auth_store();
+}
+
+// Forgotten sessions out of the file now and then: they would be refused
+// anyway, but the file is the list of who may come back.
+static void auth_tick() {
+    if (millis() - g_auth_purged_ms < 3600000UL) return;
+    g_auth_purged_ms = millis();
+    if (g_auth.sessions.purge(now_s(), clock_unix())) auth_store();
+}
+
+static void set_session_cookie(const char* token, bool remember) {
+    String c = kCookie;
+    c += '=';
+    c += token;
+    c += F("; Path=/; HttpOnly; SameSite=Lax");
+    if (remember) {
+        c += F("; Max-Age=");
+        c += String(kSessionLongS);
+    }
+    g_server.sendHeader("Set-Cookie", c);
+}
+
+static void clear_session_cookie() {
+    String c = kCookie;
+    c += F("=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    g_server.sendHeader("Set-Cookie", c);
+}
+
+// Pages need a session as the API does; without one the browser goes to the
+// sign-in page, which comes back here afterwards.
+static void append_url_encoded(String& out, const String& s) {
+    static const char* hex = "0123456789ABCDEF";
+    for (size_t i = 0; i < s.length(); ++i) {
+        const char c = s[i];
+        if (isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            out += c;
+        } else {
+            out += '%';
+            out += hex[(static_cast<uint8_t>(c) >> 4) & 15];
+            out += hex[static_cast<uint8_t>(c) & 15];
+        }
+    }
+}
+
+static bool page_gate() {
+    g_via = Via::Http;
+    if (session_of_request() >= 0) return true;
+    String here = g_server.uri();
+    if (g_server.args() > 0) {
+        here += '?';
+        for (int i = 0; i < g_server.args(); ++i) {
+            if (i) here += '&';
+            here += g_server.argName(i);
+            here += '=';
+            here += g_server.arg(i);
+        }
+    }
+    String to = F("/login?next=");
+    append_url_encoded(to, here);
+    g_server.sendHeader("Location", to, true);
+    g_server.sendHeader("Cache-Control", "no-store");
+    g_server.send(302, "text/plain", "");
+    return false;
+}
+
+static void send_page(const char* html) {
+    if (!page_gate()) return;
+    g_server.sendHeader("Cache-Control", "no-store");
+    g_server.send_P(200, "text/html", html);
 }
 
 // Before a deliberate restart: lets the answer reach whoever asked.
@@ -494,9 +636,16 @@ static void handle_health() {
     body += String(g_names.size());
     // From 0.12: who this board is, so a phone that reaches it both over
     // Wi-Fi and over Bluetooth knows the two are one board, and whether the
-    // Bluetooth link is on.
+    // Bluetooth link is on. From 0.13 that is the chip's own Wi-Fi address
+    // whatever address the owner has set, so the board stays the same board;
+    // "wifi_mac" is the address it goes by on the network now.
+    char id[18], active[18];
+    mac_format(wifi_factory_mac(), id);
+    mac_format(wifi_mac(), active);
     body += F(",\"mac\":\"");
-    body += WiFi.macAddress();
+    body += id;
+    body += F("\",\"wifi_mac\":\"");
+    body += active;
     body += F("\",\"ble_link\":");
     body += (ble_link_enabled() ? F("true") : F("false"));
     // Whether the board knows the time, from 0.12. The app and the pages
@@ -509,6 +658,7 @@ static void handle_health() {
 }
 
 static void handle_root() {
+    if (!page_gate()) return;
     String body;
     body.reserve(256);
     body += F("<!doctype html><meta name=viewport content='width=device-width,"
@@ -522,9 +672,7 @@ static void handle_root() {
     g_server.send(200, "text/html", body);
 }
 
-static void handle_settings_page() {
-    g_server.send_P(200, "text/html", SETTINGS_HTML);
-}
+static void handle_settings_page() { send_page(SETTINGS_HTML); }
 
 // The Settings page's list of networks to join: those heard in the latest
 // scan, one row per name at its strongest, hidden ones left out, strongest
@@ -1064,7 +1212,10 @@ static void air_tick() {
     in.now_ms = millis();
     in.last_watch_ms = g_air_watch_ms;
     in.on_lan = wifi_state() == WifiState::Connected;
-    in.radio_busy = sweep_running();
+    // A phone pairing has the radio too: a Wi-Fi scan taking the radio off
+    // channel for a second and a half, or a Bluetooth burst, is no help
+    // while the two sides trade the twenty rounds of a code.
+    in.radio_busy = sweep_running() || ble_link_pairing_now();
     in.netmon_due = (sweep_due() || probe_due()) && !find_holding();
     in.background_s = g_settings.air_background_s;
     in.wifi = g_air_wifi;
@@ -1381,9 +1532,7 @@ static void handle_nearby_config_post() {
     send_air_config();
 }
 
-static void handle_nearby_page() {
-    g_server.send_P(200, "text/html", NEARBY_HTML);
-}
+static void handle_nearby_page() { send_page(NEARBY_HTML); }
 
 // --- Finder ----------------------------------------------------------------
 
@@ -1878,7 +2027,27 @@ static void handle_config_get() {
     body += (wifi_state() == WifiState::SoftAP ? F("softap")
              : g_settings.use_dhcp                ? F("dhcp")
                                                   : F("static"));
-    body += F("\"}}");
+    body += F("\"}");
+    // From 0.13: the board's Wi-Fi address. "custom" is the one the owner
+    // set ("" for none), "applied" whether it is the one in use now: a new
+    // one waits for a restart.
+    char factory[18], custom[18] = "", inuse[18];
+    mac_format(wifi_factory_mac(), factory);
+    mac_format(wifi_mac(), inuse);
+    if (g_settings.wifi_mac_set) {
+        Mac m{};
+        std::memcpy(m.b, g_settings.wifi_mac, sizeof(m.b));
+        mac_format(m, custom);
+    }
+    body += F(",\"mac\":{\"active\":\"");
+    body += inuse;
+    body += F("\",\"factory\":\"");
+    body += factory;
+    body += F("\",\"custom\":\"");
+    body += custom;
+    body += F("\",\"applied\":");
+    body += (wifi_custom_mac_applied() && g_settings.wifi_mac_set ? F("true") : F("false"));
+    body += F("}}");
     api_send(200, "application/json", body);
 }
 
@@ -1956,6 +2125,7 @@ static void handle_isp() {
         if (isp_fetch(g_isp)) g_isp_ok_s = now;
         if (g_isp.date_unix != 0 && clock_set(g_clock, g_isp.date_unix, now_s(), ClockSource::Internet)) {
             Serial.println(F("[clock] set from the provider lookup"));
+            clock_learned();
         }
     }
 
@@ -2013,13 +2183,9 @@ static void handle_isp() {
     api_send(200, "application/json", body);
 }
 
-static void handle_isp_page() {
-    g_server.send_P(200, "text/html", ISP_HTML);
-}
+static void handle_isp_page() { send_page(ISP_HTML); }
 
-static void handle_dashboard() {
-    g_server.send_P(200, "text/html", DASHBOARD_HTML);
-}
+static void handle_dashboard() { send_page(DASHBOARD_HTML); }
 
 // Per-upload state. It is reset when an upload starts and again after every
 // answer, so a request is only ever judged on its own upload. Before, a POST
@@ -2032,7 +2198,7 @@ static char g_http_update_error[64] = "";
 
 static bool update_key_ok() {
     const String key = api_header("X-Netmon-Key");
-    return key.length() > 0 && key == kOtaPassword;
+    return key.length() > 0 && same_text_ct(key.c_str(), kOtaPassword);
 }
 
 static void update_fail(const char* why) {
@@ -2062,6 +2228,12 @@ static void handle_update_upload() {
 
     if (upload.status == UPLOAD_FILE_START) {
         update_reset();
+        g_via = Via::Http;
+        if (session_of_request() < 0) {
+            Serial.println(F("[ota] HTTP update rejected: not signed in"));
+            update_fail("not signed in");
+            return;
+        }
         if (!update_key_ok()) {
             Serial.println(F("[ota] HTTP update rejected: bad key"));
             update_fail("invalid update key");
@@ -2115,6 +2287,12 @@ static void handle_update_upload() {
 }
 
 static void handle_update_result() {
+    g_via = Via::Http;
+    if (session_of_request() < 0) {
+        update_reset();
+        send_login_required();
+        return;
+    }
     if (!update_key_ok()) {
         update_reset();
         g_server.send(401, "application/json",
@@ -2161,11 +2339,8 @@ static void handle_update_check() {
 // while one is open. Over Wi-Fi the code is only ever shown to somebody on
 // the board's own network, which is the point of it.
 static void send_ble_status() {
-    char code[7];
-    uint32_t left_ms = 0;
-    uint32_t result_age_s = 0;
-    const char* result = "";
-    const bool pairing = ble_link_pairing(code, left_ms, result, result_age_s);
+    LinkPairing p{};
+    const bool pairing = ble_link_pairing(p);
     JsonDocument doc;
     doc["link"] = kLinkVersion;
     doc["available"] = ble_link_ready();
@@ -2178,10 +2353,36 @@ static void send_ble_status() {
     doc["connected"] = ble_link_connected();
     doc["secure"] = ble_link_secure();
     doc["pairing"] = pairing;
-    doc["code"] = code;
-    doc["left_s"] = (left_ms + 999) / 1000;
-    doc["result"] = result;
-    doc["result_age_s"] = result_age_s;
+    doc["code"] = p.code;
+    doc["left_s"] = (p.left_ms + 999) / 1000;
+    doc["result"] = p.result;
+    doc["result_age_s"] = p.result_age_s;
+    // From 0.13: why the last attempt in a window went as it did, how many
+    // more failures the open window takes, and the last attempt of all, in a
+    // window or not, with the stack's own number for it.
+    doc["why"] = p.why;
+    doc["why_text"] = p.why_text;
+    doc["tries_left"] = p.tries_left;
+    if (p.last_why[0] != '\0') {
+        JsonObject last = doc["last"].to<JsonObject>();
+        last["why"] = p.last_why;
+        last["text"] = p.last_text;
+        last["status"] = p.last_status;
+        last["in_window"] = p.last_in_window;
+        last["age_s"] = p.last_age_s;
+    } else {
+        doc["last"] = nullptr;
+    }
+    // The owner's own pairing code, when there is one (0.13). Only ever sent
+    // to somebody signed in, like everything else here.
+    doc["own_code"] = g_settings.ble_pin >= 0;
+    if (g_settings.ble_pin >= 0) {
+        char c[7];
+        pair_code_text(static_cast<uint32_t>(g_settings.ble_pin), c);
+        doc["own"] = c;
+    } else {
+        doc["own"] = "";
+    }
     doc["served"] = ble_link_served();
     doc["via"] = g_via == Via::Link ? "bluetooth" : "wifi";
     String body;
@@ -2191,8 +2392,30 @@ static void send_ble_status() {
 
 static void handle_ble_get() { send_ble_status(); }
 
-// {"enabled":true|false}: the link on or off, kept across restarts. Off, the
-// board stops advertising and lets every phone go; paired phones stay paired.
+// Six digits, as a string so leading zeros survive, or "" for random codes.
+static bool parse_pin(JsonVariantConst v, int32_t& out) {
+    if (v.isNull()) return false;
+    const char* t = v.is<const char*>() ? v.as<const char*>() : nullptr;
+    if (t == nullptr) return false;
+    if (t[0] == '\0') {
+        out = -1;
+        return true;
+    }
+    if (std::strlen(t) != 6) return false;
+    int32_t n = 0;
+    for (int i = 0; i < 6; ++i) {
+        if (t[i] < '0' || t[i] > '9') return false;
+        n = n * 10 + (t[i] - '0');
+    }
+    out = n;
+    return true;
+}
+
+// {"enabled":true|false} switches the link on or off, kept across restarts.
+// Off, the board stops advertising and lets every phone go; paired phones
+// stay paired. From 0.13, {"own":"123456"} sets the owner's own pairing
+// code and {"own":""} goes back to a new random one each window. Either
+// field may be left out.
 static void handle_ble_post() {
     if (refuse_other_site()) return;
     JsonDocument doc;
@@ -2200,29 +2423,281 @@ static void handle_ble_post() {
         send_config_error("request body is not valid JSON");
         return;
     }
-    if (!doc["enabled"].is<bool>()) {
+    const bool has_enabled = !doc["enabled"].isNull();
+    const bool has_code = !doc["own"].isNull();
+    if (!has_enabled && !has_code) {
         send_config_error("enabled must be true or false");
         return;
     }
+    if (has_enabled && !doc["enabled"].is<bool>()) {
+        send_config_error("enabled must be true or false");
+        return;
+    }
+    int32_t code = g_settings.ble_pin;
+    if (has_code && !parse_pin(doc["own"], code)) {
+        send_config_error("the pairing code must be six digits, or empty for a random code");
+        return;
+    }
     Settings s = g_settings;
-    s.ble_link = doc["enabled"].as<bool>();
+    if (has_enabled) s.ble_link = doc["enabled"].as<bool>();
+    s.ble_pin = code;
+    if (!settings_save(s)) {
+        api_send(500, "application/json", F("{\"error\":\"could not write settings to flash\"}"));
+        return;
+    }
+    const bool code_changed = s.ble_pin != g_settings.ble_pin;
+    g_settings = s;
+    if (code_changed) {
+        ble_link_set_code(s.ble_pin);
+        Serial.println(s.ble_pin >= 0 ? F("[link] pairing now uses the owner's own code")
+                                      : F("[link] pairing now uses a new random code each time"));
+    }
+    if (has_enabled) {
+        if (s.ble_link) {
+            if (!ble_link_ready()) {
+                Serial.println(ble_link_begin(true) ? F("[link] Bluetooth link up")
+                                                    : F("[link] Bluetooth link could not start"));
+            } else {
+                ble_link_enable(true);
+            }
+        } else {
+            ble_link_enable(false);
+            ble_link_pair(false);
+        }
+    }
+    send_ble_status();
+}
+
+// --- Signing in: the endpoints (0.13) ----------------------------------------------
+
+// Open to anyone: what this is, and whether the asker is signed in. The app
+// finds boards on the network by it, and the sign-in page by it knows where
+// it stands.
+static void handle_auth_get() {
+    g_session = session_of_request();
+    const bool in = g_session >= 0;
+    char id[18];
+    mac_format(wifi_factory_mac(), id);
+    JsonDocument doc;
+    doc["netmon"] = true;
+    doc["name"] = kOtaHostname;
+    doc["version"] = kFirmwareVersion;
+    doc["id"] = id;
+    doc["login"] = true;
+    doc["signed_in"] = in;
+    doc["remember_days"] = kSessionLongS / 86400;
+    if (in) {
+        doc["own_password"] = g_auth.login.set;
+        doc["remembered"] = g_auth.sessions.s[g_session].remember;
+        doc["sessions"] = g_auth.sessions.count(now_s(), clock_unix());
+    }
+    doc["via"] = g_via == Via::Link ? "bluetooth" : "wifi";
+    String body;
+    serializeJson(doc, body);
+    if (g_via == Via::Http) g_server.sendHeader("Cache-Control", "no-store");
+    api_send(200, "application/json", body);
+}
+
+static bool password_ok(const char* pw) {
+    // Both, every time, so how long it takes says nothing about which matched.
+    const bool update = same_text_ct(pw, kOtaPassword);
+    const bool own = password_matches(g_auth.login, pw);
+    return update || own;
+}
+
+static void send_throttled(uint32_t wait) {
+    String body = F("{\"error\":\"Too many wrong passwords. Try again in ");
+    body += String(wait);
+    body += F(" seconds.\",\"retry_s\":");
+    body += String(wait);
+    body += '}';
+    api_send(429, "application/json", body);
+}
+
+// {"password":"...","remember":true,"unix":1760000000}: a session, as a
+// cookie for a browser and as "token" for the app. "unix" is the asker's
+// time, which the board takes when it has none, once signed in.
+static void handle_login() {
+    if (refuse_other_site()) return;
+    const uint32_t who = api_client();
+    const uint32_t wait = g_throttle.wait_s(who, now_s());
+    if (wait > 0) {
+        send_throttled(wait);
+        return;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    const char* pw = doc["password"] | "";
+    const bool remember = doc["remember"] | false;
+    if (pw[0] == '\0' || !password_ok(pw)) {
+        g_throttle.failed(who, now_s());
+        Serial.println(F("[auth] wrong password"));
+        api_send(401, "application/json", F("{\"error\":\"That password is not right.\",\"wrong\":true}"));
+        return;
+    }
+    g_throttle.succeeded(who);
+    if (doc["unix"].is<uint32_t>() &&
+        clock_set(g_clock, doc["unix"].as<uint32_t>(), now_s(), ClockSource::Client)) {
+        Serial.println(F("[clock] set by a client"));
+    }
+    char token[kTokenHex + 1];
+    auth_new_token(token);
+    uint8_t h[32];
+    token_hash(token, h);
+    g_session = static_cast<int>(g_auth.sessions.add(h, remember, now_s(), clock_unix()));
+    clock_learned();
+    auth_store();
+    Serial.println(remember ? F("[auth] signed in, kept for 30 days") : F("[auth] signed in"));
+    if (g_via == Via::Http) {
+        set_session_cookie(token, remember);
+        g_server.sendHeader("Cache-Control", "no-store");
+    }
+    JsonDocument out;
+    out["status"] = "signed in";
+    out["token"] = token;
+    out["remember"] = remember;
+    out["days"] = remember ? kSessionLongS / 86400 : 0;
+    String body;
+    serializeJson(out, body);
+    api_send(200, "application/json", body);
+}
+
+// Ends the asker's session, if it has one, and forgets the cookie.
+static void handle_logout() {
+    if (refuse_other_site()) return;
+    g_session = session_of_request();
+    if (g_session >= 0) {
+        g_auth.sessions.remove(g_session);
+        g_session = -1;
+        auth_store();
+        Serial.println(F("[auth] signed out"));
+    }
+    if (g_via == Via::Http) clear_session_cookie();
+    api_send(200, "application/json", F("{\"status\":\"signed out\"}"));
+}
+
+// Every session ends, the asker's too: a lost phone, a shared browser.
+static void handle_signout_all() {
+    if (refuse_other_site()) return;
+    const size_t n = g_auth.sessions.remove_all_but(-1);
+    g_session = -1;
+    auth_store();
+    Serial.print(F("[auth] signed out everywhere, sessions: "));
+    Serial.println(n);
+    if (g_via == Via::Http) clear_session_cookie();
+    api_send(200, "application/json", F("{\"status\":\"signed out everywhere\"}"));
+}
+
+// {"current":"...","new":"..."}: the owner's own login password, from then
+// on beside the update password; "new":"" goes back to the update password
+// alone. Every other session ends, so a password that leaked stops working
+// everywhere it was used.
+static void handle_password() {
+    if (refuse_other_site()) return;
+    const uint32_t who = api_client();
+    const uint32_t wait = g_throttle.wait_s(who, now_s());
+    if (wait > 0) {
+        send_throttled(wait);
+        return;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    const char* cur = doc["current"] | "";
+    const char* pw = doc["new"] | "";
+    if (cur[0] == '\0' || !password_ok(cur)) {
+        g_throttle.failed(who, now_s());
+        api_send(403, "application/json",
+                 F("{\"error\":\"The current password is not right.\",\"wrong\":true}"));
+        return;
+    }
+    g_throttle.succeeded(who);
+    if (pw[0] != '\0') {
+        const PasswordRule r = password_rule(pw);
+        if (r != PasswordRule::Ok) {
+            send_config_error(password_rule_text(r));
+            return;
+        }
+        if (same_text_ct(pw, kOtaPassword)) {
+            send_config_error("That is the update password already; choose a different one.");
+            return;
+        }
+        uint8_t salt[16];
+        auth_random(salt, sizeof(salt));
+        password_make(g_auth.login, pw, salt, kPasswordRounds);
+    } else {
+        std::memset(&g_auth.login, 0, sizeof(g_auth.login));
+    }
+    const size_t ended = g_auth.sessions.remove_all_but(g_session);
+    auth_store();
+    Serial.print(pw[0] != '\0' ? F("[auth] login password set") : F("[auth] login password removed"));
+    Serial.print(F(", other sessions ended: "));
+    Serial.println(ended);
+    JsonDocument out;
+    out["status"] = "changed";
+    out["own_password"] = g_auth.login.set;
+    out["ended"] = ended;
+    String body;
+    serializeJson(out, body);
+    api_send(200, "application/json", body);
+}
+
+// {"mac":"02:1A:2B:3C:4D:5E"} sets the address the board uses on Wi-Fi from
+// its next start; {"mac":""} goes back to the chip's own. The page restarts
+// the board afterwards. The Bluetooth address stays as it is, so paired
+// phones stay paired.
+static void handle_mac_post() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    if (!doc["mac"].is<const char*>()) {
+        send_config_error("mac must be an address like 02:1A:2B:3C:4D:5E, or empty");
+        return;
+    }
+    const char* text = doc["mac"].as<const char*>();
+    Settings s = g_settings;
+    if (text[0] == '\0') {
+        s.wifi_mac_set = false;
+        std::memset(s.wifi_mac, 0, sizeof(s.wifi_mac));
+    } else {
+        Mac m{};
+        const MacRule r = mac_rule(text, wifi_factory_ap_mac(), m);
+        if (r != MacRule::Ok) {
+            send_config_error(mac_rule_text(r));
+            return;
+        }
+        // The chip's own address is the same as having none set.
+        s.wifi_mac_set = !mac_equal(m, wifi_factory_mac());
+        std::memcpy(s.wifi_mac, m.b, sizeof(s.wifi_mac));
+    }
     if (!settings_save(s)) {
         api_send(500, "application/json", F("{\"error\":\"could not write settings to flash\"}"));
         return;
     }
     g_settings = s;
-    if (s.ble_link) {
-        if (!ble_link_ready()) {
-            Serial.println(ble_link_begin(true) ? F("[link] Bluetooth link up")
-                                                : F("[link] Bluetooth link could not start"));
-        } else {
-            ble_link_enable(true);
-        }
-    } else {
-        ble_link_enable(false);
-        ble_link_pair(false);
+    Serial.println(s.wifi_mac_set ? F("[cfg] own MAC address saved, used from the next start")
+                                  : F("[cfg] back to the chip's own MAC address from the next start"));
+    char saved[18] = "";
+    if (s.wifi_mac_set) {
+        Mac m{};
+        std::memcpy(m.b, s.wifi_mac, sizeof(m.b));
+        mac_format(m, saved);
     }
-    send_ble_status();
+    JsonDocument out;
+    out["status"] = "saved";
+    out["custom"] = saved;
+    out["restart"] = true;
+    String body;
+    serializeJson(out, body);
+    api_send(200, "application/json", body);
 }
 
 // {} opens a pairing window for two minutes, or keeps the open one going, and
@@ -2528,7 +3003,10 @@ static void handle_clock() {
         send_config_error("that time is not plausible");
         return;
     }
-    if (clock_set(g_clock, t, now_s(), ClockSource::Client)) Serial.println(F("[clock] set by a client"));
+    if (clock_set(g_clock, t, now_s(), ClockSource::Client)) {
+        Serial.println(F("[clock] set by a client"));
+        clock_learned();
+    }
     JsonDocument out;
     out["clock"] = clock_known(g_clock);
     out["unix"] = clock_unix();
@@ -2551,6 +3029,7 @@ struct ApiRoute {
     const char* path;
     uint8_t methods;
     void (*handler)();
+    bool open;            // answered without a session (0.13): only signing in
 };
 
 static const ApiRoute kApiRoutes[] = {
@@ -2583,7 +3062,23 @@ static const ApiRoute kApiRoutes[] = {
     {"/api/reports/save", kPost, handle_report_save},
     {"/api/reports/delete", kPost, handle_report_delete},
     {"/api/clock", kPost, handle_clock},
+    // Signing in (0.13). Only these three answer anyone; see src/core/auth.h.
+    {"/api/auth", kGet, handle_auth_get, true},
+    {"/api/login", kPost, handle_login, true},
+    {"/api/logout", kPost, handle_logout, true},
+    {"/api/auth/password", kPost, handle_password},
+    {"/api/auth/signout", kPost, handle_signout_all},
+    {"/api/mac", kPost, handle_mac_post},
 };
+
+// A route's handler, behind the sign-in, for whichever way the request came.
+// (Takes the route's parts rather than the route: the prototype the Arduino
+// IDE writes at the top of the sketch comes before struct ApiRoute.)
+static void run_route(void (*handler)(), bool open) {
+    g_session = -1;
+    if (!open && !require_session()) return;
+    handler();
+}
 
 static const char* link_status_text(uint16_t status) {
     switch (status) {
@@ -2613,7 +3108,7 @@ static void serve_link(const LinkIncoming& in) {
             }
         }
         if (route != nullptr) {
-            route->handler();
+            run_route(route->handler, route->open);
         } else {
             api_send(404, "text/plain", F("not found"));
         }
@@ -2693,6 +3188,12 @@ void setup() {
     Serial.print(F("[boot] remembered names: "));
     Serial.println(g_names.size());
     reports_load(g_reports);
+    // The login password and who is signed in, kept across restarts (0.13).
+    if (auth_load(g_auth)) {
+        Serial.print(F("[boot] signed-in sessions kept: "));
+        Serial.println(g_auth.sessions.count(0, 0));
+    }
+    ble_link_set_code(g_settings.ble_pin);
     for (const ReportSlot& r : g_reports) {
         if (!r.used) continue;
         Serial.print(F("[boot] saved report: "));
@@ -2756,14 +3257,23 @@ void setup() {
 
     g_server.on("/", handle_dashboard);
     g_server.on("/about", handle_root);
-    g_server.on("/events", []() { g_server.send_P(200, "text/html", EVENTS_HTML); });
+    g_server.on("/events", []() { send_page(EVENTS_HTML); });
     g_server.on("/settings", handle_settings_page);
     g_server.on("/nearby", handle_nearby_page);
-    g_server.on("/map", []() { g_server.send_P(200, "text/html", MAP_HTML); });
+    g_server.on("/map", []() { send_page(MAP_HTML); });
     g_server.on("/isp", handle_isp_page);
+    // The one page anyone may see.
+    g_server.on("/login", []() {
+        g_server.sendHeader("Cache-Control", "no-store");
+        g_server.send_P(200, "text/html", LOGIN_HTML);
+    });
     for (const ApiRoute& r : kApiRoutes) {
         const HTTPMethod m = r.methods == kAny ? HTTP_ANY : r.methods == kGet ? HTTP_GET : HTTP_POST;
-        g_server.on(r.path, m, r.handler);
+        const ApiRoute* route = &r;
+        g_server.on(r.path, m, [route]() {
+            g_via = Via::Http;
+            run_route(route->handler, route->open);
+        });
     }
     // In setup mode anything unrecognised is a captive-portal probe, so send
     // it to the page the person actually needs. In normal operation a 404 has
@@ -2776,9 +3286,10 @@ void setup() {
         g_server.sendHeader("Location", "http://192.168.4.1/settings", true);
         g_server.send(302, "text/plain", "");
     });
-    // X-Netmon-Key for the update endpoints, Origin for refuse_other_site().
-    const char* header_keys[] = {"X-Netmon-Key", "Origin"};
-    g_server.collectHeaders(header_keys, 2);
+    // X-Netmon-Key for the update endpoints, Origin for refuse_other_site(),
+    // and the session: a browser's cookie, or the app's Authorization.
+    const char* header_keys[] = {"X-Netmon-Key", "Origin", "Cookie", "Authorization"};
+    g_server.collectHeaders(header_keys, 4);
     g_server.on("/api/update", HTTP_POST, handle_update_result, handle_update_upload);
     g_server.begin();
     Serial.println(F("[boot] http server up on :80"));
@@ -2789,6 +3300,7 @@ void loop() {
     if (g_portal) g_dns.processNextRequest();
     g_server.handleClient();
     link_tick();
+    auth_tick();
     report_tick();
     dhcp_listener_tick();
     dhcp_tick();

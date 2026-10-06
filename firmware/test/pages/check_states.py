@@ -1,10 +1,12 @@
-import asyncio, json
+import asyncio, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import signin
 from playwright.async_api import async_playwright
 BASE="http://127.0.0.1:8765"
 async def main():
     out={};errs=[]
     async with async_playwright() as p:
-        b=await p.chromium.launch();page=await b.new_page(viewport={"width":1100,"height":900})
+        b=await p.chromium.launch();ctx=await signin.context(b,viewport={"width":1100,"height":900});page=await ctx.new_page()
         page.on("pageerror",lambda e:errs.append(str(e)))
         await page.request.post(BASE+"/__nearby?unavailable=1")
         await page.goto(BASE+"/nearby");await page.wait_for_timeout(3500)

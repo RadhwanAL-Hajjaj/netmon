@@ -5,10 +5,10 @@ LAN, tells you which ones it doesn't recognise, and scans the Wi-Fi and
 Bluetooth around it. You use it through web pages that the board serves
 itself, and those pages never load anything from the internet. It keeps a
 saved report of each network it has been on, and a paired phone can reach it
-over Bluetooth, away from its Wi-Fi.
+over Bluetooth, away from its Wi-Fi. Pages and API ask for a password.
 
-- **Firmware** 0.12.0-bluetooth for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
-- **Android app** 1.2.0 (optional). It reads the same API, over Wi-Fi or Bluetooth, and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications, browses and exports the saved reports, and can update the firmware.
+- **Firmware** 0.13.0-login for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
+- **Android app** 1.3.0 (optional). It reads the same API, over Wi-Fi or Bluetooth, and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications, browses and exports the saved reports, and can update the firmware.
 
 <table>
   <tr>
@@ -102,18 +102,24 @@ arduino-cli upload  --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -p <port
 
 Coming from firmware 0.9.x or older? Flash over USB once, because 0.10.0
 changed the partition scheme. See the [changelog](CHANGELOG.md#0100-nearby).
-From 0.10 or 0.11, 0.12 goes over the air.
+From 0.10, 0.11 or 0.12, 0.13 goes over the air. After updating to 0.13, sign in
+with the update password, and update the Android app to 1.3.0.
 
 ## First start
 
 1. The board doesn't know your Wi-Fi yet, so it opens its own open network
-   called **`netmon-setup`**. Join it from a phone. The settings page should
-   open by itself as a "sign in to network" page. If it doesn't, browse to
-   `http://192.168.4.1`.
-2. Tap **Scan for networks**, pick yours, enter the password, then **Save and restart**.
-3. The board joins your network and starts sweeping. Open `http://netmon.local`,
+   called **`netmon-setup`**. Join it from a phone. The board's sign-in page
+   should open by itself as a "sign in to network" page. If it doesn't, browse
+   to `http://192.168.4.1`.
+2. Sign in with the update password you set in `secrets.h`. Tick **Remember
+   me** to stay signed in on that browser for 30 days.
+3. Tap **Scan for networks**, pick yours, enter the password, then **Save and restart**.
+4. The board joins your network and starts sweeping. Open `http://netmon.local`,
    or find the board's address in your router's client list, where it shows
    up as `netmon`. More ways to find it are in [Finding netmon](docs/finding-netmon.md).
+
+Under **Settings → Signing in** you can set a login password of your own. The
+update password keeps working too, as the way back in if you forget yours.
 
 For the first ten minutes everything it sees counts as **known**, because it
 is learning what normal looks like. After that, any new device with a
@@ -137,18 +143,25 @@ Once a build is on the board, you can update it over Wi-Fi in any of these ways:
 - **ArduinoOTA** from the Arduino IDE. The board appears as `netmon`.
 - **The Android app**, under Settings → Firmware update.
 
-All three use the update password from `secrets.h`. Saved Wi-Fi networks,
-settings and learned hostnames survive an update.
+All three use the update password from `secrets.h`, and from 0.13 the page
+and the app also need to be signed in. Saved Wi-Fi networks, settings,
+learned hostnames, sessions and paired phones survive an update.
 
 ## Security notes
 
-- The pages and the read-only API need no login, so anyone on your LAN can
-  view them.
-- Requests that change things, such as settings, forgetting a network,
-  restarting or the Nearby controls, are refused when they come from a page on
-  another site (a browser Origin check). This is not authentication: a device
-  on the LAN that talks to the board directly can still make them. Only
-  firmware updates need the password.
+- From 0.13 every page and API call needs signing in, over Wi-Fi and over
+  Bluetooth. The password is your login password (Settings → Signing in) or
+  the update password from `secrets.h`, which always works. A session is a
+  random token the board keeps only a hash of: 30 days with *Remember me* (or
+  in the app), otherwise until the browser closes or 12 hours unused. Wrong
+  passwords cost a growing wait, up to 15 minutes. *Sign out everywhere* ends
+  every session, and a new login password ends all but yours.
+- The pages are plain HTTP, so on your LAN the password and the session travel
+  unencrypted: Wi-Fi encryption keeps them from outsiders, not from another
+  device that can see the traffic on your network.
+- Requests that change things are also refused when they come from a page on
+  another site (a browser Origin check), so a web page you visit can't use
+  your session on the board.
 - `netmon-setup` is an open network. It exists only while the board can't join
   one of its saved networks.
 - The Internet page sends one plain-HTTP request to [ip-api.com](https://ip-api.com)
@@ -156,10 +169,11 @@ settings and learned hostnames survive an update.
   reveals your public IP address to that service. Nothing else leaves your
   network.
 - Bluetooth: the API answers only phones paired with a 6-digit code, over an
-  encrypted link. The code is shown only on the Settings page or in the app
-  over Wi-Fi, so pairing needs someone on the board's network; a window lasts
-  two minutes and one attempt. Up to three phones stay paired, and a stranger
-  in range cannot push one out. Bluetooth can be switched off in Settings.
+  encrypted link, and signed in like any other client. The code is shown only
+  on the Settings page or in the app over Wi-Fi, or is your own, and it only
+  works while a pairing window is open: two minutes and three tries. Up to
+  three phones stay paired, and a stranger in range cannot push one out.
+  Bluetooth can be switched off in Settings.
 - Saved reports stay in the board's flash until replaced or deleted. Anyone
   who can reach the API, on the LAN or a paired phone, can read them.
 - Don't expose the board to the internet. To check on it from outside, use a
@@ -171,10 +185,17 @@ Found a security problem? Please report it privately, as described in
 ## HTTP API
 
 Every endpoint returns JSON. The Android app uses this API, and anything else
-on your network can use it too.
+on your network can use it too, once signed in: from 0.13 every endpoint but
+the first three below needs a session, from `POST /api/login`, sent as the
+`nm_s` cookie or as `Authorization: Bearer <token>`. Without one the answer is
+`401` with `"login":true` (and, over Wi-Fi, an `X-Netmon-Login` header).
 
 | Endpoint | |
 |---|---|
+| `GET /api/auth` | What the board is (`netmon`, `version`, `id`: the chip's MAC) and whether the asker is signed in. Needs no session |
+| `POST /api/login` | `{"password":"...","remember":true}`: a session, as the `nm_s` cookie and as `token` in the answer. `429` with `retry_s` after too many wrong passwords |
+| `POST /api/logout` | Ends the asker's session |
+| `POST /api/auth/password`, `POST /api/auth/signout` | `{"current":"...","new":"..."}` sets the login password (`"new":""` removes it) and ends every other session; sign out everywhere |
 | `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, free memory |
 | `GET /api/devices` | Every device: MAC, IP, hostname, vendor, state, online, uptime, last seen |
 | `GET /api/events` | The last 48 events (appeared, offline, returned, hostname learned) |
@@ -190,11 +211,12 @@ on your network can use it too.
 | `GET`/`POST /api/nearby/config` | Turn Wi-Fi and Bluetooth scanning on or off, and set the background interval |
 | `GET`/`POST /api/nearby/find` | The Finder: start, keep alive, stop, read new signal readings |
 | `GET /api/map` | The board, its access points, the router, the subnet and the provider, for the Map page |
-| `GET`/`POST /api/ble` | The Bluetooth link: on or off, address, paired phones, the pairing window. `{"enabled":false}` switches it off |
+| `GET`/`POST /api/ble` | The Bluetooth link: on or off, address, paired phones, the pairing window and how the last attempt went. `{"enabled":false}` switches it off; `{"own":"123456"}` sets your own pairing code, `{"own":""}` goes back to random ones |
 | `POST /api/ble/pair`, `POST /api/ble/forget` | Open a two-minute pairing window and get its code (`{"stop":true}` closes it); forget every paired phone |
 | `GET /api/reports`, `GET /api/reports/get?slot=N` | The saved reports, one per network; one of them, as the JSON document kept in flash |
 | `POST /api/reports/save`, `POST /api/reports/delete` | Save this network's report now; delete one (`{"slot":N}`) |
 | `POST /api/clock` | `{"unix":seconds}`: the time, for dating reports. The app and the pages send it when `/api/health` says `"clock":false` |
+| `POST /api/mac` | `{"mac":"02:1A:2B:3C:4D:5E"}`: the address the board uses on Wi-Fi from its next start; `{"mac":""}` goes back to the chip's own |
 
 Over Bluetooth every endpoint above answers the same, except the firmware
 upload. The framing is described in `firmware/netmon/src/core/ble_link.h`.
@@ -207,7 +229,9 @@ that added it.
 - The known/unknown baseline, the event history, the Nearby lists and the map
   data are all kept in RAM. A restart, including one after an update, starts
   the learning window again.
-- Settings endpoints take no password, as described under Security notes.
+- Sessions and the login password live in the board's flash. Lose every
+  password and the update password still signs in; lose that too and the
+  board needs reflashing over USB with a new `secrets.h`.
 - A fixed address applies to every saved network.
 - Hostnames come from DHCP broadcasts. A device that only renews a lease it
   already holds stays unnamed until it next reconnects. Routers that isolate
@@ -229,7 +253,7 @@ The hardware-independent logic lives in `firmware/netmon/src/core/` and is
 tested on a PC:
 
 ```sh
-cd firmware/test && make test        # 1574 checks, g++ or clang, C++17
+cd firmware/test && make test        # 1940 checks, g++ or clang, C++17
 ```
 
 The web pages are tested in headless Chromium against a simulated board. See

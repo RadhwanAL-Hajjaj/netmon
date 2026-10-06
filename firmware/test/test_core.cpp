@@ -2262,17 +2262,64 @@ static void test_link_pairing() {
     CHECK_STR(t, "999999");
     pair_code_text(1000001, t);
     CHECK_STR(t, "000001");
-    // One attempt closes it, whatever the outcome.
-    pair_done(w, 410000, false);
-    CHECK(!pair_live(w, 410000));
+    // A failure that says something about the code costs one of three tries;
+    // the window stays open, with the same code, until the third.
+    CHECK(pair_tries_left(w) == kPairTries);
+    pair_done(w, 410000, false, PairWhy::WrongCode);
+    CHECK(pair_live(w, 410000));
+    CHECK(w.code == 31);
+    CHECK(pair_tries_left(w) == kPairTries - 1);
     CHECK_STR(pair_result_text(w.result), "failed");
+    CHECK_STR(pair_why_key(w.why), "wrong_code");
+    // A dropped connection or a timeout never got to the code: free.
+    pair_done(w, 411000, false, PairWhy::Dropped);
+    pair_done(w, 412000, false, PairWhy::TimedOut);
+    CHECK(pair_live(w, 412000));
+    CHECK(pair_tries_left(w) == kPairTries - 1);
+    CHECK_STR(pair_why_key(w.why), "timed_out");
+    pair_done(w, 413000, false, PairWhy::Cancelled);
+    CHECK(pair_live(w, 413000));
+    pair_done(w, 414000, false, PairWhy::WrongCode);
+    CHECK(!pair_live(w, 414000));
+    CHECK(pair_tries_left(w) == 0);
+    CHECK(pair_passkey(w, 414001, 1000007) == 7);
+    // A fresh window starts the count again.
     pair_open(w, 420000, 5);
     CHECK_STR(pair_result_text(w.result), "");
+    CHECK_STR(pair_why_key(w.why), "");
+    CHECK(pair_tries_left(w) == kPairTries);
     pair_done(w, 421000, true);
     CHECK_STR(pair_result_text(w.result), "paired");
+    CHECK_STR(pair_why_key(w.why), "paired");
+    CHECK(!pair_live(w, 421000));      // a phone that pairs closes it
     pair_open(w, 430000, 6);
     pair_close(w);
     CHECK(!pair_live(w, 430001));
+
+    // The owner's own code: every window, never a random one.
+    PairWindow f{};
+    pair_open(f, 1000, 123, 4242);
+    CHECK(f.code == 4242);
+    CHECK(pair_passkey(f, 2000, 77) == 4242);
+    pair_code_text(f.code, t);
+    CHECK_STR(t, "004242");
+    pair_done(f, 3000, false, PairWhy::WrongCode);
+    pair_done(f, 3001, false, PairWhy::WrongCode);
+    pair_done(f, 3002, false, PairWhy::WrongCode);
+    CHECK(!pair_live(f, 3003));
+    CHECK(pair_passkey(f, 3003, 1000077) == 77);     // closed: not the owner's code
+    pair_open(f, 5000, 999, 4242);
+    CHECK(f.code == 4242);
+    CHECK(pair_tries_left(f) == kPairTries);
+    // Changed while open: the new code from then on.
+    pair_open(f, 6000, 1, 7);
+    CHECK(f.code == 7);
+    // Back to random codes: the open window keeps the one it has.
+    pair_open(f, 7000, 555555);
+    CHECK(f.code == 7);
+    pair_close(f);
+    pair_open(f, 8000, 555555);
+    CHECK(f.code == 555555);
     // The clock wrapping is no different from any other two minutes.
     PairWindow z{};
     pair_open(z, 0xFFFFFF00u, 9);
@@ -2285,6 +2332,61 @@ static void test_link_pairing() {
     CHECK(!link_drop_unpaired(false, 0, kLinkUnpairedMs + 1, true));
     CHECK(link_drop_unpaired(false, 0, kLinkPairingMs + 1, true));
     CHECK(!link_drop_unpaired(true, 0, 10 * kLinkPairingMs, false));
+}
+
+// How the end of an attempt reads, from the statuses NimBLE reports.
+static void test_link_pair_why() {
+    CHECK(pair_why_of(0, true, true) == PairWhy::Paired);
+    CHECK(pair_why_of(0, true, false) == PairWhy::NoCode);
+    CHECK(pair_why_of(0, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(kNimTimeout, false, false) == PairWhy::TimedOut);
+    CHECK(pair_why_of(kNimNotConn, false, false) == PairWhy::Dropped);
+    // Confirm value failed, found by the board or by the phone; DHKey check.
+    CHECK(pair_why_of(0x404, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x504, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x50b, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x501, false, false) == PairWhy::Cancelled);
+    CHECK(pair_why_of(0x509, false, false) == PairWhy::TooMany);
+    CHECK(pair_why_of(0x503, false, false) == PairWhy::Refused);
+    CHECK(pair_why_of(0x405, false, false) == PairWhy::Refused);
+    CHECK(pair_why_of(0x508, false, false) == PairWhy::Other);
+    // The controller's own reasons for a connection going.
+    CHECK(pair_why_of(0x208, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x213, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x23e, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x206, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(0x400, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(12345, false, false) == PairWhy::Other);
+    // Every reason has a key and words; none has neither.
+    for (uint8_t w = 1; w <= static_cast<uint8_t>(PairWhy::Other); ++w) {
+        CHECK(pair_why_key(w)[0] != '\0');
+        CHECK(pair_why_text(w)[0] != '\0');
+    }
+    CHECK_STR(pair_why_key(0), "");
+    CHECK_STR(pair_why_text(0), "");
+    CHECK(!pair_counts(PairWhy::Dropped));
+    CHECK(!pair_counts(PairWhy::TimedOut));
+    CHECK(pair_counts(PairWhy::WrongCode));
+    CHECK(pair_counts(PairWhy::Other));
+}
+
+// The session travels with every request over the link, as it does over Wi-Fi.
+static void test_link_parse_auth() {
+    LinkRequest r;
+    const char* a =
+        "GET /api/devices\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\nX-Netmon-Key: k1\n\n";
+    CHECK(link_parse(a, std::strlen(a), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "Bearer 0123456789abcdef0123456789abcdef");
+    CHECK_STR(r.key, "k1");
+    const char* b = "GET /api/devices\r\nauthorization:   Bearer x\r\n\r\n";
+    CHECK(link_parse(b, std::strlen(b), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "Bearer x");
+    CHECK_STR(r.key, "");
+    const char* c = "GET /api/devices\n\n";
+    CHECK(link_parse(c, std::strlen(c), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "");
+    std::string longer = "GET /api/devices\nAuthorization: Bearer " + std::string(kLinkAuthMax, 'a') + "\n\n";
+    CHECK(link_parse(longer.c_str(), longer.size(), r) == LinkParse::TooLong);
 }
 
 // --- Saved reports -------------------------------------------------------------
@@ -2551,6 +2653,346 @@ static void test_report_lines() {
     CHECK(report_clock_of("x") == ClockSource::None);
 }
 
+// --- Signing in (0.13) ---------------------------------------------------------
+
+#include "../netmon/src/core/auth.h"
+
+static std::string hex_of(const uint8_t* b, size_t n) {
+    std::vector<char> s(2 * n + 1);
+    hex_encode(b, n, s.data());
+    return std::string(s.data());
+}
+
+static void test_sha256() {
+    uint8_t h[32];
+    sha256("", 0, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    sha256("abc", 3, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const char* m448 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha256(m448, std::strlen(m448), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // Lengths either side of where the padding needs a second block.
+    std::string x55(55, 'x'), x56(56, 'x'), x64(64, 'x');
+    sha256(x55.data(), x55.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072");
+    sha256(x56.data(), x56.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e");
+    sha256(x64.data(), x64.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c");
+    // A million a's, fed in uneven pieces.
+    Sha256 s;
+    sha256_init(s);
+    std::string a(1000, 'a');
+    size_t fed = 0, step = 1;
+    while (fed < 1000000) {
+        size_t n = step % 997 + 1;
+        if (n > 1000000 - fed) n = 1000000 - fed;
+        sha256_update(s, a.data(), n);
+        fed += n;
+        step = step * 7 + 3;
+    }
+    sha256_final(s, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+
+    // HMAC, RFC 4231 cases 1, 2 and 6 (a key longer than a block).
+    uint8_t k1[20];
+    std::memset(k1, 0x0b, sizeof(k1));
+    hmac_sha256(k1, sizeof(k1), reinterpret_cast<const uint8_t*>("Hi There"), 8, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    const char* q = "what do ya want for nothing?";
+    hmac_sha256(reinterpret_cast<const uint8_t*>("Jefe"), 4, reinterpret_cast<const uint8_t*>(q), std::strlen(q), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    uint8_t k6[131];
+    std::memset(k6, 0xaa, sizeof(k6));
+    const char* m6 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    hmac_sha256(k6, sizeof(k6), reinterpret_cast<const uint8_t*>(m6), std::strlen(m6), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+    // PBKDF2-HMAC-SHA-256: the published vectors, two blocks of output and more.
+    const uint8_t* pw = reinterpret_cast<const uint8_t*>("password");
+    const uint8_t* salt = reinterpret_cast<const uint8_t*>("salt");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 1, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 2, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 4096, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    uint8_t d40[40];
+    const char* p2 = "passwordPASSWORDpassword";
+    const char* s2 = "saltSALTsaltSALTsaltSALTsaltSALTsalt";
+    CHECK(pbkdf2_sha256(reinterpret_cast<const uint8_t*>(p2), std::strlen(p2),
+                        reinterpret_cast<const uint8_t*>(s2), std::strlen(s2), 4096, d40, sizeof(d40)));
+    CHECK_STR(hex_of(d40, 40).c_str(),
+              "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+    uint8_t d64[64];
+    CHECK(pbkdf2_sha256(reinterpret_cast<const uint8_t*>("passwd"), 6, salt, 4, 1, d64, sizeof(d64)));
+    CHECK_STR(hex_of(d64, 64).c_str(),
+              "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+              "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783");
+    uint8_t long_salt[61] = {0};
+    CHECK(!pbkdf2_sha256(pw, 8, long_salt, sizeof(long_salt), 1, h, 32));
+    CHECK(!pbkdf2_sha256(pw, 8, salt, 4, 0, h, 32));
+
+    // Comparing and hex.
+    uint8_t x[4] = {1, 2, 3, 4}, y[4] = {1, 2, 3, 4};
+    CHECK(same_bytes(x, y, 4));
+    y[3] = 5;
+    CHECK(!same_bytes(x, y, 4));
+    CHECK(same_text_ct("netmon-update", "netmon-update"));
+    CHECK(!same_text_ct("netmon-updat", "netmon-update"));
+    CHECK(!same_text_ct("netmon-update!", "netmon-update"));
+    CHECK(!same_text_ct("", "netmon-update"));
+    CHECK(!same_text_ct(nullptr, "x"));
+    uint8_t back[4];
+    CHECK(hex_decode("0aFf10e9", back, 4));
+    CHECK(back[0] == 0x0a && back[1] == 0xff && back[2] == 0x10 && back[3] == 0xe9);
+    CHECK(!hex_decode("0aFf10e", back, 4));
+    CHECK(!hex_decode("0aFf10eg", back, 4));
+    CHECK(!hex_decode(nullptr, back, 4));
+}
+
+static void test_auth_sessions() {
+    CHECK(token_well_formed("0123456789abcdef0123456789abcdef"));
+    CHECK(!token_well_formed("0123456789ABCDEF0123456789abcdef"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcde"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcdef0"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcdeg"));
+    CHECK(!token_well_formed(nullptr));
+    uint8_t h1[32], h2[32], h3[32];
+    token_hash("0123456789abcdef0123456789abcdef", h1);
+    CHECK_STR(hex_of(h1, 32).c_str(), "3eb1bd439947eb762998e566ccc2e099c791118b2f40579cc4f7da2b5061b7f9");
+    token_hash("11111111111111111111111111111111", h2);
+    token_hash("22222222222222222222222222222222", h3);
+
+    SessionTable<4> t;
+    t.clear();
+    CHECK(t.find(h1, 100, 0) == -1);
+    CHECK(t.count(100, 0) == 0);
+    // A session not kept: alive while used, gone after 12 hours idle.
+    const int a = static_cast<int>(t.add(h1, false, 100, 0));
+    CHECK(t.find(h1, 101, 0) == a);
+    CHECK(t.find(h2, 101, 0) == -1);
+    CHECK(t.find(h1, 100 + kSessionIdleS - 1, 0) == a);
+    CHECK(t.find(h1, 100 + kSessionIdleS, 0) == -1);
+    t.touch(a, 100 + kSessionIdleS - 10);
+    CHECK(t.find(h1, 100 + kSessionIdleS + 100, 0) == a);
+    // ... and a week at most, however busy.
+    uint32_t now = 100;
+    while (now < 100 + kSessionShortMaxS - 3600) {
+        now += 3600;
+        t.touch(a, now);
+    }
+    CHECK(t.find(h1, 100 + kSessionShortMaxS - 1, 0) == a);
+    CHECK(t.find(h1, 100 + kSessionShortMaxS, 0) == -1);
+
+    // Kept ("Remember me"): idle does not matter, 30 days do.
+    t.clear();
+    const int r = static_cast<int>(t.add(h2, true, 50, 0));
+    CHECK(t.find(h2, 50 + kSessionIdleS + 5, 0) == r);
+    CHECK(t.find(h2, 50 + kSessionLongS - 1, 0) == r);
+    CHECK(t.find(h2, 50 + kSessionLongS, 0) == -1);
+    // Dated by the clock when the board has one, across restarts too.
+    t.clear();
+    const int d = static_cast<int>(t.add(h2, true, 10, 1760000000u));
+    t.s[d].earlier_boot = true;           // as loaded after a restart
+    CHECK(t.find(h2, 5, 1760000000u + kSessionLongS - 1) == d);
+    CHECK(t.find(h2, 5, 1760000000u + kSessionLongS) == -1);
+    CHECK(t.find(h2, 5, 0) == d);         // no clock yet after the restart: kept
+    // A clock gone backwards does not end it.
+    CHECK(t.find(h2, 5, 1700000000u) == d);
+
+    // Undated sessions get their date once the clock is known.
+    t.clear();
+    const int u = static_cast<int>(t.add(h3, true, 1000, 0));
+    CHECK(t.date_undated(1600, 1760000000u));
+    CHECK(t.s[u].created_unix == 1760000000u - 600);
+    CHECK(!t.date_undated(1700, 1760000100u));     // nothing left to date
+    CHECK(!t.date_undated(1700, 0));
+
+    // A full table: a dead slot first, then the session not kept used longest
+    // ago, and only then a kept one.
+    SessionTable<3> f;
+    f.clear();
+    uint8_t k[6][32];
+    for (int i = 0; i < 6; ++i) {
+        char tok[33];
+        std::snprintf(tok, sizeof(tok), "%032d", i);
+        token_hash(tok, k[i]);
+    }
+    const size_t s0 = f.add(k[0], true, 10, 0);
+    const size_t s1 = f.add(k[1], false, 20, 0);
+    const size_t s2 = f.add(k[2], false, 30, 0);
+    CHECK(s0 != s1 && s1 != s2 && s0 != s2);
+    f.touch(static_cast<int>(s1), 40);                       // s2 now idle longest
+    const size_t s3 = f.add(k[3], true, 50, 0);
+    CHECK(s3 == s2);
+    CHECK(f.find(k[2], 51, 0) == -1);
+    CHECK(f.find(k[0], 51, 0) == static_cast<int>(s0));
+    const size_t s4 = f.add(k[4], true, 60, 0);              // only s1 is not kept
+    CHECK(s4 == s1);
+    const size_t s5 = f.add(k[5], true, 70, 0);              // all kept: the oldest goes
+    CHECK(s5 == s0);
+    CHECK(f.find(k[0], 71, 0) == -1);
+    CHECK(f.count(71, 0) == 3);
+    // A slot whose session ran out is taken before any live one.
+    SessionTable<2> g;
+    g.clear();
+    g.add(k[0], false, 0, 0);
+    g.add(k[1], true, 0, 0);
+    const size_t gi = g.add(k[2], true, kSessionIdleS + 1, 0);
+    CHECK(g.find(k[1], kSessionIdleS + 2, 0) >= 0);
+    CHECK(g.find(k[2], kSessionIdleS + 2, 0) == static_cast<int>(gi));
+    // Purging, and signing out everywhere but here.
+    CHECK(!g.purge(kSessionIdleS + 2, 0));
+    CHECK(g.remove_all_but(static_cast<int>(gi)) == 1);
+    CHECK(g.count(kSessionIdleS + 3, 0) == 1);
+    g.remove(static_cast<int>(gi));
+    CHECK(g.count(kSessionIdleS + 3, 0) == 0);
+    g.add(k[0], false, 0, 0);
+    CHECK(g.purge(kSessionIdleS, 0));
+    CHECK(!g.purge(kSessionIdleS, 0));
+}
+
+static void test_auth_headers() {
+    char v[40];
+    CHECK(cookie_value("nm_s=abc", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "abc");
+    CHECK(cookie_value("theme=dark; nm_s=0123; x=1", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(cookie_value("a=1;nm_s=zz ;b=2", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "zz");
+    CHECK(!cookie_value("xnm_s=1; nm_sx=2", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(!cookie_value("", "nm_s", v, sizeof(v)));
+    CHECK(!cookie_value(nullptr, "nm_s", v, sizeof(v)));
+    CHECK(cookie_value("nm_s=", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "");
+    char tiny[4];
+    CHECK(!cookie_value("nm_s=abcdef", "nm_s", tiny, sizeof(tiny)));
+    CHECK(bearer_value("Bearer 0123", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(bearer_value("  bearer   0123  ", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(!bearer_value("Basic YWJj", v, sizeof(v)));
+    CHECK(!bearer_value("Bearer", v, sizeof(v)));
+    CHECK(!bearer_value("Bearer ", v, sizeof(v)));
+    CHECK(!bearer_value("Bearerx 1", v, sizeof(v)));
+    CHECK(!bearer_value(nullptr, v, sizeof(v)));
+    CHECK(!bearer_value("Bearer abcdef", tiny, sizeof(tiny)));
+
+    CHECK(next_path_ok("/"));
+    CHECK(next_path_ok("/settings"));
+    CHECK(next_path_ok("/?q=192.168.2.4"));
+    CHECK(!next_path_ok("//evil.example/"));
+    CHECK(!next_path_ok("/\\evil.example"));
+    CHECK(!next_path_ok("https://evil.example/"));
+    CHECK(!next_path_ok("settings"));
+    CHECK(!next_path_ok(""));
+    CHECK(!next_path_ok(nullptr));
+    CHECK(!next_path_ok("/a\nb"));
+}
+
+static void test_auth_password() {
+    CHECK(password_rule("12345678") == PasswordRule::Ok);
+    CHECK(password_rule("1234567") == PasswordRule::TooShort);
+    CHECK(password_rule("") == PasswordRule::TooShort);
+    CHECK(password_rule(nullptr) == PasswordRule::TooShort);
+    CHECK(password_rule(std::string(64, 'p').c_str()) == PasswordRule::Ok);
+    CHECK(password_rule(std::string(65, 'p').c_str()) == PasswordRule::TooLong);
+    CHECK(password_rule("tab\there!") == PasswordRule::Control);
+    CHECK(password_rule("snowman \xe2\x98\x83 ok") == PasswordRule::Ok);
+    CHECK(password_rule_text(PasswordRule::TooShort)[0] != '\0');
+    CHECK_STR(password_rule_text(PasswordRule::Ok), "");
+
+    uint8_t salt[16];
+    for (int i = 0; i < 16; ++i) salt[i] = static_cast<uint8_t>(i);
+    PasswordHash ph;
+    password_make(ph, "correct horse battery", salt, kPasswordRounds);
+    CHECK(ph.set);
+    CHECK(ph.rounds == kPasswordRounds);
+    CHECK_STR(hex_of(ph.hash, 32).c_str(), "25ec2e843d040853eb91d6ee9a96d626c48de1b5cb7eb4c549e71a3c990cb674");
+    CHECK(password_matches(ph, "correct horse battery"));
+    CHECK(!password_matches(ph, "correct horse batterY"));
+    CHECK(!password_matches(ph, ""));
+    CHECK(!password_matches(ph, nullptr));
+    PasswordHash none{};
+    CHECK(!password_matches(none, "correct horse battery"));
+    PasswordHash silly = ph;
+    silly.rounds = 0;
+    CHECK(!password_matches(silly, "correct horse battery"));
+}
+
+static void test_auth_throttle() {
+    LoginThrottle<3> t;
+    t.clear();
+    const uint32_t A = 0xC0A8021Bu, B = 0xC0A8021Cu;
+    // Five wrong passwords are free.
+    for (int i = 0; i < 5; ++i) {
+        CHECK(t.wait_s(A, 100) == 0);
+        t.failed(A, 100);
+    }
+    CHECK(t.wait_s(A, 100) == 0);
+    t.failed(A, 100);                    // the sixth: 30 s
+    CHECK(t.wait_s(A, 100) == 30);
+    CHECK(t.wait_s(A, 129) == 1);
+    CHECK(t.wait_s(A, 130) == 0);
+    CHECK(t.wait_s(B, 100) == 0);        // somebody else is not held up
+    t.failed(A, 130);                    // seventh: 60 s
+    CHECK(t.wait_s(A, 130) == 60);
+    for (int i = 0; i < 10; ++i) t.failed(A, 200);
+    CHECK(t.wait_s(A, 200) == kLoginWaitMaxS);
+    // The right password clears it.
+    t.succeeded(A);
+    CHECK(t.wait_s(A, 201) == 0);
+    // A place quiet for an hour starts afresh.
+    for (int i = 0; i < 7; ++i) t.failed(B, 300);
+    CHECK(t.wait_s(B, 300) > 0);
+    CHECK(t.wait_s(B, 300 + kLoginForgetS) == 0);
+    t.failed(B, 300 + kLoginForgetS + 1);
+    CHECK(t.wait_s(B, 300 + kLoginForgetS + 1) == 0);
+    // Many places: past 30 wrong passwords in ten minutes, everyone waits.
+    LoginThrottle<3> g;
+    g.clear();
+    for (uint32_t i = 0; i < kLoginGlobalMax; ++i) g.failed(1000 + i, 5000);
+    CHECK(g.wait_s(99, 5000) == 0);
+    g.failed(2000, 5001);
+    CHECK(g.wait_s(99, 5001) == kLoginGlobalWaitS);
+    CHECK(g.wait_s(99, 5001 + kLoginGlobalWaitS) == 0);
+    // Spread out, they never add up to that.
+    LoginThrottle<3> s;
+    s.clear();
+    for (uint32_t i = 0; i < 100; ++i) s.failed(3000 + i, 10000 + i * 30);
+    CHECK(s.wait_s(77, 10000 + 100 * 30) == 0);
+}
+
+static void test_mac_rule() {
+    Mac setup{}, m{};
+    mac_parse("D4:E9:F4:A3:B8:AD", setup);
+    CHECK(mac_rule("02:1A:2B:3C:4D:5E", setup, m) == MacRule::Ok);
+    char out[18];
+    mac_format(m, out);
+    CHECK_STR(out, "02:1A:2B:3C:4D:5E");
+    CHECK(mac_rule("d4e9f4a3b8ac", setup, m) == MacRule::Ok);    // a maker's address may be copied
+    CHECK(mac_rule("01:00:5E:00:00:01", setup, m) == MacRule::Group);
+    CHECK(mac_rule("FF:FF:FF:FF:FF:FF", setup, m) == MacRule::Group);
+    CHECK(mac_rule("00:00:00:00:00:00", setup, m) == MacRule::Zero);
+    CHECK(mac_rule("D4:E9:F4:A3:B8:AD", setup, m) == MacRule::SetupClash);
+    CHECK(mac_rule("02:1A:2B:3C:4D", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule("", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule("zz:1A:2B:3C:4D:5E", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule_text(MacRule::Group)[0] != '\0');
+    CHECK_STR(mac_rule_text(MacRule::Ok), "");
+    for (uint32_t i = 0; i < 64; ++i) {
+        const Mac r = mac_random_local(i * 2654435761u, ~i * 40503u);
+        CHECK((r.b[0] & 0x03) == 0x02);   // locally administered, one device
+        char t[18];
+        mac_format(r, t);
+        Mac back{};
+        CHECK(mac_rule(t, setup, back) == MacRule::Ok);
+    }
+}
+
 int main() {
     test_mac();
     test_event_log();
@@ -2595,11 +3037,19 @@ int main() {
     test_link_arg();
     test_link_cut();
     test_link_pairing();
+    test_link_pair_why();
+    test_link_parse_auth();
     test_clock();
     test_http_date();
     test_report_slots();
     test_report_rows();
     test_report_lines();
+    test_sha256();
+    test_auth_sessions();
+    test_auth_headers();
+    test_auth_password();
+    test_auth_throttle();
+    test_mac_rule();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

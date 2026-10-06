@@ -14,6 +14,9 @@
 
 #include "../core/ble_link.h"
 
+// Pairing is started by the phone, never by the board: see ble_link.cpp for
+// why. From 0.13 every request also carries the app's session, as over Wi-Fi.
+//
 // The service and its two characteristics. The last six bytes spell
 // "netmon" in ASCII; the rest is random.
 #define NETMON_LINK_SERVICE "4e4d0001-9c2b-4d8e-a1f3-6e65746d6f6e"
@@ -67,9 +70,31 @@ void ble_link_tick();
 // Opens the pairing window, or keeps the open one going; see ble_link.h in
 // core. Closes it with `open` false.
 void ble_link_pair(bool open);
-// The window as it stands: whether it is open, its code, time left and how
-// the last attempt went.
-bool ble_link_pairing(char code[7], uint32_t& left_ms, const char*& result, uint32_t& result_age_s);
+
+// The owner's own pairing code, 0 to 999999, or -1 for a new random code
+// each window. A change closes any window open with the old code.
+void ble_link_set_code(int32_t fixed);
+
+// The window as it stands, and how the last attempt went, in a window or not.
+struct LinkPairing {
+    char code[7];               // while open
+    uint32_t left_ms;
+    const char* result;         // the last attempt in a window: "paired", "failed" or ""
+    const char* why;            // ... its PairWhy key: "wrong_code", "dropped", ...
+    const char* why_text;       // ... in words
+    uint32_t result_age_s;
+    uint8_t tries_left;         // failed attempts the open window still takes
+    const char* last_why;       // the last attempt of all, window or not
+    const char* last_text;
+    int32_t last_status;        // the stack's own number for how it ended
+    bool last_in_window;
+    uint32_t last_age_s;
+};
+bool ble_link_pairing(LinkPairing& out);
+
+// A phone is pairing now: a window is open and a connection has not yet
+// encrypted. The Nearby scans keep off the radio meanwhile.
+bool ble_link_pairing_now();
 
 // Forgets every paired phone. Connections still open are dropped once their
 // answers have gone, the one asking included.

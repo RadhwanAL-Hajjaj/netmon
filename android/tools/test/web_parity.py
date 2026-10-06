@@ -191,7 +191,9 @@ def run(js, env=None):
 
 
 def script(page):
-    return re.search(r'<script>(.*?)</script>', page, re.S).group(1)
+    # Every script of the page in order: from firmware 0.13 the shared head
+    # carries one of its own (the sign-in redirect) before the page's.
+    return '\n'.join(re.findall(r'<script>(.*?)</script>', page, re.S))
 
 
 def ids(page):

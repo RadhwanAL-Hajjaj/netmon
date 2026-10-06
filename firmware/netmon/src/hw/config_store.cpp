@@ -10,6 +10,7 @@
 #include <ArduinoJson.h>
 
 #include "../core/air_plan.h"
+#include "../core/mac.h"
 
 static const char* kPath = "/config.json";
 
@@ -27,6 +28,8 @@ void settings_defaults(Settings& s) {
     s.air_ble = true;
     s.air_background_s = 120;
     s.ble_link = true;
+    s.ble_pin = -1;
+    s.wifi_mac_set = false;
 }
 
 bool settings_load(Settings& s) {
@@ -78,6 +81,13 @@ bool settings_load(Settings& s) {
     if (!air_background_valid(s.air_background_s)) s.air_background_s = 120;
     // Absent before 0.12.0: on, like a new board.
     s.ble_link = doc["ble_link"] | true;
+    // Absent before 0.13.0: random codes, and the chip's own Wi-Fi address.
+    s.ble_pin = doc["ble_pin"] | -1;
+    if (s.ble_pin < -1 || s.ble_pin > 999999) s.ble_pin = -1;
+    Mac m{};
+    const char* mac = doc["wifi_mac"] | "";
+    s.wifi_mac_set = mac[0] != '\0' && mac_parse(mac, m) && (m.b[0] & 0x01) == 0;
+    if (s.wifi_mac_set) memcpy(s.wifi_mac, m.b, sizeof(s.wifi_mac));
     return true;
 }
 
@@ -104,6 +114,14 @@ bool settings_save(const Settings& s) {
     doc["air_ble"] = s.air_ble;
     doc["air_background_s"] = s.air_background_s;
     doc["ble_link"] = s.ble_link;
+    doc["ble_pin"] = s.ble_pin;
+    if (s.wifi_mac_set) {
+        Mac m{};
+        memcpy(m.b, s.wifi_mac, sizeof(m.b));
+        char t[18];
+        mac_format(m, t);
+        doc["wifi_mac"] = t;
+    }
 
     File f = LittleFS.open(kPath, "w");
     if (!f) {

@@ -63,7 +63,97 @@
 "dt{color:var(--mut)}" \
 "dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;" \
 "overflow-wrap:anywhere}" \
-"</style>"
+"</style>" \
+"<script>" \
+/* From 0.13 every request needs signing in. A session that ends while a */ \
+/* page is open shows as a 401 marked X-Netmon-Login on whatever the page */ \
+/* asks next; the page then goes to the sign-in page, which brings it back. */ \
+"(function(){var f=window.fetch;if(!f)return;" \
+"window.fetch=function(){return f.apply(this,arguments).then(function(r){" \
+"if(r.status==401&&r.headers.get('X-Netmon-Login')){nmlogin();return new Promise(function(){})}" \
+"return r})}})();" \
+"function nmlogin(){location.href='/login?next='+encodeURIComponent(location.pathname+location.search)+location.hash}" \
+"function nmsignout(){var go=function(){location.href='/login'};" \
+"fetch('/api/logout',{method:'POST'}).then(go,go)}" \
+"</script>"
+
+// The one page served without a session. "Remember me" asks the board for a
+// session that lasts 30 days and a cookie that outlives the browser; the
+// browser's own password manager offers to save the password, which the
+// autocomplete names below let it do.
+static const char LOGIN_HTML[] PROGMEM =
+"<!doctype html><title>Sign in - Network Monitor</title>"
+NM_HEAD
+R"HTML(<style>
+.in{max-width:23rem;margin:0 auto;padding:2rem 1rem 1.4rem}
+h1{margin:0;font-size:1.3rem;font-weight:600;letter-spacing:-.02em}
+.who{margin:.3rem 0 0;color:var(--mut);font-size:.88rem;overflow-wrap:anywhere}
+.pw{display:flex;gap:.4rem}.pw input{flex:1;min-width:0}.pw button{flex:none}
+label.keep{display:flex;align-items:flex-start;gap:.55rem;margin:1rem 0 1.1rem;
+ font-size:.9rem;color:var(--ink);cursor:pointer}
+.keep input{width:auto;margin:.2rem 0 0;padding:0;flex:none}
+#err{margin:.85rem 0 0;font-size:.88rem;color:var(--bad)}#err:empty{display:none}
+button.primary:disabled{opacity:.6;cursor:default}
+</style>
+<div class=sh>
+<header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a></header>
+<form class=in id=f>
+<h1>Sign in</h1>
+<p class=who id=who>to this network monitor</p>
+<input id=user name=username autocomplete=username value=netmon hidden>
+<label for=pw>Password</label>
+<div class=pw><input id=pw name=password type=password autocomplete=current-password
+ autocapitalize=off spellcheck=false autofocus>
+<button type=button id=peek aria-pressed=false>Show</button></div>
+<label class=keep><input type=checkbox id=keep><span id=keeptext>Remember me on this
+ browser for 30 days</span></label>
+<button class=primary id=go>Sign in</button>
+<p id=err role=alert></p>
+<p class=hint>Your login password, or the board's update password from secrets.h,
+which always works. Unticked, you stay signed in until the browser closes.</p>
+</form>
+</div>
+<script>
+var busy=false,waitT=0,nx='/';
+// Back to the page that sent you here, but only to a page on this board:
+// "//elsewhere" and "/\elsewhere" would leave it, and browsers drop tabs and
+// line breaks from an address before reading it.
+(function(){var m=location.search.match(/[?&]next=([^&#]*)/),v='';
+ if(m)try{v=decodeURIComponent(m[1])}catch(e){}
+ if(/^\/(?![\/\\])[^\\\x00-\x20\x7f]*$/.test(v))nx=v;
+ if(/^\/login\b/.test(nx))nx='/';
+ if(location.hash&&nx.indexOf('#')<0)nx+=location.hash})();
+function say(m){err.textContent=m||''}
+peek.onclick=function(){var s=pw.type=='password';pw.type=s?'text':'password';
+ peek.textContent=s?'Hide':'Show';peek.setAttribute('aria-pressed',s);pw.focus()};
+try{keep.checked=localStorage.getItem('nm.keep')=='1'}catch(e){}
+fetch('/api/auth',{cache:'no-store'}).then(function(r){return r.json()}).then(function(a){
+ if(a.signed_in){location.replace(nx);return}
+ ver.textContent=a.version||'';who.textContent=(a.name||'netmon')+' at '+location.host;
+ if(a.remember_days)keeptext.textContent='Remember me on this browser for '+a.remember_days+' days'})
+ .catch(function(){say('Could not reach the board.')});
+// After too many wrong passwords the board says how long to wait.
+function hold(s){var end=Date.now()+s*1000;go.disabled=true;clearInterval(waitT);
+ function tick(){var l=Math.ceil((end-Date.now())/1000);
+  if(l>0){say('Too many wrong passwords. Try again in '+l+' s.');return}
+  clearInterval(waitT);go.disabled=false;say('')}
+ tick();waitT=setInterval(tick,1000)}
+f.onsubmit=function(e){e.preventDefault();if(busy||go.disabled)return;
+ if(!pw.value){say('Enter the password.');pw.focus();return}
+ busy=true;go.disabled=true;go.textContent='Signing in…';say('');
+ try{localStorage.setItem('nm.keep',keep.checked?'1':'0')}catch(x){}
+ fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({password:pw.value,remember:keep.checked,unix:Math.floor(Date.now()/1000)})})
+ .then(function(r){return r.json().catch(function(){return {}}).then(function(j){return {s:r.status,j:j}})})
+ .then(function(x){busy=false;go.textContent='Sign in';
+  if(x.s==200){location.replace(nx);return}
+  go.disabled=false;
+  if(x.s==429){hold(x.j.retry_s||30);return}
+  say(x.j.error||'The board refused ('+x.s+').');pw.select()})
+ .catch(function(){busy=false;go.disabled=false;go.textContent='Sign in';
+  say('Could not reach the board.')})};
+</script>
+)HTML";
 
 static const char DASHBOARD_HTML[] PROGMEM =
 "<!doctype html><title>Network Monitor</title>"
@@ -128,7 +218,7 @@ tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
 <div class=wrap id=wrap><table id=tbl><colgroup id=cg></colgroup>
 <thead><tr id=hrow></tr></thead><tbody id=rows></tbody></table></div>
 <p class=none id=none hidden></p>
-<p class=foot><a href="/events">Event history</a> · <a href="/api/health">Health data</a></p>
+<p class=foot><a href="/events">Event history</a> · <a href="/api/health">Health data</a> · <a href="/login" onclick="nmsignout();return false">Sign out</a></p>
 </div>
 <script>
 // Floors are measured from the widest real value each column has to hold:
@@ -310,6 +400,11 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  text-decoration:none;background:var(--bg);color:inherit;white-space:nowrap}
 #repmsg{margin:.75rem 0 0;font-size:.85rem}#repmsg:empty{display:none}
 #repmsg.err{color:var(--bad)}#repmsg.ok{color:var(--ok)}
+#btcodemsg,#authmsg{margin:.75rem 0 0;font-size:.85rem}#btcodemsg:empty,#authmsg:empty{display:none}
+#btcodemsg.err,#authmsg.err{color:var(--bad)}#btcodemsg.ok,#authmsg.ok{color:var(--ok)}
+#btcodemsg.warn{color:var(--warn)}
+#btown{max-width:10rem;font:600 1.1rem var(--mono);letter-spacing:.14em}
+#macin{font-family:var(--mono)}
 </style>
 <div class=sh>
 <header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a><nav><a href="/">Devices</a><a href="/map">Map</a><a href="/nearby">Nearby</a><a href="/events">Events</a><a href="/isp">Internet</a>
@@ -352,6 +447,18 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  </div>
  <p class=hint id=acthead>In use right now</p>
  <dl id=act></dl>
+ <div id=macbox hidden>
+  <label for=macin>MAC address on Wi-Fi</label>
+  <input id=macin autocomplete=off spellcheck=false autocapitalize=characters oninput=machint()>
+  <div class=btrow><button type=button onclick=macrand()>Random address</button>
+  <button type=button onclick=macown()>The chip's own</button></div>
+  <p class=hint id=machelp></p>
+  <p class=hint>A new address is taken at the restart after saving. The router
+  then sees a new device and may give the board a new IP address: if this page
+  does not come back, find netmon in the router's list of devices, or try
+  http://netmon.local. The Bluetooth address stays the same, so paired phones
+  stay paired.</p>
+ </div>
 </section>
 <section>
  <h2>DHCP information</h2>
@@ -389,6 +496,21 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  <button type=button id=btonoff onclick=btswitch()>Switch off</button>
  <button type=button id=btforget onclick=btforgetall()>Forget paired phones</button></div>
  <p id=btmsg></p>
+ <div id=btcodebox hidden>
+  <label for=btmode>Pairing code</label>
+  <select id=btmode onchange=btmodeset()>
+   <option value=random>A new random code for each pairing</option>
+   <option value=own>My own code, the same every time</option>
+  </select>
+  <div id=btownbox hidden><label for=btown>Your code: six digits</label>
+  <input id=btown inputmode=numeric autocomplete=off maxlength=6 placeholder="000000" oninput="btedit=true"></div>
+  <p class=hint>Whichever you choose, a phone can pair only while a pairing
+  window is open, and three wrong codes close it. Your own code is easier to
+  enter on a phone that cannot see this page; keep it to yourself, and avoid
+  ones like 000000 or 123456.</p>
+  <div class=btrow><button type=button id=btcodebtn onclick=btcodesave()>Save pairing code</button></div>
+  <p id=btcodemsg></p>
+ </div>
 </section>
 <section>
  <h2>Saved reports</h2>
@@ -401,6 +523,26 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  <p class=hint id=repnote>Reading&hellip;</p>
  <div class=btrow><button type=button id=repsave onclick=repsavenow()>Save this network now</button></div>
  <p id=repmsg></p>
+</section>
+<section>
+ <h2>Signing in</h2>
+ <p class=hint>These pages and the netmon app ask for a password: your own
+ login password once you set one here, and always the update password from
+ secrets.h, as the way back in if you forget yours.</p>
+ <dl id=authinfo><dt>This browser</dt><dd>Reading&hellip;</dd></dl>
+ <div class=btrow><button type=button onclick=nmsignout()>Sign out</button>
+ <button type=button id=soall onclick=signoutall()>Sign out everywhere</button></div>
+ <label for=pwcur>Current password</label>
+ <input id=pwcur type=password autocomplete=current-password>
+ <label for=pwnew>New login password</label>
+ <input id=pwnew type=password autocomplete=new-password>
+ <label for=pwnew2>New login password again</label>
+ <input id=pwnew2 type=password autocomplete=new-password>
+ <p class=hint>8 to 64 characters. Every other browser and phone signed in is
+ signed out, so they sign in again with the new one.</p>
+ <div class=btrow><button type=button id=pwbtn onclick=setpw()>Set login password</button>
+ <button type=button id=pwdel onclick=delpw() hidden>Remove it</button></div>
+ <p id=authmsg></p>
 </section>
 <section>
  <h2>Firmware update</h2>
@@ -464,8 +606,39 @@ function loadcfg(){fetch('/api/config').then(function(r){return r.json()})
     +'automatic unless you know the new network uses fixed addresses — a '
     +'fixed address from somewhere else will leave the board unreachable. '
     +'Left alone for three minutes, it restarts and tries its saved networks again.'}
-  showactive(c.active)})
+  showactive(c.active);macshow(c.mac)})
  .catch(function(){show('Could not read the current settings.')})}
+// The board's own Wi-Fi address (0.13): the chip's, or one the owner sets.
+// Empty or the chip's own both mean the chip's own.
+var macnow=null;
+function macnorm(v){var h=v.trim().replace(/[:.\-]/g,'');
+ return /^[0-9a-f]{12}$/i.test(h)?h.toUpperCase().match(/../g).join(':'):''}
+function macshow(m){macnow=m||null;macbox.hidden=!m;if(!m)return;
+ macin.value=m.custom||m.factory;machint()}
+function machint(){var m=macnow;if(!m)return;
+ var v=macin.value.trim()?macnorm(macin.value):m.factory,saved=m.custom||m.factory;
+ machelp.textContent=!v?'Six pairs of hex digits, like 02:1A:2B:3C:4D:5E. Empty means the chip\'s own.'
+  :v!=saved?'Not saved yet: the board takes '+v+' when you save and it restarts.'
+  :m.custom&&m.active==m.custom?'Your own address, in use now. The chip\'s own is '+m.factory+'.'
+  :m.custom?'Saved, and taken at the next restart. In use now: '+m.active+'.'
+  :'The chip\'s own address. Enter another, or make a random one, and the router sees this board as a new device.'}
+function macrand(){var b=new Uint8Array(6),i;
+ try{crypto.getRandomValues(b)}catch(e){for(i=0;i<6;i++)b[i]=Math.random()*256|0}
+ // Locally administered (bit 1 set) and for one device (bit 0 clear), so it
+ // cannot be any manufacturer's.
+ b[0]=b[0]&0xFC|2;
+ macin.value=[].map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join(':').toUpperCase();
+ machint()}
+function macown(){if(macnow){macin.value=macnow.factory;machint()}}
+// What save() sends to /api/mac: null for no change, '' for the chip's own,
+// or the new address; a string starting with '!' is what is wrong with it.
+function macwant(){var m=macnow;if(!m)return null;
+ var t=macin.value.trim(),v=t?macnorm(t):m.factory;
+ if(!v)return '!Enter a MAC address like 02:1A:2B:3C:4D:5E, or leave it empty for the chip\'s own.';
+ if(parseInt(v.slice(0,2),16)&1)return '!That is a group (multicast) address; the first pair of digits must be even.';
+ if(v=='00:00:00:00:00:00')return '!00:00:00:00:00:00 is not a usable address.';
+ if(v==(m.custom||m.factory))return null;
+ return v==m.factory?'':v}
 function doscan(){show('Scanning');
  fetch('/api/scan').then(function(r){return r.json()}).then(function(n){
   ssidsel.innerHTML='';
@@ -475,7 +648,9 @@ function doscan(){show('Scanning');
   if(n.length){ssid.value=n[0].ssid}
   show(n.length?n.length+' networks in range':'No networks found',n.length>0)})
  .catch(function(){show('Wi-Fi scan failed or is busy. DHCP capture is paused during the scan; try again in a few seconds.')})}
-function save(){show('Saving');
+function save(){var mac=macwant();
+ if(mac&&mac.charAt(0)=='!'){show(mac.slice(1));macin.focus();return}
+ show('Saving');
  fetch('/api/config',{method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({ssid:ssid.value,pass:pass.value,
@@ -485,7 +660,16 @@ function save(){show('Saving');
  .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
  .then(function(res){
   if(!res.ok){show(res.j.error);return}
-  show('Saved. Restarting now.',true);
+  if(mac===null)return res;
+  // The address goes second: a setting the board refused leaves it as it was.
+  return fetch('/api/mac',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({mac:mac})})
+  .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})})
+ .then(function(res){
+  if(!res)return;
+  if(!res.ok){show(res.j.error);return}
+  show(mac===null?'Saved. Restarting now.':'Saved. Restarting now with '
+   +(mac||'the chip\'s own address')+'. If this page does not come back within a minute, the board has a new IP address.',true);
   fetch('/api/reboot',{method:'POST'})})
  .catch(function(){show('Could not save. The board may have restarted already.')})}
 var nets=[],armed=null,armT=0;
@@ -587,6 +771,8 @@ function sendfw(key){var x=new XMLHttpRequest(),fd=new FormData(),t0=Date.now();
  x.onload=function(){var j={};try{j=JSON.parse(x.responseText)}catch(e){}
   if(x.status==200){fwfill.style.width='100%';
    fwsay('Installed. The board is restarting\u2026','ok');waitback(t0);return}
+  // Signed out meanwhile: XMLHttpRequest goes past the fetch() wrapper.
+  if(x.status==401&&x.getResponseHeader('X-Netmon-Login')){nmlogin();return}
   busy=false;fwbtn.disabled=false;fwbar.hidden=true;
   fwsay(x.status==401?'Wrong update password.':(j.error||'The board rejected the file.'),'err')};
  x.onerror=function(){
@@ -616,27 +802,56 @@ function waitback(t0){setTimeout(function poll(){
    setTimeout(poll,2000)})},4000)}
 // Bluetooth. Polled every two seconds while a pairing window is open, so the
 // countdown runs and "paired" shows as soon as the phone is done.
-var bt=null,btT=0,btarm=null,btarmT=0;
-function btsay(m,c){btmsg.textContent=m;btmsg.className=c||''}
+var bt=null,btT=0,btarm=null,btarmT=0,btauto=false,btedit=false;
+function btsay(m,c){btmsg.textContent=m;btmsg.className=c||'';btauto=false}
 function mmss(s){return Math.floor(s/60)+':'+('0'+s%60).slice(-2)}
+// How the last pairing attempt went. From 0.13 the board says why one failed:
+// a wrong code, the phone giving up, the connection dropping.
+function btlast(l){return l.text.replace(/\.$/,'')+' \u00b7 '+agetext(l.age_s)
+ +(l.status?' \u00b7 code 0x'+(l.status>>>0).toString(16):'')}
 function btshow(b){bt=b;
  var state=!b.available?'Not running: Bluetooth could not start on this board'
   :!b.enabled?'Off':'On, advertising as '+b.name;
  btinfo.innerHTML=row('Link',state)+row('Address',b.addr||'-')
   +row('Paired phones',b.bonds+' of '+b.max_bonds)
-  +row('Connected now',b.connected?b.connected+(b.secure<b.connected?' ('+b.secure+' paired)':''):'none');
+  +row('Connected now',b.connected?b.connected+(b.secure<b.connected?' ('+b.secure+' paired)':''):'none')
+  +(b.own_code==null?'':row('Pairing code',b.own_code?'Your own':'New random code each time'))
+  +(b.last?row('Last attempt',btlast(b.last)):'');
  btonoff.textContent=b.enabled?'Switch off':'Switch on';
  btpair.disabled=!b.available||!b.enabled;
  btpair.textContent=b.pairing?'Cancel pairing':'Pair a phone';
  btcode.hidden=!b.pairing;
+ var m='',c='';
  if(b.pairing){btdigits.textContent=b.code.slice(0,3)+' '+b.code.slice(3);
-  btsteps.textContent='In the netmon app choose Settings, Bluetooth, Pair this phone, or tap '
-   +'this board under Bluetooth when finding a monitor. When the phone asks, type this code. '
-   +'It works for one phone, for the next '+mmss(b.left_s)+'.'}
- else if(b.result=='paired'&&b.result_age_s<120)btsay('Paired. That phone can now use the app over Bluetooth.','ok');
- else if(b.result=='failed'&&b.result_age_s<120)btsay('Pairing failed: a wrong code, or the phone gave up. '
-  +'Pair again for a new code.','err');
+  btsteps.textContent='In the netmon app, tap this board under Bluetooth when finding a monitor, '
+   +'or Pair this phone in Settings, Bluetooth, and enter this code when the app asks for it. '
+   +'It works for one phone, for the next '+mmss(b.left_s)+'.'
+   +(b.tries_left!=null&&b.tries_left<3?' '+b.tries_left+(b.tries_left==1?' try':' tries')+' left.':'');
+  if(b.result=='failed'){m='That try did not pair: '+(b.why_text||'pairing failed.')
+   +' The window is still open with the same code.';c='err'}}
+ else if(b.result=='paired'&&b.result_age_s<120){m='Paired. That phone can now use the app over Bluetooth.';c='ok'}
+ else if(b.result=='failed'&&b.result_age_s<120){m='Pairing failed: '
+  +(b.why_text||'a wrong code, or the phone gave up.')
+  +(b.tries_left===0?' Three tries failed, so the window closed.':'')+' Pair again to try again.';c='err'}
+ // Messages of its own replace one the page put up after a tap; only the
+ // ones from here go away again by themselves.
+ if(m){btsay(m,c);btauto=true}else if(btauto)btsay('');
+ btcodebox.hidden=b.own_code==null;
+ if(!btedit){btmode.value=b.own_code?'own':'random';btown.value=b.own||'';btownbox.hidden=!b.own_code}
  clearTimeout(btT);btT=setTimeout(loadble,b.pairing?2000:10000)}
+// The owner's own pairing code (0.13), or a new random one each window.
+function btmodeset(){btedit=true;btownbox.hidden=btmode.value!='own';
+ if(btmode.value=='own'){btown.focus()}}
+function btweak(c){return /^(\d)\1{5}$/.test(c)||'0123456789'.indexOf(c)>=0||'9876543210'.indexOf(c)>=0}
+function btcodesay(m,c){btcodemsg.textContent=m;btcodemsg.className=c||''}
+function btcodesave(){var own=btmode.value=='own'?btown.value.replace(/\s/g,''):'';
+ if(btmode.value=='own'&&!/^\d{6}$/.test(own)){btcodesay('The code needs exactly six digits.','err');btown.focus();return}
+ btcodebtn.disabled=true;btcodesay('');
+ btpost('/api/ble',{own:own}).then(function(b){btcodebtn.disabled=false;btedit=false;btshow(b);
+  if(!own)btcodesay('Saved. Each pairing window gets a new random code.','ok');
+  else if(btweak(own))btcodesay('Saved, though '+own+' is easy to guess. A code nobody would try first is safer.','warn');
+  else btcodesay('Saved. Pairing windows use your code from now on.','ok')})
+ .catch(function(e){btcodebtn.disabled=false;btcodesay(typeof e=='string'?e:'Could not reach the board.','err')})}
 function loadble(){fetch('/api/ble').then(function(r){if(!r.ok)throw r.status;return r.json()})
  .then(btshow)
  .catch(function(e){btinfo.innerHTML=row('Link',e==404?'Needs firmware 0.12 or later':'Unavailable');
@@ -726,7 +941,50 @@ reprows.onclick=function(e){var t=e.target.closest&&e.target.closest('button');i
  repdisarm();repsay('');
  btpost('/api/reports/delete',{slot:r.slot}).then(function(l){showreps(l);repsay('Deleted.','ok')})
  .catch(function(x){repsay(typeof x=='string'?x:'Could not reach the board.','err')})};
-loadcfg();loadnets();loaddhcp();loadble();loadreps();
+// Signing in (0.13).
+var soarm=false,soarmT=0,pwarm=false,pwarmT=0;
+function authsay(m,c){authmsg.textContent=m;authmsg.className=c||''}
+function loadauth(){fetch('/api/auth',{cache:'no-store'}).then(function(r){return r.json()})
+ .then(function(a){
+  authinfo.innerHTML=row('This browser',a.remembered?'Signed in, remembered for '+a.remember_days+' days'
+    :'Signed in until the browser closes, or 12 hours unused')
+   +row('Password',a.own_password?'Your login password, or the update password'
+    :'The update password from secrets.h')
+   +row('Signed in now',a.sessions+(a.sessions==1?' browser or phone':' browsers and phones'));
+  pwbtn.textContent=a.own_password?'Change login password':'Set login password';
+  pwdel.hidden=!a.own_password})
+ .catch(function(){authinfo.innerHTML=row('Status','Unavailable')})}
+function signoutall(){
+ if(!soarm){soarm=true;soall.textContent='Confirm: this browser too';soall.className='arm';
+  soarmT=setTimeout(function(){soarm=false;soall.textContent='Sign out everywhere';soall.className=''},4000);return}
+ clearTimeout(soarmT);
+ var go=function(){location.href='/login'};
+ fetch('/api/auth/signout',{method:'POST'}).then(go,go)}
+function pwsend(cur,nw){pwbtn.disabled=pwdel.disabled=true;authsay('');
+ fetch('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({current:cur,new:nw})})
+ .then(function(r){return r.json().catch(function(){return {}}).then(function(j){return {s:r.status,j:j}})})
+ .then(function(x){pwbtn.disabled=pwdel.disabled=false;
+  if(x.s!=200){authsay(x.j.error||'The board refused ('+x.s+').','err');return}
+  pwcur.value=pwnew.value=pwnew2.value='';
+  authsay((nw?'Login password set.':'Login password removed: the update password signs in.')
+   +(x.j.ended?' '+x.j.ended+(x.j.ended==1?' other browser or phone was':' other browsers and phones were')
+    +' signed out.':''),'ok');
+  loadauth()})
+ .catch(function(){pwbtn.disabled=pwdel.disabled=false;authsay('Could not reach the board.','err')})}
+function setpw(){
+ if(!pwcur.value){authsay('Enter the current password first: your login password or the update password.','err');pwcur.focus();return}
+ if(!pwnew.value){authsay('Enter the new password.','err');pwnew.focus();return}
+ if(pwnew.value!==pwnew2.value){authsay('The two new passwords are not the same.','err');pwnew2.focus();return}
+ pwsend(pwcur.value,pwnew.value)}
+// Two taps, like the other buttons that take something away.
+function delpw(){
+ if(!pwcur.value){authsay('Enter the current password first.','err');pwcur.focus();return}
+ if(!pwarm){pwarm=true;pwdel.textContent='Confirm';pwdel.className='arm';
+  pwarmT=setTimeout(function(){pwarm=false;pwdel.textContent='Remove it';pwdel.className=''},4000);return}
+ clearTimeout(pwarmT);pwarm=false;pwdel.textContent='Remove it';pwdel.className='';
+ pwsend(pwcur.value,'')}
+loadcfg();loadnets();loaddhcp();loadble();loadreps();loadauth();
 setInterval(function(){if(!busy)loaddhcp()},10000);
 setInterval(function(){if(!busy)loadreps()},60000);
 </script>

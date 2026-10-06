@@ -3,6 +3,9 @@ router, the internet and an access point; offline devices; grouping by
 status; the Devices page search it links to; keyboard; phone width."""
 import asyncio, json, sys
 from playwright.async_api import async_playwright
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import signin
 BASE = "http://127.0.0.1:8765"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "shots"
 
@@ -17,7 +20,7 @@ async def main():
     async with async_playwright() as p:
         b = await p.chromium.launch()
         for scheme in ("light", "dark"):
-            ctx = await b.new_context(viewport={"width": 1100, "height": 1000}, color_scheme=scheme)
+            ctx = await signin.context(b, viewport={"width": 1100, "height": 1000}, color_scheme=scheme)
             page = await ctx.new_page()
             page.on("pageerror", lambda e, s=scheme: errors.append(("pageerror", s, str(e))))
             page.on("console", lambda m, s=scheme: m.type == "error" and errors.append(("console", s, m.text)))
@@ -96,7 +99,7 @@ async def main():
                                      await page.eval_on_selector_all("#rows tr", "r => r.length")]
             await ctx.close()
         # Phone.
-        ctx = await b.new_context(viewport={"width": 360, "height": 780}, device_scale_factor=2,
+        ctx = await signin.context(b, viewport={"width": 360, "height": 780}, device_scale_factor=2,
                                   is_mobile=True, has_touch=True)
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror", "phone", str(e))))

@@ -15,6 +15,16 @@ uint32_t wifi_dns();
 Mac wifi_mac();
 const char* wifi_current_ssid();
 
+// The chip's own Wi-Fi addresses, burned in at the factory: the station's,
+// which the board goes by unless the owner sets another (0.13), and the
+// setup network's, which any address set must differ from.
+Mac wifi_factory_mac();
+Mac wifi_factory_ap_mac();
+
+// Whether the address the owner set was taken at start-up. False when none
+// was set, or the Wi-Fi stack refused it and the chip's own is in use.
+bool wifi_custom_mac_applied();
+
 // How a remembered network fared when the board last started. NotTried means
 // an earlier network in the list joined first; Failed means it was in range
 // but the connection did not complete; Refused means the key was rejected.

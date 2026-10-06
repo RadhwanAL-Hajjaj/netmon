@@ -17,7 +17,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *  - the address used last time,
  *  - the board's mDNS adverts (_http._tcp, added in 0.9.x, and ArduinoOTA's
  *    _arduino._tcp), which Android can browse but does not resolve as a name,
- *  - a sweep of the phone's subnet asking every address for /api/health.
+ *  - a sweep of the phone's subnet asking every address what it is
+ *    (/api/auth from firmware 0.13, which answers without signing in;
+ *    /api/health before that).
  * Whatever answers like a netmon board is reported once, on the main thread.
  */
 class Discovery(context: Context, private val listener: Listener) {
@@ -28,7 +30,8 @@ class Discovery(context: Context, private val listener: Listener) {
         fun onFinished(foundAny: Boolean)
     }
 
-    data class Found(val base: String, val version: String, val via: String)
+    /** [login]: the board asks for a password (firmware 0.13 and later). */
+    data class Found(val base: String, val version: String, val via: String, val login: Boolean = false)
 
     private val app = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
@@ -103,7 +106,7 @@ class Discovery(context: Context, private val listener: Listener) {
             c.readTimeoutMs = 4000
         }
         val h = c.identify() ?: return
-        report(Found(c.base, h.version, via))
+        report(Found(c.base, h.version, via, h.login))
     }
 
     private fun report(f: Found) {
@@ -204,7 +207,7 @@ class Discovery(context: Context, private val listener: Listener) {
             c.connectTimeoutMs = 4000
             c.readTimeoutMs = 6000
             val h = c.identify() ?: return null
-            return Found(c.base, h.version, "entered")
+            return Found(c.base, h.version, "entered", h.login)
         }
     }
 }

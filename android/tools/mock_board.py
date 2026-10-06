@@ -5,8 +5,11 @@ Answers every endpoint the firmware serves, with bodies shaped exactly like
 netmon.ino builds them (field names, order, types), accepts firmware uploads
 the way the ESP32 WebServer does, and simulates the restart that follows.
 Test hooks:  GET /__log  (requests seen)   POST /__reset   POST /__mode?x=...
-             POST /__fw?v=0.9|0.11|0.12  (0.11 adds update_max, Nearby, the Finder and the map;
-                                          0.12 the Bluetooth link's endpoints, saved reports and the clock)
+             POST /__fw?v=0.9|0.11|0.12|0.13  (0.11 adds update_max, Nearby, the Finder and the map;
+                                          0.12 the Bluetooth link's endpoints, saved reports and the clock;
+                                          0.13 signing in: every /api/ call but /api/auth, /api/login and
+                                          /api/logout wants a session, from the update key or LOGIN_PW)
+             POST /__auth?expire=1  (every session ends, as after "Sign out everywhere")
              POST /__find?idle=1    (the Finder forgets its device, as after 15 s unasked)
              POST /__find?other=1   (another page takes the Finder for another device)
 """
@@ -34,6 +37,11 @@ LOCK = threading.Lock()
 
 V11 = "0.11.0-finder"
 V12 = "0.12.0-bluetooth"
+V13 = "0.13.0-login"
+LOGIN_PW = "login-pass-1"
+# Firmware 0.13: sessions by token, and the wrong-password count.
+AUTH = {"sessions": {}, "fails": 0, "until": 0.0}
+OPEN_PATHS = ("/api/auth", "/api/login", "/api/logout")
 # Firmware 0.12: the Bluetooth link, as GET /api/ble reports it, saved reports and the clock.
 LINK = {"enabled": True, "bonds": 1, "open": 0.0, "code": "", "result": "", "result_at": 0.0}
 CLOCK = {"boot_unix": 0}
@@ -62,7 +70,11 @@ BLE = [
 
 
 def fwv():
-    return {"0.11": 11, "0.12": 12}.get(STATE["fw"], 9)
+    return {"0.11": 11, "0.12": 12, "0.13": 13}.get(STATE["fw"], 9)
+
+
+def v13():
+    return fwv() >= 13
 
 
 def v11():
@@ -80,7 +92,13 @@ def link_status():
             "addr": "D4:E9:F4:12:34:58", "bonds": LINK["bonds"], "max_bonds": 3, "connected": 0, "secure": 0,
             "pairing": live, "code": LINK["code"] if live else "",
             "left_s": int(120 - (now - LINK["open"]) + 0.999) if live else 0, "result": LINK["result"],
-            "result_age_s": int(now - LINK["result_at"]) if LINK["result"] else 0, "served": 0, "via": "wifi"}
+            "result_age_s": int(now - LINK["result_at"]) if LINK["result"] else 0, "served": 0, "via": "wifi",
+            **({"why": "wrong_code" if LINK["result"] == "failed" else "paired" if LINK["result"] else "",
+                "why_text": "The code did not match." if LINK["result"] == "failed" else "",
+                "tries_left": 2 if LINK["result"] == "failed" else 3,
+                "last": {"why": "wrong_code", "text": "The code did not match.", "status": 1284,
+                         "in_window": True, "age_s": 5} if LINK["result"] == "failed" else None,
+                "own_code": False, "own": ""} if v13() else {})}
 
 
 def report_rows(saved_unix):
@@ -256,7 +274,7 @@ def health():
 def version():
     if STATE["version"] != "0.9.6-status-hints":
         return STATE["version"]
-    return V12 if v12() else V11 if v11() else STATE["version"]
+    return V13 if v13() else V12 if v12() else V11 if v11() else STATE["version"]
 
 
 def devices():
@@ -337,15 +355,65 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", headers=()):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for k, v in headers:
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
         self.close_connection = True
+
+    def _token(self):
+        a = self.headers.get("Authorization") or ""
+        return a[7:].strip() if a.lower().startswith("bearer ") else ""
+
+    def _signed_in(self):
+        return self._token() in AUTH["sessions"]
+
+    def _needs_login(self, path):
+        """0.13: answers 401 for an /api/ call without a session; True when it did."""
+        if not v13() or not path.startswith("/api/") or path in OPEN_PATHS or self._signed_in():
+            return False
+        self._send(401, '{"error":"Sign in to the monitor first.","login":true,"netmon":true}',
+                   headers=(("X-Netmon-Login", "required"),))
+        return True
+
+    def _auth_get(self):
+        if not v13():
+            return self._send(404, "not found", "text/plain")
+        out = {"netmon": True, "name": "netmon", "version": version(), "id": "D4:E9:F4:12:34:56", "login": True,
+               "signed_in": self._signed_in(), "remember_days": 30}
+        if self._signed_in():
+            out.update(own_password=True, remembered=AUTH["sessions"][self._token()], sessions=len(AUTH["sessions"]))
+        out["via"] = "wifi"
+        return self._send(200, json.dumps(out))
+
+    def _login(self, body):
+        if time.time() < AUTH["until"]:
+            wait = int(AUTH["until"] - time.time() + 0.999)
+            return self._send(429, '{"error":"Too many wrong passwords. Try again in %d seconds.","retry_s":%d}' % (wait, wait))
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except Exception:
+            return self._send(400, '{"error":"request body is not valid JSON"}')
+        if doc.get("password") not in (KEY, LOGIN_PW):
+            with LOCK:
+                AUTH["fails"] += 1
+                if AUTH["fails"] > 5:
+                    AUTH["until"] = time.time() + 30
+            return self._send(401, '{"error":"That password is not right.","wrong":true}')
+        tok = "%032x" % int.from_bytes(hashlib.sha256(("%f" % time.time()).encode() + body).digest()[:16], "big")
+        with LOCK:
+            AUTH["fails"] = 0
+            AUTH["sessions"][tok] = doc.get("remember") is True
+            if isinstance(doc.get("unix"), int) and not CLOCK["boot_unix"]:
+                CLOCK["boot_unix"] = doc["unix"] - uptime()
+        return self._send(200, json.dumps({"status": "signed in", "token": tok, "remember": doc.get("remember") is True,
+                                           "days": 30 if doc.get("remember") is True else 0}))
 
     def _gate(self):
         with LOCK:
@@ -379,6 +447,10 @@ class H(BaseHTTPRequestHandler):
                 self.connection.close()
             except Exception:
                 pass
+            return
+        if u.path == "/api/auth":
+            return self._auth_get()
+        if self._needs_login(u.path):
             return
         if STATE["mode"] == "badjson" and u.path.startswith("/api/"):
             return self._send(200, "<html>not json</html>", "text/html")
@@ -462,6 +534,7 @@ class H(BaseHTTPRequestHandler):
                                    {"ssid": "Cafe Guest", "pass": ""}])
                 NEARBY.update(wifi=True, ble=True, ble_ready=True, background_s=120)
                 LINK.update(enabled=True, bonds=1, open=0.0, code="", result="", result_at=0.0)
+                AUTH.update(sessions={}, fails=0, until=0.0)
                 CLOCK.update(boot_unix=0)
                 reports_reset()
                 FIND.update(t=None, prev=None, started=0.0, asked=0.0, rd=[], last=0.0,
@@ -487,8 +560,23 @@ class H(BaseHTTPRequestHandler):
             self._body()
             STATE["mode"] = parse_qs(u.query).get("x", ["normal"])[0]
             return self._send(200, "{}")
+        if u.path == "/__auth":
+            self._body()
+            with LOCK:
+                AUTH["sessions"].clear()
+            return self._send(200, "{}")
         if not self._gate():
             self.close_connection = True
+            return
+        if v13() and u.path == "/api/login":
+            return self._login(self._body())
+        if v13() and u.path == "/api/logout":
+            self._body()
+            with LOCK:
+                AUTH["sessions"].pop(self._token(), None)
+            return self._send(200, '{"status":"signed out"}')
+        if self._needs_login(u.path):
+            self._body()
             return
         key = self.headers.get("X-Netmon-Key")
         if u.path == "/api/update/check":

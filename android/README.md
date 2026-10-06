@@ -6,11 +6,12 @@ including the Wi-Fi and Bluetooth radars, the Finder and the network map, plus
 notifications, a longer event history kept on the phone, the board's saved
 reports, and firmware updates from the phone.
 
-Version 1.2.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
+Version 1.3.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
 and later, and shows what each board has: network history needs firmware 0.9.4
 or later, the DHCP listener status 0.9.6, Nearby 0.10, the Finder and the
-access points on the map 0.11, and Bluetooth and saved reports 0.12. On older
-firmware those screens say what they need instead.
+access points on the map 0.11, Bluetooth and saved reports 0.12, and signing
+in 0.13. On older firmware those screens say what they need instead. Firmware
+0.13 needs this version: earlier apps cannot sign in.
 
 ## Install
 
@@ -22,13 +23,32 @@ firmware those screens say what they need instead.
    uninstalling the old one first.
 2. Start netmon. It looks for the monitor three ways at once: the address used
    last time, the board's mDNS adverts, and a sweep of the phone's subnet that
-   asks each address for `/api/health`. Tap the monitor it finds, or type its
-   address (for example `192.168.2.30`).
+   asks each address what it is (`/api/auth`, or `/api/health` before
+   firmware 0.13). Tap the monitor it finds, or type its address (for example
+   `192.168.2.30`).
+3. With firmware 0.13 the app asks for the monitor's password: your login
+   password, or the update password from `secrets.h`. Leave *Save password*
+   on and it signs in again by itself whenever it needs to.
 
 The phone has to be on the same Wi-Fi as the monitor, or paired with it over
 Bluetooth (below). A monitor that could not join Wi-Fi opens its own network,
 `netmon-setup`; join it and the app finds the board at 192.168.4.1 (it keeps
 using Wi-Fi even though that network has no internet).
+
+## Signing in
+
+From firmware 0.13 the monitor wants a session with every request, over
+Wi-Fi and over Bluetooth. The app signs in once, for 30 days. With *Save
+password* on, the password is kept on the phone, encrypted with a key held by
+Android's keystore and readable only by this app, and when a session ends (its
+30 days are up, someone pressed *Sign out everywhere*, the login password
+changed) the app gets a new one by itself; only when it can't, does it ask.
+The saved password is only ever sent to the monitor it belongs to: a new
+address first has to say it is that monitor, by its chip's MAC.
+
+*Settings → Signing in* shows whether the password is saved and how many
+browsers and phones are signed in, and has *Sign out* and *Forget password*.
+The login password itself is set on the monitor's own Settings page.
 
 ## Bluetooth
 
@@ -37,10 +57,14 @@ Bluetooth whenever Wi-Fi can't: walking with the Finder, in setup mode, on
 another network. Every screen works the same; firmware updates stay on Wi-Fi.
 
 - **Pairing.** *Settings → Bluetooth → Pair this phone*, on the monitor's
-  Wi-Fi: the app asks the monitor for a pairing window, shows its 6-digit code,
-  and Android asks for it. Away from that Wi-Fi, press *Pair a phone* on the
-  monitor's own Settings page from any device on its network, then use *Find
-  your monitor → Look for monitors over Bluetooth* here and tap it.
+  Wi-Fi: the app asks the monitor for a pairing window, gets its 6-digit code,
+  and gives it to Android itself (should Android ask anyway, the code is on
+  screen to type). Away from that Wi-Fi, press *Pair a phone* on the monitor's
+  own Settings page from any device on its network, then use *Find your
+  monitor → Look for monitors over Bluetooth* here, tap it and enter the code,
+  or your own pairing code if you set one. When pairing fails, the app says
+  why, in the monitor's words where it can ask it over Wi-Fi, and whether the
+  window is still open for another try.
 - **Choosing.** *Automatic* uses Wi-Fi when the monitor answers there and
   Bluetooth when it doesn't, checking Wi-Fi again every 30 seconds while on
   Bluetooth; *Wi-Fi only* and *Bluetooth only* do what they say. The top bar
@@ -145,8 +169,10 @@ from the readings the phone has collected. Unanswered checks show as red dots.
   whether the new version is running. The password is the update password
   set in `firmware/netmon/secrets.h` when the firmware was built; the app can
   remember it.
+- Signing in: whether the password is saved, sign out, forget the password
+  (see above).
 - Bluetooth: pairing, how the app reaches the monitor, and the monitor's own
-  link (see above).
+  link, its kind of pairing code and how the last attempt went (see above).
 - Saved reports (firmware 0.12): the device list of each network the monitor
   has been on, up to four, as it last stood. Tap one to look through it,
   filtered by online, not recognised or carried over from before a restart,
@@ -196,15 +222,16 @@ Where the toolchain folder is not `../tc`, set `TOOLCHAIN`. kotlinc needs
 about 2 GB of heap for the API 35 jar; the script asks for that unless
 `JAVA_OPTS` says otherwise.
 
-**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2211 checks of the
+**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2293 checks of the
 parsers, formatting, settings validation, firmware checks, event history,
 alert rules, the Nearby, Finder and map logic, the Bluetooth link's frames
 (against the same bytes the firmware's own tests use), the choice between
 Wi-Fi and Bluetooth, saved reports, and the client against
 `tools/mock_board.py`, a stand-in board that answers every endpoint the way
 the firmware does, including uploads and the restart that follows (and, after
-`POST /__fw?v=0.11` or `0.12`, Nearby, the Finder, the map, the Bluetooth
-link's endpoints, saved reports and the clock). The client runs a second
+`POST /__fw?v=0.11`, `0.12` or `0.13`, Nearby, the Finder, the map, the
+Bluetooth link's endpoints, saved reports, the clock and signing in, with
+sessions that end and wrong passwords that wait). The client runs a second
 time over a simulated Bluetooth link: a stand-in for the board's end that
 takes the request frames, asks the mock board, and answers in frames cut as
 the firmware cuts them. Where node is installed, `tools/test/web_parity.py`
@@ -225,7 +252,8 @@ change without a phone (into `build-manual/shots` unless told otherwise).
 ```
 app/src/main/java/com/example/netmon/
   Models.kt, Parse.kt     one data class per endpoint, and JSON to model
-  NetmonClient.kt         HTTP client, multipart upload, restart watch
+  NetmonClient.kt         HTTP client, sessions, multipart upload, restart watch
+  Auth.kt                 signing in: the session, the saved password and its keystore key
   Board.kt                latest readings; one request at a time, in order
   AppState.kt             history, latency record, alert memory, under one lock
   EventHistory.kt         the on-phone event log
@@ -245,7 +273,7 @@ app/src/main/java/com/example/netmon/
   ui/                     screens, view helpers, charts
   ui/Painters.kt          the drawing of the radars, the Finder and the map
   ui/NearbyScreen.kt, ui/FinderPane.kt, ui/MapPane.kt   Nearby, the Finder, the map
-  ui/LinkCard.kt, ui/ReportsCard.kt   Settings: Bluetooth, saved reports
+  ui/LinkCard.kt, ui/ReportsCard.kt, ui/SignInCard.kt   Settings: Bluetooth, saved reports, signing in
 ```
 
 ## Notes
@@ -259,8 +287,8 @@ app/src/main/java/com/example/netmon/
 - The board's web server answers one request at a time, so the app never
   sends requests in parallel, and pauses its readings during a firmware upload.
 - To use it away from home, enter an address you can reach through a VPN.
-  Opening the board to the internet is not recommended: only firmware updates
-  need a password.
+  Opening the board to the internet is not recommended: its pages and API
+  are plain HTTP, so the password would cross the internet unencrypted.
 - If the app ever stops unexpectedly, the next start shows the error with a
   Copy button, so it can be sent along.
 - The Finder asks for no permission beyond vibration: the rotation sensor needs
@@ -268,6 +296,18 @@ app/src/main/java/com/example/netmon/
   page's do, so they sound with the phone on silent once you turn them on.
 
 ## Changes
+
+**1.3.0**
+- Signing in (firmware 0.13): the app asks for the monitor's password once,
+  keeps a 30-day session, and with *Save password* signs in again by itself.
+  Every request carries the session, over Wi-Fi and Bluetooth; the background
+  check and firmware updates too. *Settings → Signing in*.
+- Pairing works on the phones where it failed: the app starts the pairing over
+  its own connection and gives Android the code itself, and says why an
+  attempt failed. Away from the monitor's Wi-Fi, the code (or your own) is
+  entered in the app.
+- Find your monitor identifies boards by `/api/auth`, which answers without
+  signing in, and says which ones ask for a password.
 
 **1.2.0**
 - Bluetooth: pairing with the monitor's code, Automatic, Wi-Fi only or

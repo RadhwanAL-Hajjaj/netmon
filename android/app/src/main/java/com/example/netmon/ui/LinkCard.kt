@@ -24,11 +24,12 @@ import com.example.netmon.MainActivity
  * Settings, Bluetooth: pairing this phone with the board, how the app
  * reaches it, and the board's own Bluetooth link.
  *
- * Pairing needs the board's code, which only someone on its network can see:
- * the app asks for a pairing window over Wi-Fi, shows the code, and Android
- * asks for it while the phone pairs. Away from the board's Wi-Fi, the code
- * comes from its Settings page instead and the pairing starts from the
- * Find your monitor screen.
+ * Pairing needs the board's code, which only someone on its network can see
+ * (or the owner's own code, set on the board's Settings page): the app asks
+ * for a pairing window over Wi-Fi, gets the code, and gives it to Android
+ * itself while the phone pairs. Away from the board's Wi-Fi, the code comes
+ * from its Settings page instead and the pairing starts from the Find your
+ * monitor screen.
  */
 class LinkCard(private val host: MainActivity) {
 
@@ -41,6 +42,8 @@ class LinkCard(private val host: MainActivity) {
     private lateinit var forgetBtn: TextView
     private lateinit var boardLine: KV
     private lateinit var phonesLine: KV
+    private lateinit var codeLine: KV
+    private lateinit var lastLine: KV
     private lateinit var boardSwitch: android.widget.Switch
     private lateinit var boardRow: LinearLayout
     private lateinit var forgetAllBtn: TextView
@@ -74,6 +77,8 @@ class LinkCard(private val host: MainActivity) {
         boardSwitch = sw
         boardLine = card.addKV("Address", top = 2)
         phonesLine = card.addKV("Paired phones")
+        codeLine = card.addKV("Pairing code")
+        lastLine = card.addKV("Last attempt")
         forgetAllBtn = card.add(c.button("Forget every paired phone", Btn.DANGER) { confirmForgetAll() }, WRAP, WRAP, top = 10)
         msg = card.add(c.label("", 14f, T.TEXT2), top = 8)
         msg.visibility = View.GONE
@@ -121,6 +126,9 @@ class LinkCard(private val host: MainActivity) {
         boardRow.shown(b != null)
         boardLine.show(b != null)
         phonesLine.show(b != null)
+        // From firmware 0.13: the owner's own code, and how the last pairing went.
+        codeLine.show(b?.codeKnown == true)
+        lastLine.show(b?.last != null)
         forgetAllBtn.shown(b != null && b.bonds > 0)
         if (b != null) {
             settingSwitch = true
@@ -129,6 +137,11 @@ class LinkCard(private val host: MainActivity) {
             settingSwitch = false
             boardLine.set(if (b.available) b.addr else "Bluetooth could not start on the monitor")
             phonesLine.set("${b.bonds} of ${b.maxBonds}" + if (b.connected > 0) ", ${b.connected} connected now" else "")
+            codeLine.set(if (b.ownCode) "The owner's own" else "New random code each time")
+            b.last?.let { l ->
+                lastLine.set(l.text.removeSuffix(".") + ", " + com.example.netmon.Format.ago(l.ageS),
+                    if (l.why == "paired") T.TEXT else T.WARN)
+            }
         }
     }
 
@@ -143,9 +156,10 @@ class LinkCard(private val host: MainActivity) {
     // --- pairing -----------------------------------------------------------------
 
     /**
-     * Opens a pairing window on the board over Wi-Fi, shows its code, and
-     * pairs. Over Bluetooth alone the board cannot show this phone a code it
-     * could trust, so that way goes through the board's Settings page.
+     * Opens a pairing window on the board over Wi-Fi, gets its code, and
+     * pairs, giving Android the code itself. Over Bluetooth alone the board
+     * cannot show this phone a code it could trust, so that way goes through
+     * the board's Settings page.
      */
     private fun pair() {
         if (busy) return
@@ -181,15 +195,19 @@ class LinkCard(private val host: MainActivity) {
         host.dialog("Pair away from the monitor's Wi-Fi",
             host.label("The monitor shows its pairing code on its own Settings page. On any phone or computer on the " +
                 "monitor's Wi-Fi, open the monitor's address, go to Settings, Bluetooth and press Pair a phone. Then, " +
-                "on this phone, use Find your monitor, Look for monitors over Bluetooth, and tap the monitor.", 15f, T.TEXT2),
+                "on this phone, use Find your monitor, Look for monitors over Bluetooth, tap the monitor and enter " +
+                "the code.", 15f, T.TEXT2),
             "Find your monitor", { host.showConnect() }, negative = "Close")
     }
 
-    /** The code, large, while the phone pairs; Android's own prompt asks for it. */
+    /**
+     * The code, large, while the phone pairs. The app gives it to Android
+     * itself; should Android ask anyway, it is there to type.
+     */
     private fun showCode(st: BleStatus) {
         val c = host
         val box = c.column()
-        box.add(c.label("When Android asks, type this code:", 15f, T.TEXT2))
+        box.add(c.label("The monitor's code. The app enters it for you; if Android asks for it, type it there.", 15f, T.TEXT2))
         val code = box.add(c.label(st.code.substring(0, 3) + " " + st.code.substring(3), 40f, T.TEXT, Fonts.medium, numbers = true), top = 10)
         code.letterSpacing = 0.08f
         code.contentDescription = st.code.toCharArray().joinToString(" ")
@@ -198,7 +216,7 @@ class LinkCard(private val host: MainActivity) {
         spin.indeterminateTintList = ColorStateList.valueOf(T.ACCENT)
         wait.add(spin, c.dp(20), c.dp(20))
         val status = wait.add(c.label("Connecting to the monitor", 14f, T.TEXT2), 0, WRAP, weight = 1f, start = 10)
-        box.add(c.hint("The code works once, for the next two minutes."), top = 12)
+        box.add(c.hint("The code works for one phone, for the next two minutes. Three wrong tries close the window."), top = 12)
         val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         val d = AlertDialog.Builder(c)
             .setTitle("Pair with the monitor")
@@ -210,13 +228,16 @@ class LinkCard(private val host: MainActivity) {
             .setCancelable(false)
             .create()
         d.show()
-        main.postDelayed({ if (d.isShowing) status.text = "Type the code when Android asks" }, 4000)
+        main.postDelayed({ if (d.isShowing && status.text == "Connecting to the monitor") status.text = "Pairing" }, 3000)
         busy = true
         render()
         val addr = st.addr
+        val digits = st.code
         Thread({
             val result = try {
-                BleLink.pair(addr, 110_000) { cancelled.get() }
+                BleLink.pair(addr, digits, 110_000, { cancelled.get() }) { byApp ->
+                    if (d.isShowing) status.text = if (byApp) "Code entered. Finishing" else "Type the code where Android asks for it"
+                }
             } catch (e: ApiException) {
                 main.post {
                     busy = false
@@ -229,13 +250,16 @@ class LinkCard(private val host: MainActivity) {
             main.post {
                 busy = false
                 if (d.isShowing) d.dismiss()
-                when (result) {
+                when (result.result) {
                     BleLink.Paired.YES -> {
                         Board.paired(addr)
                         say("Paired. The app now reaches the monitor over Bluetooth whenever Wi-Fi cannot.", T.OK)
                         Board.refresh(Board.Part.BLE)
                     }
-                    BleLink.Paired.FAILED -> say("Pairing did not finish: a wrong code, or it took too long. Pair again for a new code.", T.BAD)
+                    BleLink.Paired.FAILED -> {
+                        say("Pairing did not finish. " + result.why, T.BAD)
+                        explainFailure()
+                    }
                     BleLink.Paired.CANCELLED -> {
                         say("")
                         Board.runVia(Board.wifiBase, { it.blePair(stop = true) }) { _, _ -> Board.refresh(Board.Part.BLE) }
@@ -244,6 +268,27 @@ class LinkCard(private val host: MainActivity) {
                 render()
             }
         }, "netmon-pair").start()
+    }
+
+    /**
+     * The board's own account of the attempt (firmware 0.13), which knows
+     * better than Android whether the code was wrong or the connection went,
+     * and whether its window is still open for another try.
+     */
+    private fun explainFailure() {
+        Board.runVia(Board.wifiBase, { it.ble() }) { st, _ ->
+            if (st == null) return@runVia
+            Board.setBle(st)
+            if (st.result != "failed" || st.whyText.isEmpty()) return@runVia
+            val more = when {
+                st.pairing -> " The window is still open with the same code: tap Pair again to try once more" +
+                    (if (st.triesLeft in 1..2) " (${st.triesLeft} ${if (st.triesLeft == 1) "try" else "tries"} left)." else ".")
+                st.triesLeft == 0 -> " Three tries failed, so the window closed. Pair again for a new window."
+                else -> " Pair again for a new window."
+            }
+            say("Pairing did not finish. The monitor says: " + st.whyText + more, T.BAD)
+            render()
+        }
     }
 
     // --- forgetting ----------------------------------------------------------------

@@ -37,6 +37,8 @@ data class Health(
     val bleLink: Boolean = false,
     /** The board knows no time yet (firmware 0.12); false for older boards, which never ask. */
     val clockUnset: Boolean = false,
+    /** The address the board uses on Wi-Fi now (0.13): [mac] unless the owner set another. */
+    val wifiMac: String = "",
 ) {
     val inSetupMode: Boolean get() = wifi == "softap"
 }
@@ -253,7 +255,50 @@ data class BleStatus(
     val result: String,            // "paired", "failed" or "" for the last attempt in a window
     val resultAgeS: Long,
     val via: String,               // "wifi" or "bluetooth": how this reading was asked for
+    // From firmware 0.13: why the last attempt in a window went as it did, the
+    // failed tries the open window still takes, the last attempt of all, and
+    // whether the owner set a pairing code of their own.
+    val why: String = "",          // "wrong_code", "cancelled", "dropped", ...
+    val whyText: String = "",
+    val triesLeft: Int = 3,
+    val last: PairAttempt? = null,
+    val ownCode: Boolean = false,
+    val codeKnown: Boolean = false,  // the board says which kind of code it uses (0.13)
 )
+
+/** How a pairing attempt ended, as the board saw it (firmware 0.13). */
+data class PairAttempt(
+    val why: String,
+    val text: String,
+    val status: Int,               // the Bluetooth stack's own number for it
+    val inWindow: Boolean,
+    val ageS: Long,
+)
+
+/**
+ * What a board says about itself to anyone (GET /api/auth, firmware 0.13), or
+ * from /api/health before 0.13. [id] is the chip's own Wi-Fi MAC, which tells
+ * the board apart however it is reached and whatever address it uses.
+ */
+data class BoardId(
+    val version: String,
+    val id: String,
+    val name: String,
+    val login: Boolean,            // the board asks for a password (0.13 and later)
+    val signedIn: Boolean,         // ... and the asker has a session
+)
+
+/** GET /api/auth for a signed-in asker. */
+data class AuthInfo(
+    val board: BoardId,
+    val ownPassword: Boolean,      // the owner set a login password; the update password works too
+    val remembered: Boolean,       // this session lasts 30 days
+    val sessions: Int,
+    val rememberDays: Int,
+)
+
+/** POST /api/login: the session to send with every request from now on. */
+data class LoginReply(val token: String, val days: Int)
 
 /** GET /api/reports (firmware 0.12): the board's saved report of each network it has been on. */
 data class ReportList(

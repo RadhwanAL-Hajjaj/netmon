@@ -46,6 +46,6 @@ object CrashLog {
 }
 
 object BuildInfo {
-    const val VERSION_NAME = "1.2.0"
-    const val VERSION_CODE = 3
+    const val VERSION_NAME = "1.3.0"
+    const val VERSION_CODE = 4
 }

@@ -8,12 +8,15 @@ import java.net.MalformedURLException
 import java.net.SocketTimeoutException
 import java.net.URL
 
-class ApiException(val kind: Kind, message: String, val status: Int = 0) : Exception(message) {
+class ApiException(val kind: Kind, message: String, val status: Int = 0, val retryS: Int = 0) : Exception(message) {
     /**
      * NotPaired: the board was reached over Bluetooth but this phone is not
      * (or no longer) paired with it, so it may not ask anything.
+     * LoginRequired (firmware 0.13): the board wants a session this request
+     * did not carry, or one it has ended. Unauthorized stays what it was: a
+     * wrong password, the update one or, signing in, the login one.
      */
-    enum class Kind { Unreachable, Timeout, Unauthorized, Http, BadData, NotPaired }
+    enum class Kind { Unreachable, Timeout, Unauthorized, Http, BadData, NotPaired, LoginRequired }
 }
 
 /**
@@ -40,14 +43,74 @@ class NetmonClient(address: String) {
     var connectTimeoutMs = 4000
     var readTimeoutMs = 8000
 
+    /**
+     * The session every request carries from firmware 0.13: "Authorization:
+     * Bearer", over Wi-Fi and over the Bluetooth link alike. Only ever set for
+     * the board the app uses, never for an address being tried.
+     */
+    var token: String? = null
+
+    /**
+     * Asked for a new session when the board says to sign in, with the
+     * password saved on this phone; the token, or null when there is none to
+     * be had. The request is then made once more.
+     */
+    var renewSession: ((NetmonClient) -> String?)? = null
+
     fun health(): Health = Parse.health(get("/api/health"))
 
-    /** The board's health when this address really is a netmon board, otherwise null. */
-    fun identify(): Health? = try {
-        val text = get("/api/health")
-        if (Subnet.looksLikeNetmon(text)) Parse.health(text) else null
-    } catch (e: ApiException) {
-        null
+    /**
+     * What is at this address, when it is a netmon board, otherwise null.
+     * Asks nothing that needs signing in, and sends no session: from 0.13
+     * GET /api/auth answers anyone; before that /api/health did.
+     */
+    fun identify(): BoardId? {
+        try {
+            return Parse.boardId(get("/api/auth", readTimeoutMs, signed = false))
+        } catch (e: ApiException) {
+            // A board from before 0.13 has no /api/auth; anything else that
+            // does not answer it is no netmon board either.
+            if (e.kind != ApiException.Kind.Http || e.status != 404) return null
+        }
+        return try {
+            val text = get("/api/health", readTimeoutMs, signed = false)
+            if (!Subnet.looksLikeNetmon(text)) return null
+            val h = Parse.health(text)
+            BoardId(h.version, h.mac, "netmon", login = false, signedIn = false)
+        } catch (e: ApiException) {
+            null
+        }
+    }
+
+    // --- Signing in (firmware 0.13) ---------------------------------------------
+
+    /** Who the board is and, with [token], whether that session is still good. */
+    fun auth(): AuthInfo = Parse.auth(get("/api/auth"))
+
+    /**
+     * Signs in. [remember] asks for a session that lasts 30 days and outlives
+     * restarts. The phone's clock goes along, which the board takes when it
+     * has none. A wrong password is ApiException(Unauthorized); too many,
+     * Http 429 with how long to wait in [ApiException.retryS].
+     */
+    fun login(password: String, remember: Boolean, unix: Long = System.currentTimeMillis() / 1000): LoginReply {
+        val body = Parse.loginBody(password, remember, unix).toByteArray(Charsets.UTF_8)
+        val text = try {
+            post("/api/login", body, "application/json", signed = false)
+        } catch (e: ApiException) {
+            // Here a 401 can only mean the password. Some HttpURLConnections
+            // drop a streamed request's 401 body, and with it the board's words.
+            if (e.kind == ApiException.Kind.Unauthorized && e.message == DEFAULT_401) {
+                throw ApiException(ApiException.Kind.Unauthorized, "That password is not right.", e.status)
+            }
+            throw e
+        }
+        return Parse.loginReply(text)
+    }
+
+    /** Ends this session on the board. */
+    fun logout() {
+        post("/api/logout", ByteArray(0), null)
     }
     fun devices(): List<Device> = Parse.devices(get("/api/devices"))
     fun events(): List<BoardEvent> = Parse.events(get("/api/events"))
@@ -135,7 +198,7 @@ class NetmonClient(address: String) {
         post("/api/clock", Parse.clockBody(unix).toByteArray(Charsets.UTF_8), "application/json")
     }
 
-    /** True when the board accepts this update password. */
+    /** True when the board accepts this update password. From 0.13 it takes a session as well. */
     fun checkUpdateKey(key: String): Boolean = try {
         post("/api/update/check", ByteArray(0), null, mapOf(KEY_HEADER to key))
         true
@@ -166,7 +229,7 @@ class NetmonClient(address: String) {
         val tail = "\r\n--$boundary--\r\n".toByteArray(Charsets.UTF_8)
         val total = (head.size + image.size + tail.size).toLong()
 
-        val c = open("/api/update", "POST", 60000)
+        val c = open("/api/update", "POST", 60000, signed = true)
         try {
             c.doOutput = true
             c.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
@@ -203,9 +266,31 @@ class NetmonClient(address: String) {
 
     // --- plumbing ----------------------------------------------------------
 
-    private fun get(path: String, readTimeout: Int = readTimeoutMs): String {
-        if (viaBluetooth) return overLink("GET", path, null, emptyMap(), readTimeout)
-        val c = open(path, "GET", readTimeout)
+    private fun get(path: String, readTimeout: Int = readTimeoutMs, signed: Boolean = true): String =
+        renewing(signed) { getOnce(path, readTimeout, signed) }
+
+    private fun post(path: String, body: ByteArray, contentType: String?, headers: Map<String, String> = emptyMap(),
+                     signed: Boolean = true): String =
+        renewing(signed) { postOnce(path, body, contentType, headers, signed) }
+
+    /**
+     * Makes a request, and when the board says to sign in first and a new
+     * session can be had without asking anybody, makes it once more with it.
+     */
+    private inline fun renewing(signed: Boolean, call: () -> String): String {
+        try {
+            return call()
+        } catch (e: ApiException) {
+            if (!signed || e.kind != ApiException.Kind.LoginRequired) throw e
+            val fresh = renewSession?.invoke(this) ?: throw e
+            token = fresh
+            return call()
+        }
+    }
+
+    private fun getOnce(path: String, readTimeout: Int, signed: Boolean): String {
+        if (viaBluetooth) return overLink("GET", path, null, emptyMap(), readTimeout, signed)
+        val c = open(path, "GET", readTimeout, signed)
         try {
             return finish(c)
         } catch (e: SocketTimeoutException) {
@@ -217,9 +302,9 @@ class NetmonClient(address: String) {
         }
     }
 
-    private fun post(path: String, body: ByteArray, contentType: String?, headers: Map<String, String> = emptyMap()): String {
-        if (viaBluetooth) return overLink("POST", path, body, headers, readTimeoutMs)
-        val c = open(path, "POST", readTimeoutMs)
+    private fun postOnce(path: String, body: ByteArray, contentType: String?, headers: Map<String, String>, signed: Boolean): String {
+        if (viaBluetooth) return overLink("POST", path, body, headers, readTimeoutMs, signed)
+        val c = open(path, "POST", readTimeoutMs, signed)
         try {
             c.doOutput = true
             if (contentType != null) c.setRequestProperty("Content-Type", contentType)
@@ -236,7 +321,7 @@ class NetmonClient(address: String) {
         }
     }
 
-    private fun open(path: String, method: String, readTimeout: Int): HttpURLConnection {
+    private fun open(path: String, method: String, readTimeout: Int, signed: Boolean): HttpURLConnection {
         val c = try {
             URL(base + path).openConnection() as HttpURLConnection
         } catch (e: IOException) {
@@ -249,6 +334,8 @@ class NetmonClient(address: String) {
         c.instanceFollowRedirects = false
         c.setRequestProperty("Connection", "close")
         c.setRequestProperty("Accept", "application/json")
+        val t = token
+        if (signed && t != null) c.setRequestProperty(AUTH_HEADER, "Bearer $t")
         return c
     }
 
@@ -257,9 +344,12 @@ class NetmonClient(address: String) {
      * board is out of reach or this phone is not paired; the board's answer
      * is read exactly as an HTTP one.
      */
-    private fun overLink(method: String, path: String, body: ByteArray?, headers: Map<String, String>, timeout: Int): String {
+    private fun overLink(method: String, path: String, body: ByteArray?, headers: Map<String, String>, timeout: Int,
+                         signed: Boolean): String {
         val t = Link.transport ?: throw ApiException(ApiException.Kind.Unreachable, "Bluetooth is not available on this phone.")
-        val reply = t.exchange(LinkCodec.address(base), LinkCodec.request(method, path, headers, body), timeout)
+        val tok = token
+        val all = if (signed && tok != null) headers + (AUTH_HEADER to "Bearer $tok") else headers
+        val reply = t.exchange(LinkCodec.address(base), LinkCodec.request(method, path, all, body), timeout)
         return answer(reply.status, reply.text)
     }
 
@@ -268,14 +358,20 @@ class NetmonClient(address: String) {
         val code = c.responseCode
         val stream: InputStream? = if (code >= 400) c.errorStream else c.inputStream
         val text = stream?.use { readAll(it) } ?: ""
-        return answer(code, text)
+        // Over Wi-Fi the board marks "sign in first" in a header as well, which
+        // survives where the body of a 401 to a streamed request may not.
+        return answer(code, text, c.getHeaderField(LOGIN_HEADER) != null)
     }
 
-    private fun answer(code: Int, text: String): String {
+    private fun answer(code: Int, text: String, loginMarked: Boolean = false): String {
         if (code in 200..299) return text
         val said = Parse.errorText(text)
         when {
-            code == 401 -> throw ApiException(ApiException.Kind.Unauthorized, said ?: "Wrong update password.", code)
+            code == 401 && (loginMarked || Parse.loginRequired(text)) ->
+                throw ApiException(ApiException.Kind.LoginRequired, said ?: "Sign in to the monitor first.", code)
+            code == 401 -> throw ApiException(ApiException.Kind.Unauthorized, said ?: DEFAULT_401, code)
+            code == 429 -> throw ApiException(ApiException.Kind.Http, said ?: "Too many wrong passwords. Try again later.",
+                code, Parse.retryS(text))
             code == 302 -> throw ApiException(ApiException.Kind.Http,
                 "The board is in setup mode and redirected the request. Join netmon-setup and use 192.168.4.1.", code)
             code == 404 -> throw ApiException(ApiException.Kind.Http,
@@ -298,6 +394,9 @@ class NetmonClient(address: String) {
 
     companion object {
         const val KEY_HEADER = "X-Netmon-Key"
+        const val AUTH_HEADER = "Authorization"
+        const val LOGIN_HEADER = "X-Netmon-Login"
+        private const val DEFAULT_401 = "Wrong update password."
         private const val CHUNK = 4096
         private const val MAX_REPLY = 512 * 1024
 
@@ -359,6 +458,7 @@ object RestartWatch {
         base: String,
         uploadStartedMs: Long,
         oldVersion: String,
+        token: String? = null,
         now: () -> Long = { System.currentTimeMillis() },
         sleep: (Long) -> Unit = { Thread.sleep(it) },
         firstLookMs: Long = 4000,
@@ -371,6 +471,8 @@ object RestartWatch {
         val probe = NetmonClient(base).apply {
             connectTimeoutMs = 2500
             readTimeoutMs = 3000
+            // Sessions outlive a restart: the board keeps them in its flash.
+            this.token = token
         }
         sleep(firstLookMs)
         while (true) {

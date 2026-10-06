@@ -21,6 +21,7 @@ import com.example.netmon.AlertMode
 import com.example.netmon.Alerts
 import com.example.netmon.ApiException
 import com.example.netmon.AppState
+import com.example.netmon.Auth
 import com.example.netmon.Board
 import com.example.netmon.BuildInfo
 import com.example.netmon.ConfigUpdate
@@ -36,8 +37,9 @@ import com.example.netmon.WifiNetwork
 class SettingsScreen(host: MainActivity) : Screen(host) {
 
     override val parts = listOf(Board.Part.HEALTH, Board.Part.CONFIG, Board.Part.NETWORKS, Board.Part.DHCP,
-        Board.Part.BLE, Board.Part.REPORTS)
+        Board.Part.BLE, Board.Part.REPORTS, Board.Part.AUTH)
 
+    private val signInCard = SignInCard(host)
     private val linkCard = LinkCard(host)
     private val reportsCard = ReportsCard(host)
 
@@ -116,6 +118,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         val c = ctx
         val col = c.column()
         col.add(buildBoardCard(), top = 8)
+        col.add(signInCard.build(), top = 16)
         col.add(buildWifiCard(), top = 16)
         col.add(linkCard.build(), top = 16)
         col.add(reportsCard.build(), top = 16)
@@ -628,7 +631,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         say(fwMsg, "Checking the password")
 
         Thread {
-            val client = NetmonClient(base)
+            val client = Auth.client(base)
             val started = System.currentTimeMillis()
             var outcome: RestartWatch.Outcome? = null
             var failure: String? = null
@@ -660,10 +663,14 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
                         if (e.kind != ApiException.Kind.Unreachable && e.kind != ApiException.Kind.Timeout) throw e
                         main.post { say(fwMsg, "The connection dropped. Checking whether the monitor restarted.") }
                     }
-                    outcome = RestartWatch.await(base, started, oldVersion)
+                    outcome = RestartWatch.await(base, started, oldVersion, client.token)
                 }
             } catch (e: ApiException) {
-                failure = if (e.kind == ApiException.Kind.Unauthorized) "Wrong update password." else e.message
+                failure = when (e.kind) {
+                    ApiException.Kind.Unauthorized -> "Wrong update password."
+                    ApiException.Kind.LoginRequired -> "Sign in to the monitor first, then try again."
+                    else -> e.message
+                }
             } finally {
                 Board.paused = false
             }
@@ -752,7 +759,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         card.addKV("App", top = 10).set("netmon for Android ${BuildInfo.VERSION_NAME}")
         card.add(c.hint("Talks to the monitor's own web API; nothing leaves your network except the monitor's own " +
             "provider lookup. Network history needs firmware 0.9.4 or later, the DHCP listener status 0.9.6, " +
-            "Nearby 0.10, the Finder and the network map 0.11, and Bluetooth and saved reports 0.12."), top = 8)
+            "Nearby 0.10, the Finder and the network map 0.11, Bluetooth and saved reports 0.12, and signing in 0.13."), top = 8)
         return card
     }
 
@@ -783,6 +790,7 @@ class SettingsScreen(host: MainActivity) : Screen(host) {
         renderNetworks()
         renderDhcp()
         renderAlerts()
+        signInCard.render()
         linkCard.render()
         reportsCard.render()
         fwRunning.text = when {

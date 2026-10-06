@@ -38,6 +38,23 @@ class Prefs(context: Context) {
         get() = sp.getString("update_key", null)
         set(v) = sp.edit().putString("update_key", v).apply()
 
+    // --- Signing in (app 1.3, firmware 0.13) -----------------------------------------
+
+    /** The session the board handed out, sent with every request to it. */
+    var sessionToken: String?
+        get() = sp.getString("session_token", null)
+        set(v) = sp.edit().putString("session_token", v).apply()
+
+    /** The board the session and the saved password belong to: its chip's own MAC. */
+    var sessionFor: String?
+        get() = sp.getString("session_for", null)
+        set(v) = sp.edit().putString("session_for", v).apply()
+
+    /** The password, encrypted with a key Android's keystore holds, when "Save password" was on. */
+    var savedPassword: String?
+        get() = sp.getString("saved_password", null)
+        set(v) = sp.edit().putString("saved_password", v).apply()
+
     var alertMode: AlertMode
         get() = AlertMode.of(sp.getString("alert_mode", null))
         set(v) = sp.edit().putString("alert_mode", v.key).apply()

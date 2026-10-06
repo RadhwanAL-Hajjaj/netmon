@@ -41,6 +41,7 @@ object Parse {
             mac = str("mac").uppercase(),
             bleLink = bool("ble_link"),
             clockUnset = has("clock") && !bool("clock"),
+            wifiMac = str("wifi_mac").uppercase(),
         )
     }
 
@@ -62,10 +63,60 @@ object Parse {
             result = str("result"),
             resultAgeS = long("result_age_s"),
             via = str("via"),
+            why = str("why"),
+            whyText = str("why_text"),
+            triesLeft = int("tries_left", 3),
+            last = optJSONObject("last")?.let { l ->
+                PairAttempt(l.str("why"), l.str("text"), l.int("status"), l.bool("in_window"), l.long("age_s"))
+            },
+            ownCode = bool("own_code"),
+            codeKnown = has("own_code"),
         )
     }
 
     fun bleBody(enabled: Boolean): String = JSONObject().put("enabled", enabled).toString()
+
+    // --- Signing in (firmware 0.13) ----------------------------------------------
+
+    /** GET /api/auth, or null when the answer is not a netmon board's. */
+    fun boardId(text: String): BoardId? = try {
+        val o = JSONObject(text)
+        if (!o.bool("netmon") || o.str("version").isEmpty()) null
+        else BoardId(o.str("version"), o.str("id").uppercase(), o.str("name", "netmon"), o.bool("login"), o.bool("signed_in"))
+    } catch (e: JSONException) {
+        null
+    }
+
+    fun auth(text: String): AuthInfo {
+        val b = boardId(text) ?: throw ApiException(ApiException.Kind.BadData, "The board sent a reply this app cannot read.")
+        val o = obj(text)
+        return AuthInfo(b, o.bool("own_password"), o.bool("remembered"), o.int("sessions"), o.int("remember_days", 30))
+    }
+
+    fun loginBody(password: String, remember: Boolean, unix: Long): String =
+        JSONObject().put("password", password).put("remember", remember).put("unix", unix).toString()
+
+    fun loginReply(text: String): LoginReply = obj(text).run {
+        val t = str("token")
+        if (t.length != 32 || t.any { it !in '0'..'9' && it !in 'a'..'f' }) {
+            throw ApiException(ApiException.Kind.BadData, "The board did not hand out a session.")
+        }
+        LoginReply(t, int("days"))
+    }
+
+    /** True for the board's "sign in first" answer, as opposed to a wrong update password. */
+    fun loginRequired(text: String): Boolean = try {
+        JSONObject(text).bool("login")
+    } catch (e: JSONException) {
+        false
+    }
+
+    /** How long the board wants a sign-in to wait after too many wrong passwords. */
+    fun retryS(text: String): Int = try {
+        JSONObject(text).int("retry_s")
+    } catch (e: JSONException) {
+        0
+    }
 
     fun clockBody(unix: Long): String = JSONObject().put("unix", unix).toString()
 

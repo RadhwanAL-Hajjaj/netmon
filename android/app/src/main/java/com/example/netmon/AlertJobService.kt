@@ -72,7 +72,10 @@ object BackgroundCheck {
         Alerts.notifyDevices(context, tell)
     }
 
-    private fun client(base: String) = NetmonClient(base).apply {
+    // With the session, and a new one from the saved password when it has
+    // ended (firmware 0.13). Without a saved password a board that wants one
+    // is left alone until the app is opened.
+    private fun client(base: String) = Auth.client(base).apply {
         connectTimeoutMs = 4000
         readTimeoutMs = 7000
     }

@@ -23,7 +23,7 @@ import java.util.concurrent.Executors
  */
 object Board {
 
-    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP, NEARBY, NEARBY_CONFIG, MAP, BLE, REPORTS }
+    enum class Part { HEALTH, DEVICES, EVENTS, LATENCY, ISP, CONFIG, NETWORKS, DHCP, NEARBY, NEARBY_CONFIG, MAP, BLE, REPORTS, AUTH }
 
     enum class Link { NONE, CONNECTING, LIVE, LOST }
 
@@ -70,6 +70,16 @@ object Board {
     var ble: BleStatus? = null
         private set
     var reports: ReportList? = null
+        private set
+    /** Signing in, as the board sees this phone (firmware 0.13). */
+    var auth: AuthInfo? = null
+        private set
+
+    /**
+     * The board wants a password the app cannot give it by itself (firmware
+     * 0.13): the screens ask. Readings wait until it is given.
+     */
+    var needsLogin = false
         private set
 
     /** Readings that failed for a reason other than the board being unreachable. */
@@ -126,7 +136,11 @@ object Board {
         if (!known) {
             verifyMac = p.boardMac ?: ""
             clear()
+            // Not known yet to be the same board: it gets no session until
+            // it says it is, and the saved password only then (Auth.renew).
+            Auth.dropSession()
         }
+        needsLogin = false
         if (LinkCodec.isBle(b)) p.boardBle = b else p.boardUrl = b
         base = b
         p.lastRoute = b
@@ -201,6 +215,8 @@ object Board {
         p.boardBle = null
         p.boardMac = null
         p.lastRoute = null
+        Auth.forgetBoard()
+        needsLogin = false
         clear()
         changed()
         Alerts.schedule(app)
@@ -210,7 +226,7 @@ object Board {
         generation++
         health = null; devices = null; latency = null; isp = null
         config = null; networks = null; dhcp = null
-        nearby = null; nearbyAtMs = 0L; nearbyConfig = null; map = null; ble = null; reports = null
+        nearby = null; nearbyAtMs = 0L; nearbyConfig = null; map = null; ble = null; reports = null; auth = null
         partErrors.clear()
         partStatus.clear()
         lastOkMs = 0L; lastError = null; failures = 0
@@ -221,7 +237,7 @@ object Board {
 
     fun refresh(parts: Collection<Part>) {
         val b = base ?: return
-        if (paused || parts.isEmpty()) return
+        if (paused || parts.isEmpty() || needsLogin) return
         recheckWifi()
         val start: Boolean
         synchronized(queued) {
@@ -237,7 +253,7 @@ object Board {
     private fun drain(b: String, gen: Int) {
         NetRoute.pinIfNeeded(app)
         var route = b
-        var client = NetmonClient(route)
+        var client = Auth.client(route)
         var switched = false
         while (true) {
             if (paused) {
@@ -260,7 +276,7 @@ object Board {
                     if (alt != null) {
                         switched = true
                         route = alt
-                        client = NetmonClient(alt)
+                        client = Auth.client(alt)
                         main.post { if (gen == generation) useRoute(alt, auto = true) }
                         synchronized(queued) { queued.add(part) }
                         continue
@@ -278,8 +294,9 @@ object Board {
                     }
                 }
                 // An unreachable board would only time out again for each
-                // remaining reading; the next poll tries afresh.
-                if (unreachable || e.kind == ApiException.Kind.NotPaired) {
+                // remaining reading; the next poll tries afresh. One that
+                // wants a password wants it for every reading.
+                if (unreachable || e.kind == ApiException.Kind.NotPaired || e.kind == ApiException.Kind.LoginRequired) {
                     synchronized(queued) { queued.clear() }
                     return
                 }
@@ -328,7 +345,7 @@ object Board {
                 wifiChecking = false
                 if (gen != generation || h == null) return@post
                 // An answer from some other board at that address is no way back.
-                if (mac != null && h.mac.isNotEmpty() && !h.mac.equals(mac, ignoreCase = true)) return@post
+                if (mac != null && h.id.isNotEmpty() && !h.id.equals(mac, ignoreCase = true)) return@post
                 if (onBluetooth && AppState.prefs.linkMode == LinkMode.AUTO) useRoute(w, auto = true)
             }
         }, "netmon-wifi-check").start()
@@ -425,6 +442,10 @@ object Board {
                 val r = c.reports()
                 publish(gen, part) { reports = r }
             }
+            Part.AUTH -> {
+                val a = c.auth()
+                publish(gen, part) { auth = a }
+            }
         }
     }
 
@@ -434,6 +455,7 @@ object Board {
             set()
             partErrors.remove(part)
             partStatus.remove(part)
+            needsLogin = false
             failures = 0
             lastOkMs = System.currentTimeMillis()
             lastError = null
@@ -445,6 +467,12 @@ object Board {
         when (e.kind) {
             ApiException.Kind.Unreachable, ApiException.Kind.Timeout, ApiException.Kind.NotPaired -> {
                 failures++
+                lastError = e.message
+            }
+            ApiException.Kind.LoginRequired -> {
+                // With a saved password that just could not be used (the
+                // board stopped answering midway), the next poll tries again.
+                if (Auth.needed) needsLogin = true
                 lastError = e.message
             }
             else -> {
@@ -473,7 +501,7 @@ object Board {
         io.execute {
             NetRoute.pinIfNeeded(app)
             val result = try {
-                Result.success(work(NetmonClient(b)))
+                Result.success(work(Auth.client(b)))
             } catch (e: ApiException) {
                 Result.failure(e)
             } catch (e: RuntimeException) {
@@ -492,9 +520,41 @@ object Board {
                     lastOkMs = System.currentTimeMillis()
                     done(result.getOrNull(), null)
                 } else {
+                    if (err.kind == ApiException.Kind.LoginRequired && Auth.needed && !needsLogin) {
+                        needsLogin = true
+                        changed()
+                    }
                     done(null, err)
                 }
             }
+        }
+    }
+
+    /**
+     * Signs in with a password the person typed; [save] keeps it, encrypted,
+     * so the app signs in again by itself. Then reads everything afresh.
+     */
+    fun signIn(password: String, save: Boolean, done: (ApiException?) -> Unit) {
+        runVia(base, { c -> Auth.signIn(c, password, save) }) { a, err ->
+            if (err == null && a != null) {
+                auth = a
+                needsLogin = false
+                lastError = null
+                changed()
+                refresh(Part.HEALTH, Part.DEVICES, Part.EVENTS, Part.AUTH)
+            }
+            done(err)
+        }
+    }
+
+    /** Ends this phone's session on the board and forgets the saved password. */
+    fun signOut(done: () -> Unit) {
+        runVia(base, { c -> c.logout() }) { _, _ ->
+            Auth.signedOut()
+            auth = null
+            needsLogin = true
+            changed()
+            done()
         }
     }
 

@@ -53,6 +53,9 @@ fun main() {
     nearbyClientTests()
     client12Tests()
     linkClientTests()
+    authParseTests()
+    client13Tests()
+    link13Tests()
     println("passed $passed, failed $failed")
     if (failed > 0) System.exit(1)
 }
@@ -1343,6 +1346,157 @@ fun linkClientTests() {
         loop.noise = false
         c.reboot()
         check(loop.paths.last() == "POST /api/reboot", "restart over the link")
+    } finally {
+        Link.transport = saved
+        mock("/__reset", "POST")
+    }
+}
+
+// --- Firmware 0.13: signing in, and how pairing went ----------------------------------
+
+const val LOGIN_PW = "login-pass-1"
+const val BOARD_ID = "D4:E9:F4:12:34:56"
+
+fun authParseTests() {
+    val a = """{"netmon":true,"name":"netmon","version":"0.13.0-login","id":"d4:e9:f4:12:34:56","login":true,""" +
+        """"signed_in":true,"remember_days":30,"own_password":true,"remembered":false,"sessions":3,"via":"wifi"}"""
+    val id = Parse.boardId(a)
+    eq(id, BoardId("0.13.0-login", BOARD_ID, "netmon", login = true, signedIn = true), "board id read")
+    val info = Parse.auth(a)
+    eq(Triple(info.ownPassword, info.remembered, info.sessions), Triple(true, false, 3), "auth read")
+    eq(info.rememberDays, 30, "remember days")
+    eq(Parse.boardId("""{"status":"ok","version":"1"}"""), null, "other JSON is no board")
+    eq(Parse.boardId("""{"netmon":true}"""), null, "no version, no board")
+    eq(Parse.boardId("<html>"), null, "HTML is no board")
+    eq(Parse.boardId("""{"netmon":true,"version":"0.13.0","login":true}""")?.signedIn, false, "signed_in missing reads false")
+    eq(Parse.loginReply("""{"status":"signed in","token":"0123456789abcdef0123456789abcdef","remember":true,"days":30}"""),
+        LoginReply("0123456789abcdef0123456789abcdef", 30), "login reply read")
+    eq(throws<ApiException>("short token") { Parse.loginReply("""{"token":"abc"}""") }?.kind, ApiException.Kind.BadData,
+        "a token that is not one")
+    eq(throws<ApiException>("capital token") { Parse.loginReply("""{"token":"0123456789ABCDEF0123456789ABCDEF"}""") }?.kind,
+        ApiException.Kind.BadData, "tokens are lower case")
+    check(Parse.loginRequired("""{"error":"Sign in to the monitor first.","login":true,"netmon":true}"""), "sign in first")
+    check(!Parse.loginRequired("""{"error":"invalid update key"}"""), "a wrong update key is not that")
+    check(!Parse.loginRequired("not json"), "nor is anything else")
+    eq(Parse.retryS("""{"error":"Too many wrong passwords. Try again in 30 seconds.","retry_s":30}"""), 30, "retry_s")
+    eq(Parse.retryS("{}"), 0, "no retry_s")
+    eq(Parse.loginBody("p\"w", true, 1791136862L),
+        """{"password":"p\"w","remember":true,"unix":1791136862}""", "login body escapes")
+
+    // How pairing went, from 0.13.
+    val b13 = Parse.ble("""{"link":1,"available":true,"enabled":true,"on":true,"name":"netmon","addr":"d4:e9:f4:12:34:58",""" +
+        """"bonds":1,"max_bonds":3,"connected":1,"secure":0,"pairing":true,"code":"482916","left_s":95,"result":"failed",""" +
+        """"result_age_s":4,"why":"wrong_code","why_text":"The code did not match.","tries_left":2,""" +
+        """"last":{"why":"wrong_code","text":"The code did not match.","status":1284,"in_window":true,"age_s":4},""" +
+        """"own_code":true,"own":"482916","served":12,"via":"wifi"}""")
+    eq(Triple(b13.why, b13.whyText, b13.triesLeft), Triple("wrong_code", "The code did not match.", 2), "why it failed")
+    eq(b13.last, PairAttempt("wrong_code", "The code did not match.", 1284, true, 4), "the last attempt")
+    check(b13.ownCode && b13.codeKnown, "the owner's own code")
+    val b12 = Parse.ble("""{"link":1,"available":true,"enabled":true,"on":true,"name":"netmon","addr":"D4:E9:F4:12:34:58",""" +
+        """"bonds":1,"max_bonds":3,"connected":0,"secure":0,"pairing":false,"code":"","left_s":0,"result":"",""" +
+        """"result_age_s":0,"served":0,"via":"wifi"}""")
+    check(b12.last == null && !b12.codeKnown && !b12.ownCode && b12.triesLeft == 3 && b12.why == "", "0.12 reads as before")
+    val b13n = Parse.ble("""{"link":1,"addr":"x","last":null,"own_code":false,"own":""}""")
+    check(b13n.last == null && b13n.codeKnown && !b13n.ownCode, "no attempt yet, random codes")
+
+    // The session goes in the link's own header lines.
+    val req = String(LinkCodec.request("GET", "/api/health", mapOf("Authorization" to "Bearer 0123")), Charsets.UTF_8)
+    eq(req, "GET /api/health\nAuthorization: Bearer 0123\n\n", "a session over the link")
+}
+
+/** Firmware 0.13's sign-in, over Wi-Fi. */
+fun client13Tests() {
+    try { mock("/__reset", "POST") } catch (e: Exception) { return }
+    mock("/__fw?v=0.12", "POST")
+    // Before 0.13 there is no /api/auth: the board is found by its health, as before.
+    eq(NetmonClient(MOCK).identify(), BoardId("0.12.0-bluetooth", BOARD_ID, "netmon", login = false, signedIn = false),
+        "a 0.12 board identified by its health")
+    mock("/__fw?v=0.13", "POST")
+    val c = NetmonClient(MOCK)
+    eq(c.identify(), BoardId("0.13.0-login", BOARD_ID, "netmon", login = true, signedIn = false), "a 0.13 board identified")
+    val need = throws<ApiException>("no session") { c.health() }
+    eq(need?.kind, ApiException.Kind.LoginRequired, "the board wants a session")
+    eq(need?.message, "Sign in to the monitor first.", "and says so")
+    eq(throws<ApiException>("no session, update key") { c.checkUpdateKey("test-key") }?.kind, ApiException.Kind.LoginRequired,
+        "the update check wants one too, rather than reading as a wrong key")
+    val wrong = throws<ApiException>("wrong password") { c.login("nope-nope", true) }
+    eq(wrong?.kind, ApiException.Kind.Unauthorized, "a wrong password")
+    eq(wrong?.message, "That password is not right.", "in words")
+
+    val r = c.login(LOGIN_PW, true)
+    eq(r.token.length, 32, "a session")
+    eq(r.days, 30, "for 30 days")
+    c.token = r.token
+    eq(c.health().version, "0.13.0-login", "signed in")
+    val a = c.auth()
+    check(a.board.signedIn && a.remembered && a.sessions == 1, "the board knows this session")
+    eq(c.identify()?.signedIn, false, "identify sends no session")
+    eq(c.checkUpdateKey("wrong"), false, "a wrong update key, signed in")
+    eq(c.checkUpdateKey("test-key"), true, "the right one")
+    // The update password signs in as well.
+    eq(NetmonClient(MOCK).login("test-key", false).days, 0, "the update password, not kept")
+
+    // A session that ended is renewed once, by whatever the app has to renew it with.
+    var asked = 0
+    val c2 = NetmonClient(MOCK)
+    c2.token = "0".repeat(32)
+    c2.renewSession = { cc -> asked++; cc.login(LOGIN_PW, true).token }
+    eq(c2.devices().size, 6, "renewed and answered")
+    eq(asked, 1, "renewed once")
+    check(c2.token != "0".repeat(32), "with the new session kept")
+    eq(c2.events().size, 7, "and used again")
+    eq(asked, 1, "no renewal while it lasts")
+    c2.identify()
+    eq(asked, 1, "identify never renews")
+    // Nothing to renew with: the board's answer stands.
+    val c3 = NetmonClient(MOCK)
+    c3.renewSession = { _ -> null }
+    eq(throws<ApiException>("nothing to renew with") { c3.health() }?.kind, ApiException.Kind.LoginRequired, "still signed out")
+
+    // Every session ends: the next request is turned away.
+    mock("/__auth?expire=1", "POST")
+    eq(throws<ApiException>("ended") { c.health() }?.kind, ApiException.Kind.LoginRequired, "an ended session")
+    c.token = c.login(LOGIN_PW, true).token
+    c.logout()
+    eq(throws<ApiException>("signed out") { c.health() }?.kind, ApiException.Kind.LoginRequired, "signed out")
+
+    // A firmware upload carries the session too, and the restart watch after it.
+    c.token = c.login(LOGIN_PW, true).token
+    val img = ByteArray(300_000).also { it[0] = 0xE9.toByte() }
+    val t0 = System.currentTimeMillis()
+    c.uploadFirmware(img, "netmon.ino.bin", "test-key") { _, _ -> }
+    val out = RestartWatch.await(MOCK, t0, "0.13.0-login", c.token, firstLookMs = 1000, retryMs = 200, giveUpAfterMs = 20_000)
+    check(out is RestartWatch.Outcome.SameVersion, "back after the restart, still signed in: $out")
+    val bare = NetmonClient(MOCK)
+    eq(throws<ApiException>("upload without a session") { bare.uploadFirmware(img, "netmon.ino.bin", "test-key") { _, _ -> } }?.kind,
+        ApiException.Kind.LoginRequired, "an upload without a session")
+
+    // Too many wrong passwords: the board says how long to wait.
+    val t = NetmonClient(MOCK)
+    repeat(6) { try { t.login("guess-$it", true) } catch (e: ApiException) {} }
+    val held = throws<ApiException>("throttled") { t.login(LOGIN_PW, true) }
+    eq(held?.status, 429, "held off")
+    check((held?.retryS ?: 0) in 1..30, "with the wait: ${held?.retryS}")
+    check(held?.message?.startsWith("Too many wrong passwords") == true, "in words")
+    mock("/__reset", "POST")
+}
+
+/** The same over the Bluetooth link: the session goes in the request's header lines. */
+fun link13Tests() {
+    try { mock("/__reset", "POST") } catch (e: Exception) { return }
+    val saved = Link.transport
+    val loop = LoopLink(MOCK, 20)
+    Link.transport = loop
+    try {
+        mock("/__fw?v=0.13", "POST")
+        val c = NetmonClient("ble://D4:E9:F4:12:34:58")
+        eq(c.identify()?.login, true, "identified over the link")
+        eq(throws<ApiException>("no session over the link") { c.health() }?.kind, ApiException.Kind.LoginRequired,
+            "the board wants a session over the link too")
+        c.token = c.login(LOGIN_PW, true).token
+        eq(c.health().version, "0.13.0-login", "signed in over the link")
+        eq(c.ble().codeKnown, true, "0.13 link status over the link")
+        check(loop.paths.contains("POST /api/login"), "signed in over the link itself")
     } finally {
         Link.transport = saved
         mock("/__reset", "POST")

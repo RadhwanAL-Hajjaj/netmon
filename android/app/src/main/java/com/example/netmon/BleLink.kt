@@ -38,8 +38,10 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * Only a board this phone has paired with is ever connected to for requests.
  * Pairing is its own step ([pair]), started by the person with a code the
- * board shows on its Settings page or in this app over Wi-Fi; a request never
- * brings up Android's pairing prompt by surprise.
+ * board shows on its Settings page or in this app over Wi-Fi, or the owner's
+ * own code; a request never brings up Android's pairing prompt by surprise.
+ * From app 1.3 the app enters the code itself, and from firmware 0.13 every
+ * request also carries the session from signing in (NetmonClient).
  */
 @SuppressLint("MissingPermission")    // every entry point checks first: see permitted()
 object BleLink : LinkTransport {
@@ -423,14 +425,44 @@ object BleLink : LinkTransport {
     enum class Paired { YES, FAILED, CANCELLED }
 
     /**
-     * Pairs this phone with the board at [address], whose pairing window has
-     * just been opened. Connecting is enough to start it: the board asks for
-     * pairing at once and Android shows its prompt, where the person types
-     * the board's code. An old pairing Android still holds is dropped first,
-     * so the new one starts clean. On YES the link is left set up, ready for
-     * requests.
+     * A pairing attempt's end: [why] in words when it failed, and whether
+     * the app gave Android the code itself ([codeByApp]) or Android had to
+     * ask the person for it.
      */
-    fun pair(address: String, timeoutMs: Long, cancelled: () -> Boolean): Paired {
+    class PairResult(val result: Paired, val why: String = "", val codeByApp: Boolean = false)
+
+    // Hidden in the SDK, unchanged since Android 4.4: why a pairing ended
+    // without a bond, as ACTION_BOND_STATE_CHANGED carries it.
+    private const val EXTRA_REASON = "android.bluetooth.device.extra.REASON"
+
+    private fun unbondText(reason: Int): String = when (reason) {
+        1 -> "The code did not match. Check it against the monitor's Settings page, and that a pairing window is open there."
+        2 -> "The monitor turned the pairing down. Open a pairing window on it, then try again."
+        3 -> "Pairing was cancelled on this phone."
+        4 -> "The monitor went out of reach before pairing finished."
+        5 -> "The phone was busy looking for devices. Try again in a moment."
+        6 -> "Nobody entered the code in time."
+        7 -> "Too many attempts just now. Wait a minute, then try again."
+        8 -> "The monitor stopped the pairing: its window may have closed, or the code was wrong."
+        else -> "Pairing did not finish."
+    }
+
+    /**
+     * Pairs this phone with the board at [address], whose pairing window is
+     * open. The phone asks to pair over a connection it opens itself: from
+     * firmware 0.13 the board no longer asks first, since its request and the
+     * phone's crossed and broke pairing on many phones. When Android wants the
+     * board's code, the app gives it [code] itself, so no prompt appears; a
+     * phone that will not take it from an app, or no [code], brings up
+     * Android's own prompt for the person to type it. [asked] is told, on the
+     * main thread, which of the two happened.
+     *
+     * An old pairing Android still holds is dropped first, so the new one
+     * starts clean. On YES the link is left set up, ready for requests.
+     */
+    fun pair(address: String, code: String?, timeoutMs: Long, cancelled: () -> Boolean,
+             asked: (byApp: Boolean) -> Unit = {}): PairResult {
+        require(code == null || (code.length == 6 && code.all { it in '0'..'9' })) { "The code is six digits." }
         lock.lock()
         try {
             close()
@@ -444,43 +476,73 @@ object BleLink : LinkTransport {
                         "Android still holds an old pairing with the monitor. Forget netmon in the phone's Bluetooth settings, then pair again.")
                 }
             }
-            val states = LinkedBlockingQueue<Int>()
+            val states = LinkedBlockingQueue<IntArray>()
+            val gave = java.util.concurrent.atomic.AtomicBoolean(false)
             val watcher = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
                     val d = bondDevice(intent) ?: return
                     if (!d.address.equals(address, ignoreCase = true)) return
-                    states.add(intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR))
+                    when (intent.action) {
+                        BluetoothDevice.ACTION_BOND_STATE_CHANGED -> states.add(intArrayOf(
+                            intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR),
+                            intent.getIntExtra(EXTRA_REASON, 0)))
+                        BluetoothDevice.ACTION_PAIRING_REQUEST -> {
+                            // A passkey the board shows arrives as a PIN request;
+                            // Android sends its six digits on as the passkey.
+                            val variant = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, BluetoothDevice.ERROR)
+                            var took = false
+                            if (code != null && variant == BluetoothDevice.PAIRING_VARIANT_PIN) {
+                                took = try {
+                                    d.setPin(code.toByteArray(Charsets.US_ASCII))
+                                } catch (e: SecurityException) {
+                                    false
+                                }
+                                // Nobody else needs to hear of it: no prompt.
+                                if (took && isOrderedBroadcast) abortBroadcast()
+                            }
+                            gave.set(took)
+                            asked(took)
+                        }
+                    }
                 }
             }
-            registerBondWatcher(watcher)
+            registerPairingWatcher(watcher)
             try {
                 val gen = connect(dev)
-                // Some phones wait for an app to ask rather than answer the
-                // board's own request; asking twice does no harm.
-                if (dev.bondState == BluetoothDevice.BOND_NONE) dev.createBond()
+                if (dev.bondState == BluetoothDevice.BOND_NONE && !dev.createBond()) {
+                    close()
+                    return PairResult(Paired.FAILED, "Android would not start pairing. Switch Bluetooth off and on, then try again.")
+                }
                 val until = System.currentTimeMillis() + timeoutMs
                 var started = false
                 while (dev.bondState != BluetoothDevice.BOND_BONDED) {
                     if (cancelled()) {
                         close()
-                        return Paired.CANCELLED
+                        if (dev.bondState == BluetoothDevice.BOND_BONDING) removeBond(dev)
+                        return PairResult(Paired.CANCELLED)
                     }
                     if (System.currentTimeMillis() > until) {
                         close()
-                        return Paired.FAILED
+                        return PairResult(Paired.FAILED, "Pairing took too long.", gave.get())
                     }
                     val s = states.poll(300, TimeUnit.MILLISECONDS)
-                    if (s == BluetoothDevice.BOND_BONDING) started = true
-                    if (s == BluetoothDevice.BOND_NONE && started) {
+                    if (s != null && s[0] == BluetoothDevice.BOND_BONDING) started = true
+                    if (s != null && s[0] == BluetoothDevice.BOND_BONDED) break
+                    if (s != null && s[0] == BluetoothDevice.BOND_NONE && started) {
                         close()
-                        return Paired.FAILED
+                        return PairResult(Paired.FAILED, unbondText(s[1]), gave.get())
                     }
                     // The connection dropped before the pairing finished.
                     var e = events.poll()
                     while (e != null) {
                         if (e.gen == gen && e.kind == DISCONNECTED && dev.bondState != BluetoothDevice.BOND_BONDED) {
+                            // Its bond state follows a moment later, with the reason.
+                            val late = settled(states, 1500)
                             close()
-                            return Paired.FAILED
+                            if (dev.bondState == BluetoothDevice.BOND_BONDED) return PairResult(Paired.YES, codeByApp = gave.get())
+                            val why = if (late != null && late[0] == BluetoothDevice.BOND_NONE && late[1] != 0) unbondText(late[1])
+                                else "The Bluetooth connection dropped before pairing finished."
+                            return PairResult(Paired.FAILED, why, gave.get())
                         }
                         e = events.poll()
                     }
@@ -495,7 +557,7 @@ object BleLink : LinkTransport {
                 } catch (e: ApiException) {
                     close()
                 }
-                return Paired.YES
+                return PairResult(Paired.YES, codeByApp = gave.get())
             } finally {
                 try {
                     app.unregisterReceiver(watcher)
@@ -504,6 +566,17 @@ object BleLink : LinkTransport {
             }
         } finally {
             lock.unlock()
+        }
+    }
+
+    /** The first bond state after [states] stops saying "bonding", within [ms]; null if none came. */
+    private fun settled(states: LinkedBlockingQueue<IntArray>, ms: Long): IntArray? {
+        val until = System.currentTimeMillis() + ms
+        while (true) {
+            val left = until - System.currentTimeMillis()
+            if (left <= 0) return null
+            val s = states.poll(left, TimeUnit.MILLISECONDS) ?: return null
+            if (s[0] != BluetoothDevice.BOND_BONDING) return s
         }
     }
 
@@ -539,8 +612,13 @@ object BleLink : LinkTransport {
             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
         }
 
-    private fun registerBondWatcher(r: BroadcastReceiver) {
+    // Bond changes, and Android asking for the code. That second one is an
+    // ordered broadcast: heard first, at a high priority, the app can answer
+    // it and stop Android's own prompt from appearing.
+    private fun registerPairingWatcher(r: BroadcastReceiver) {
         val f = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        f.addAction(BluetoothDevice.ACTION_PAIRING_REQUEST)
+        f.priority = IntentFilter.SYSTEM_HIGH_PRIORITY - 1
         if (Build.VERSION.SDK_INT >= 33) {
             app.registerReceiver(r, f, Context.RECEIVER_EXPORTED)
         } else {

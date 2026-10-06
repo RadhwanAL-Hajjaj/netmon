@@ -1,6 +1,7 @@
 package com.example.netmon
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -13,6 +14,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.InputType
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -46,10 +48,13 @@ import com.example.netmon.ui.column
 import com.example.netmon.ui.dialog
 import com.example.netmon.ui.dp
 import com.example.netmon.ui.dpf
+import com.example.netmon.ui.hint
+import com.example.netmon.ui.input
 import com.example.netmon.ui.label
 import com.example.netmon.ui.pressable
 import com.example.netmon.ui.rounded
 import com.example.netmon.ui.row
+import com.example.netmon.ui.switchRow
 
 class MainActivity : Activity() {
 
@@ -202,7 +207,7 @@ class MainActivity : Activity() {
         pill.setPadding(dp(12), dp(7), dp(12), dp(7))
         pill.background = pressable(rounded(T.SURFACE, dpf(16f)), dpf(16f))
         pill.isClickable = true
-        pill.setOnClickListener { showConnect() }
+        pill.setOnClickListener { if (Board.needsLogin) showLogin() else showConnect() }
         return bar
     }
 
@@ -283,7 +288,7 @@ class MainActivity : Activity() {
         val h = Board.health
         versionLabel.text = h?.version ?: ""
         val base = Board.base
-        val (dot, words) = when (Board.link) {
+        val (dot, words) = if (Board.needsLogin && base != null) T.WARN to "Sign in" else when (Board.link) {
             Board.Link.NONE -> T.TEXT3 to "Not set up"
             Board.Link.CONNECTING -> T.TEXT3 to "Connecting"
             Board.Link.LOST -> T.BAD to "Not answering"
@@ -296,7 +301,8 @@ class MainActivity : Activity() {
         sb.setSpan(ForegroundColorSpan(dot), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         sb.append(words)
         pill.text = sb
-        pill.contentDescription = "Monitor: $words. Tap to change."
+        pill.contentDescription = if (Board.needsLogin) "The monitor asks for its password. Tap to sign in."
+            else "Monitor: $words. Tap to change."
     }
 
     // --- navigation -------------------------------------------------------------
@@ -369,6 +375,84 @@ class MainActivity : Activity() {
         if (!::pill.isInitialized) return
         renderTopBar()
         showing?.render()
+        // The board wants a password (firmware 0.13): asked once each time;
+        // after "Not now", the top bar's Sign in asks again.
+        if (Board.needsLogin) {
+            if (!loginAsked && resumed && showing !is ConnectScreen) {
+                loginAsked = true
+                showLogin()
+            }
+        } else {
+            loginAsked = false
+        }
+    }
+
+    // --- signing in (firmware 0.13) -------------------------------------------------
+
+    private var loginDialog: AlertDialog? = null
+    private var loginAsked = false
+
+    /** Asks for the board's password: the login password, or the update password. */
+    fun showLogin() {
+        if (loginDialog?.isShowing == true || isFinishing || isDestroyed) return
+        val base = Board.base ?: return
+        val box = column()
+        box.add(label("The monitor at ${NetmonClient.display(base)} asks for its password: your login password, " +
+            "or the update password from secrets.h.", 15f, T.TEXT2))
+        val pw = box.add(input("Password", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD), top = 12)
+        val canSave = Auth.canSave()
+        val (saveRow, save) = switchRow("Save password", canSave) {}
+        save.isEnabled = canSave
+        box.add(saveRow, top = 8)
+        box.add(hint(if (canSave) "Saved encrypted, for this app only, so the app signs in again by itself whenever " +
+            "the monitor asks." else "This phone cannot keep a password safely, so the app asks again when the monitor does."), top = 2)
+        val msg = box.add(label("", 14f, T.BAD), top = 8)
+        msg.visibility = View.GONE
+        val d = AlertDialog.Builder(this)
+            .setTitle("Sign in to the monitor")
+            .setView(FrameLayout(this).apply {
+                setPadding(dp(24), dp(8), dp(24), dp(4))
+                addView(box, FrameLayout.LayoutParams(MATCH, WRAP))
+            })
+            .setPositiveButton("Sign in", null)
+            .setNegativeButton("Not now", null)
+            .create()
+        loginDialog = d
+        d.setOnShowListener {
+            val go = d.getButton(AlertDialog.BUTTON_POSITIVE)
+            go.setOnClickListener {
+                val password = pw.text.toString()
+                if (password.isEmpty()) {
+                    msg.setTextColor(T.BAD)
+                    msg.text = "Enter the password."
+                    msg.visibility = View.VISIBLE
+                    return@setOnClickListener
+                }
+                go.isEnabled = false
+                msg.setTextColor(T.TEXT2)
+                msg.text = "Signing in"
+                msg.visibility = View.VISIBLE
+                Board.signIn(password, save.isChecked) { err ->
+                    go.isEnabled = true
+                    if (err == null) {
+                        if (d.isShowing) d.dismiss()
+                        Toast.makeText(this, "Signed in", Toast.LENGTH_SHORT).show()
+                        return@signIn
+                    }
+                    msg.setTextColor(T.BAD)
+                    msg.text = when {
+                        err.kind == ApiException.Kind.Unauthorized -> "That password is not right."
+                        err.status == 429 && err.retryS > 0 -> "Too many wrong passwords. Try again in ${err.retryS} seconds."
+                        else -> err.message ?: "Could not sign in."
+                    }
+                    pw.selectAll()
+                }
+            }
+        }
+        d.setOnDismissListener { if (loginDialog === d) loginDialog = null }
+        d.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        d.show()
+        pw.requestFocus()
     }
 
     @Deprecated("Deprecated in Java")

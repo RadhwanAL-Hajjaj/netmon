@@ -1,6 +1,7 @@
 package com.example.netmon.ui
 
 import android.content.res.ColorStateList
+import android.text.InputFilter
 import android.text.InputType
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -183,27 +184,53 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
     }
 
     /**
-     * Pairs with a monitor heard over Bluetooth. Its code is on its Settings
-     * page, open on some device on its Wi-Fi; Android asks for it.
+     * Pairs with a monitor heard over Bluetooth. The code is the one its
+     * Settings page shows, on some device on its Wi-Fi, or the owner's own;
+     * the person enters it here and the app gives it to Android.
      */
     private fun pairWith(h: BleLink.Heard) {
         val c = ctx
-        if (!h.pairing) {
-            c.dialog("Open a pairing window first",
-                c.label("On any phone or computer on the monitor's Wi-Fi, open the monitor's Settings page and press " +
-                    "Pair a phone in the Bluetooth section. It shows a 6-digit code. Then tap Pair here, and type that " +
-                    "code when Android asks.", 15f, T.TEXT2),
-                "Pair now", { runPair(h) }, negative = "Close")
-            return
+        val box = c.column()
+        box.add(c.label(if (h.pairing) "Enter the 6-digit code the monitor's Settings page shows, or your own pairing code."
+            else "This monitor has no pairing window open. On any phone or computer on its Wi-Fi, open its Settings " +
+                "page and press Pair a phone in the Bluetooth section. Then enter the code it shows, or your own " +
+                "pairing code.", 15f, T.TEXT2))
+        val code = box.add(c.input("6-digit code", InputType.TYPE_CLASS_NUMBER), top = 12)
+        code.filters = arrayOf(InputFilter.LengthFilter(6))
+        code.letterSpacing = 0.12f
+        val msg = box.add(c.label("", 14f, T.BAD), top = 8)
+        msg.visibility = View.GONE
+        val d = AlertDialog.Builder(c)
+            .setTitle("Pair with ${h.name}")
+            .setView(FrameLayout(c).apply {
+                setPadding(c.dp(24), c.dp(8), c.dp(24), c.dp(4))
+                addView(box, FrameLayout.LayoutParams(MATCH, WRAP))
+            })
+            .setPositiveButton("Pair", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+        d.setOnShowListener {
+            d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val digits = code.text.toString().trim()
+                if (digits.length != 6 || digits.any { it !in '0'..'9' }) {
+                    msg.text = "The code is six digits."
+                    msg.visibility = View.VISIBLE
+                    return@setOnClickListener
+                }
+                d.dismiss()
+                runPair(h, digits)
+            }
         }
-        runPair(h)
+        d.show()
+        code.requestFocus()
     }
 
-    private fun runPair(h: BleLink.Heard) {
+    private fun runPair(h: BleLink.Heard, digits: String) {
         endScan("Pairing with ${h.address}")
         val c = ctx
         val box = c.column()
-        box.add(c.label("When Android asks, type the 6-digit code the monitor's Settings page shows.", 15f, T.TEXT2))
+        val status = box.add(c.label("Connecting to the monitor", 15f, T.TEXT2))
+        box.add(c.hint("The app enters the code for you. If Android asks for it anyway, type it there."), top = 10)
         val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         val d = AlertDialog.Builder(c)
             .setTitle("Pairing")
@@ -217,16 +244,20 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
         d.show()
         Thread({
             val result: Any = try {
-                BleLink.pair(h.address, 110_000) { cancelled.get() }
+                BleLink.pair(h.address, digits, 110_000, { cancelled.get() }) { byApp ->
+                    if (d.isShowing) status.text = if (byApp) "Code entered. Finishing" else "Type the code where Android asks for it"
+                }
             } catch (e: ApiException) {
                 e
             }
             main.post {
                 if (d.isShowing) d.dismiss()
                 when (result) {
-                    BleLink.Paired.YES -> choose(LinkCodec.SCHEME + h.address)
-                    BleLink.Paired.FAILED -> btStatus.text = "Pairing did not finish: a wrong code, no pairing window open, or it took too long."
-                    BleLink.Paired.CANCELLED -> btStatus.text = ""
+                    is BleLink.PairResult -> when (result.result) {
+                        BleLink.Paired.YES -> choose(LinkCodec.SCHEME + h.address)
+                        BleLink.Paired.FAILED -> btStatus.text = "Pairing did not finish. " + result.why
+                        BleLink.Paired.CANCELLED -> btStatus.text = ""
+                    }
                     is ApiException -> btStatus.text = result.message ?: "Pairing did not work."
                 }
                 btStatus.visibility = if (btStatus.text.isEmpty()) View.GONE else View.VISIBLE
@@ -279,7 +310,8 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
         r.isClickable = true
         val col = c.column()
         col.add(c.label(NetmonClient.display(board.base), 17f, T.TEXT, Fonts.medium, numbers = true))
-        col.add(c.label("netmon ${board.version}, found by ${board.via}", 13f, T.TEXT2), top = 2)
+        col.add(c.label("netmon ${board.version}, found by ${board.via}" + if (board.login) ", asks for a password" else "",
+            13f, T.TEXT2), top = 2)
         r.add(col, 0, WRAP, weight = 1f)
         r.add(c.label("Use", 15f, T.ACCENT, Fonts.medium), WRAP, WRAP, start = 8)
         r.setOnClickListener { choose(board.base) }

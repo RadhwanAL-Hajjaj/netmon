@@ -24,8 +24,8 @@ android {
         minSdk = 26
         targetSdk = 34
         // Keep in step with BuildInfo in CrashLog.kt.
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "1.3.1"
     }
 
     // With keystore.properties present, debug builds are signed with the same

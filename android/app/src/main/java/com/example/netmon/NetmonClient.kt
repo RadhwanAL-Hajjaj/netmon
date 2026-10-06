@@ -486,6 +486,17 @@ object RestartWatch {
                     else -> Outcome.SameVersion(h.version)
                 }
             } catch (e: ApiException) {
+                // Asked to sign in: the board is back, running 0.13 or later.
+                // Coming from 0.12 the phone has no session for it yet, so it
+                // learns the version from /api/auth, which asks for none.
+                if (e.kind == ApiException.Kind.LoginRequired) {
+                    val id = try {
+                        probe.identify()
+                    } catch (x: RuntimeException) {
+                        null
+                    }
+                    if (id != null) return if (id.version != oldVersion) Outcome.Updated(id.version) else Outcome.SameVersion(id.version)
+                }
                 if (now() - uploadStartedMs > giveUpAfterMs) return Outcome.NoAnswer
                 sleep(retryMs)
             }

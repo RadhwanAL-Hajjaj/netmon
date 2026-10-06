@@ -47,7 +47,7 @@ class Discovery(context: Context, private val listener: Listener) {
         NetRoute.pinIfNeeded(app)
         val p = Executors.newFixedThreadPool(32)
         pool = p
-        if (saved != null) p.execute { probe(saved, "last used") }
+        if (saved != null && !LinkCodec.isBle(saved)) p.execute { probe(saved, "last used") }
         startNsd()
 
         val lan = NetRoute.local(app)
@@ -92,7 +92,7 @@ class Discovery(context: Context, private val listener: Listener) {
     }
 
     private fun probe(base: String, via: String, quick: Boolean = false) {
-        if (stopped.get()) return
+        if (stopped.get() || LinkCodec.isBle(base)) return
         val c = try {
             NetmonClient(base)
         } catch (e: IllegalArgumentException) {
@@ -105,7 +105,16 @@ class Discovery(context: Context, private val listener: Listener) {
             c.connectTimeoutMs = 2500
             c.readTimeoutMs = 4000
         }
-        val h = c.identify() ?: return
+        // stop() interrupts the probes still running; one interrupted while it
+        // waits simply ends. An exception escaping a pool thread would end the app.
+        val h = try {
+            c.identify()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        } catch (e: RuntimeException) {
+            null
+        } ?: return
         report(Found(c.base, h.version, via, h.login))
     }
 

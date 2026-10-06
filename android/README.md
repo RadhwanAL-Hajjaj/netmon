@@ -6,7 +6,7 @@ including the Wi-Fi and Bluetooth radars, the Finder and the network map, plus
 notifications, a longer event history kept on the phone, the board's saved
 reports, and firmware updates from the phone.
 
-Version 1.3.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
+Version 1.3.1, for Android 8.0 and later. It works with netmon firmware 0.9.x
 and later, and shows what each board has: network history needs firmware 0.9.4
 or later, the DHCP listener status 0.9.6, Nearby 0.10, the Finder and the
 access points on the map 0.11, Bluetooth and saved reports 0.12, and signing
@@ -222,7 +222,7 @@ Where the toolchain folder is not `../tc`, set `TOOLCHAIN`. kotlinc needs
 about 2 GB of heap for the API 35 jar; the script asks for that unless
 `JAVA_OPTS` says otherwise.
 
-**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2293 checks of the
+**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2296 checks of the
 parsers, formatting, settings validation, firmware checks, event history,
 alert rules, the Nearby, Finder and map logic, the Bluetooth link's frames
 (against the same bytes the firmware's own tests use), the choice between
@@ -296,6 +296,16 @@ app/src/main/java/com/example/netmon/
   page's do, so they sound with the phone on silent once you turn them on.
 
 ## Changes
+
+**1.3.1**
+- Fixed: the app stopped when *Find your monitor* was opened while it was
+  using Bluetooth. The search asked the board over Bluetooth as "the address
+  used last time", and ending the search cut that request off mid-wait. The
+  search now only ever looks on the network, and a Bluetooth request that is
+  stopped part-way just ends.
+- Updating a board from 0.12 to 0.13 from the app now reports the new
+  version, rather than "no answer" after two and a half minutes: the board
+  that comes back asks to sign in, which the update watch now counts as back.
 
 **1.3.0**
 - Signing in (firmware 0.13): the app asks for the monitor's password once,

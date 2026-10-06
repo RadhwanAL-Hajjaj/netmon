@@ -294,7 +294,9 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
         status.text = if (lan == null) "This phone is not on Wi-Fi. Looking anyway." else "Looking on ${subnetText(lan)}"
         val d = Discovery(ctx, this)
         discovery = d
-        d.start(Board.base)
+        // The board's address on Wi-Fi, never its Bluetooth route: looking
+        // for boards is a network search.
+        d.start(Board.wifiBase)
     }
 
     private fun subnetText(lan: NetRoute.Local): String = "the network around ${lan.ipText}"

@@ -422,6 +422,9 @@ class H(BaseHTTPRequestHandler):
                 STATE["boot"] = rp[0] + 1.5  # comes back 1.5 s after going down
                 STATE["version"] = rp[1]
                 STATE["restart_pending"] = None
+                # An image of 0.13 or later comes back asking to sign in.
+                if re.match(r"0\.(1[3-9]|[2-9]\d)\.", rp[1]):
+                    STATE["fw"] = "0.13"
             if time.time() < STATE["boot"]:
                 return False  # still "restarting"
         mode = STATE["mode"]

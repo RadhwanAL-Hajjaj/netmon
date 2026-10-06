@@ -1471,6 +1471,24 @@ fun client13Tests() {
     eq(throws<ApiException>("upload without a session") { bare.uploadFirmware(img, "netmon.ino.bin", "test-key") { _, _ -> } }?.kind,
         ApiException.Kind.LoginRequired, "an upload without a session")
 
+    // From 0.12 to 0.13 over the air: the phone has no session for the board
+    // that comes back, which asks for one. The watch still sees it is back,
+    // and with which version.
+    mock("/__reset", "POST")
+    mock("/__fw?v=0.12", "POST")
+    val old = NetmonClient(MOCK)
+    val v13 = ByteArray(300_000).also { it[0] = 0xE9.toByte() }
+    val tag = "\u00000.13.0-login\u0000".toByteArray(Charsets.ISO_8859_1)
+    System.arraycopy(tag, 0, v13, 123_456, tag.size)
+    val t1 = System.currentTimeMillis()
+    old.uploadFirmware(v13, "netmon-0.13.0.ino.bin", "test-key") { _, _ -> }
+    eq(RestartWatch.await(MOCK, t1, "0.12.0-bluetooth", null, firstLookMs = 1000, retryMs = 200, giveUpAfterMs = 20_000),
+        RestartWatch.Outcome.Updated("0.13.0-login"), "0.12 to 0.13: back, and asking to sign in")
+    eq(throws<ApiException>("0.13 after the update") { old.health() }?.kind, ApiException.Kind.LoginRequired,
+        "the new firmware wants a session")
+    mock("/__reset", "POST")
+    mock("/__fw?v=0.13", "POST")
+
     // Too many wrong passwords: the board says how long to wait.
     val t = NetmonClient(MOCK)
     repeat(6) { try { t.login("guess-$it", true) } catch (e: ApiException) {} }

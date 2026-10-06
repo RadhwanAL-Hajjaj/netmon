@@ -139,7 +139,18 @@ object BleLink : LinkTransport {
         lock.lock()
         try {
             lastUsedMs = System.currentTimeMillis()
-            if (ready != address || gatt == null) open(address)
+            if (ready != address || gatt == null) {
+                try {
+                    open(address)
+                } catch (e: InterruptedException) {
+                    // Stopped while the link was being set up (Find your
+                    // monitor ending its search, say): the half-open
+                    // connection goes, and the request ends unanswered.
+                    close()
+                    Thread.currentThread().interrupt()
+                    throw ApiException(ApiException.Kind.Unreachable, "Stopped before the monitor answered over Bluetooth.")
+                }
+            }
             val id = nextId
             nextId = if (nextId >= 255) 1 else nextId + 1
             try {
@@ -147,6 +158,10 @@ object BleLink : LinkTransport {
             } catch (e: LinkCodec.Closed) {
                 close()
                 throw ApiException(ApiException.Kind.Unreachable, "The Bluetooth connection to the monitor dropped.")
+            } catch (e: InterruptedException) {
+                close()
+                Thread.currentThread().interrupt()
+                throw ApiException(ApiException.Kind.Unreachable, "Stopped before the monitor answered over Bluetooth.")
             } catch (e: ApiException) {
                 // An answer that never finished leaves the link in doubt: start
                 // the next request on a fresh one.

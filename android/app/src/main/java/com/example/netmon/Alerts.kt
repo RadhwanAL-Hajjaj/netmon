@@ -16,6 +16,7 @@ import android.os.Build
 object Alerts {
 
     const val CHANNEL = "new_devices"
+    const val CHANNEL_WATCH = "lan_watch"
     const val EXTRA_TAB = "tab"
     const val EXTRA_MAC = "mac"
     private const val JOB_ID = 4201
@@ -29,6 +30,58 @@ object Alerts {
         ch.description = "A device joined the network the monitor watches."
         nm.createNotificationChannel(ch)
     }
+
+    fun ensureWatchChannel(context: Context) {
+        val nm = context.getSystemService(NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(CHANNEL_WATCH) != null) return
+        val ch = NotificationChannel(CHANNEL_WATCH, "LAN watch", NotificationManager.IMPORTANCE_HIGH)
+        ch.description = "The router, a DHCP server or an access point changed on the network the monitor watches."
+        nm.createNotificationChannel(ch)
+    }
+
+    /**
+     * The LAN watch's events (firmware 0.14) new to this phone. Only recent ones:
+     * the first reading after the app is installed holds whatever the board
+     * still remembers, and an alert from hours ago is history, not news.
+     */
+    fun notifyWatch(context: Context, events: List<LoggedEvent>) {
+        if (AppState.prefs.alertMode == AlertMode.OFF || !allowed(context)) return
+        val now = System.currentTimeMillis()
+        val tell = events.filter { it.type in Format.WATCH && now - it.wallMs < 6 * 3_600_000L }
+        if (tell.isEmpty()) return
+        val nm = context.getSystemService(NotificationManager::class.java) ?: return
+        ensureWatchChannel(context)
+        for (e in tell) {
+            val open = Intent(context, MainActivity::class.java)
+                .putExtra(EXTRA_TAB, "events")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            val pi = PendingIntent.getActivity(
+                context, e.key.hashCode(), open,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val where = listOf(e.ip.takeIf { it.isNotBlank() && it != "0.0.0.0" }, e.mac.ifBlank { null })
+                .filterNotNull().joinToString("   ")
+            val n = Notification.Builder(context, CHANNEL_WATCH)
+                .setSmallIcon(R.drawable.ic_stat_netmon)
+                .setColor(0xFFF0605F.toInt())
+                .setContentTitle(Format.eventTitle(e.type))
+                .setContentText(e.text)
+                .setStyle(Notification.BigTextStyle().bigText(listOf(e.text, where).filter { it.isNotBlank() }.joinToString("\n")))
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setCategory(Notification.CATEGORY_STATUS)
+                .setWhen(e.wallMs)
+                .setShowWhen(true)
+                .build()
+            try {
+                nm.notify(WATCH_TAG, e.key.hashCode(), n)
+            } catch (x: SecurityException) {
+                return
+            }
+        }
+    }
+
+    private const val WATCH_TAG = "watch"
 
     /** Whether Android will actually show them: the runtime permission, and the app-level switch. */
     fun allowed(context: Context): Boolean {

@@ -5,6 +5,7 @@
 
 // lwIP's ARP table lives behind these. Paths are stable across ESP32 core
 // 2.x and 3.x; if a build fails here, that is the first thing to check.
+#include "lwip/dhcp.h"
 #include "lwip/err.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
@@ -97,3 +98,12 @@ size_t arp_read_cache(ArpHit* out, size_t max) {
 }
 
 size_t arp_cache_capacity() { return ARP_TABLE_SIZE; }
+
+uint32_t lan_dhcp_server() {
+    CoreLock lock;
+    struct netif* nif = sta_netif_locked();
+    if (nif == nullptr || !dhcp_supplied_address(nif)) return 0;
+    const struct dhcp* d = netif_dhcp_data(nif);
+    if (d == nullptr) return 0;
+    return lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&d->server_ip_addr)));
+}

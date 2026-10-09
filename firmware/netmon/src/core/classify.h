@@ -40,3 +40,24 @@ inline Status classify_device(uint32_t now_s, uint32_t first_scan_s,
     if (randomised) return Status::Private;
     return classify_new(now_s, first_scan_s, window_s);
 }
+
+// From 0.12 the board remembers, per network, the devices it recognises
+// (baseline.h). A device on that list is known whenever it turns up, and once
+// a learning window has closed on the network the list is the whole answer:
+// anything else with a manufacturer MAC is unknown from the first sweep after
+// a restart. Before then, the window decides as it always has.
+inline Status classify_remembered(uint32_t now_s, uint32_t first_scan_s,
+                                  uint32_t window_s, bool randomised,
+                                  bool listed, bool learned) {
+    if (randomised) return Status::Private;
+    if (listed) return Status::Known;
+    if (learned) return Status::Unknown;
+    return classify_new(now_s, first_scan_s, window_s);
+}
+
+// Whether new devices are still taken as known: the window is open and nothing
+// has been learned on this network before.
+inline bool still_learning(uint32_t now_s, uint32_t first_scan_s,
+                           uint32_t window_s, bool learned) {
+    return !learned && in_learning_window(now_s, first_scan_s, window_s);
+}

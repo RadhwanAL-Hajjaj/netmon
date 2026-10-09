@@ -51,7 +51,7 @@ async def main():
         res["page_sends_to_login"] = page.url.startswith(BASE + "/login?next=") and \
             unquote(page.url.split("next=")[1]) == "/settings"
         res["login_page_text"] = (await page.inner_text("h1")) == "Sign in" and \
-            "0.13.0" in await page.inner_text("#ver") and "netmon at 127.0.0.1" in await page.inner_text("#who")
+            "0.14.0" in await page.inner_text("#ver") and "netmon at 127.0.0.1" in await page.inner_text("#who")
         res["autocomplete_names"] = await page.get_attribute("#pw", "autocomplete") == "current-password" and \
             await page.get_attribute("#user", "autocomplete") == "username"
         r = await page.request.get(BASE + "/api/health")

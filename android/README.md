@@ -89,7 +89,9 @@ learned, free memory), gateway latency, and recent activity.
 
 **Devices.** Search by name, address or maker; filter by status; sort by
 address, name, status, maker or time online. Tap a device for its details, to
-copy its MAC or address, or to open its web page.
+copy its MAC or address, or to open its web page. With firmware 0.14 the
+details also offer **Trust**, for an unrecognised device, and **Forget**: the
+board keeps the recognised devices for each network across restarts.
 
 *Map*, at the top of Devices, draws the network as the board's Map page does:
 the router in the middle, the internet above it, and around it a bubble per
@@ -186,7 +188,13 @@ from the readings the phone has collected. Unanswered checks show as red dots.
 ## Notifications
 
 "Unrecognised devices" follows the board's own verdict: a device with a
-manufacturer address first seen after the learning window. "Every new device"
+manufacturer address first seen after the learning window. Both settings also
+notify what the board's LAN watch notices (firmware 0.14): the router
+answering from another device, two devices on one address, an unexpected DHCP
+server, an unknown access point with your Wi-Fi name or one offering weaker
+security. Those come on a channel of their own, *LAN watch*, and only for
+alerts from the last six hours. Accept or dismiss them on the board's Events
+page. "Every new device"
 also covers devices the phone has never seen before, including phones with
 private addresses, and remembers them even after the board restarts and starts
 learning again.
@@ -222,7 +230,7 @@ Where the toolchain folder is not `../tc`, set `TOOLCHAIN`. kotlinc needs
 about 2 GB of heap for the API 35 jar; the script asks for that unless
 `JAVA_OPTS` says otherwise.
 
-**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2296 checks of the
+**Tests:** `tools/test/run.sh` runs `tools/test/CoreTest.kt`: 2321 checks of the
 parsers, formatting, settings validation, firmware checks, event history,
 alert rules, the Nearby, Finder and map logic, the Bluetooth link's frames
 (against the same bytes the firmware's own tests use), the choice between
@@ -296,6 +304,10 @@ app/src/main/java/com/example/netmon/
   page's do, so they sound with the phone on silent once you turn them on.
 
 ## Changes
+
+**Unreleased**
+- Trust and Forget in a device's details, and the LAN watch's alerts in
+  Events, on the Overview and as notifications (firmware 0.14).
 
 **1.3.1**
 - Fixed: the app stopped when *Find your monitor* was opened while it was

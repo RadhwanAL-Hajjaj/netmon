@@ -77,7 +77,8 @@ class EventHistory(private val file: File?, private val capacity: Int = 600) {
      * Folds in one reading of /api/events taken at [nowWallMs], when the
      * board reported [uptimeS]. Returns how many entries were new.
      */
-    fun merge(nowWallMs: Long, uptimeS: Long, events: List<BoardEvent>): Int {
+    fun merge(nowWallMs: Long, uptimeS: Long, events: List<BoardEvent>,
+              fresh: MutableList<LoggedEvent>? = null): Int {
         val boot = nowWallMs - uptimeS * 1000
         var added = 0
         if (bootWallMs == 0L) {
@@ -105,7 +106,10 @@ class EventHistory(private val file: File?, private val capacity: Int = 600) {
             val key = "${bootWallMs / 1000}|${e.atS}|${e.type}|${e.mac}|${e.text}"
             val ev = LoggedEvent(bootWallMs + e.atS * 1000, e.type, e.mac, e.ip, e.text, key)
             if (ev.wallMs <= clearedAtMs) continue
-            if (insert(ev)) added++
+            if (insert(ev)) {
+                added++
+                fresh?.add(ev)
+            }
         }
         return added
     }

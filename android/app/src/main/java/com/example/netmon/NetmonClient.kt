@@ -137,6 +137,18 @@ class NetmonClient(address: String) {
         post("/api/reboot", ByteArray(0), null)
     }
 
+    // --- Recognised devices (firmware 0.14) -------------------------------------
+
+    /** Marks a device as known on the board's network, kept across restarts. */
+    fun trustDevice(mac: String) {
+        post("/api/devices/trust", Parse.macBody(mac).toByteArray(Charsets.UTF_8), "application/json")
+    }
+
+    /** Stops recognising a device: off the list and the table, flagged if it turns up again. */
+    fun forgetDevice(mac: String) {
+        post("/api/devices/forget", Parse.macBody(mac).toByteArray(Charsets.UTF_8), "application/json")
+    }
+
     // --- Nearby, Finder and Map (firmware 0.10 and 0.11) ------------------------
 
     /** Both radios' tables. Reading it counts as watching: the board scans quickly for the next 20 s. */
@@ -165,7 +177,7 @@ class NetmonClient(address: String) {
 
     fun map(): MapInfo = Parse.map(get("/api/map"))
 
-    // --- Bluetooth link (firmware 0.12) ------------------------------------------
+    // --- Bluetooth link (firmware 0.14) ------------------------------------------
 
     fun ble(): BleStatus = Parse.ble(get("/api/ble"))
 
@@ -180,7 +192,7 @@ class NetmonClient(address: String) {
     /** Forgets every paired phone, this one included. */
     fun bleForget(): BleStatus = Parse.ble(post("/api/ble/forget", ByteArray(0), null))
 
-    // --- Saved reports and the board's clock (firmware 0.12) ------------------------
+    // --- Saved reports and the board's clock (firmware 0.14) ------------------------
 
     fun reports(): ReportList = Parse.reports(get("/api/reports"))
 

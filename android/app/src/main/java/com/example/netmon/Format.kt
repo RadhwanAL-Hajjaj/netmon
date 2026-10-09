@@ -69,11 +69,15 @@ object Format {
         else -> status.replaceFirstChar { it.uppercase() }
     }
 
+    /** The LAN watch's event types, from firmware 0.14: worth a notification, drawn as alerts. */
+    val WATCH = setOf("router_changed", "ip_conflict", "dhcp_server", "rogue_ap", "weak_ap")
+
     fun statusExplained(d: Device): String = when (d.status) {
-        "known" -> "Seen during the learning window, so the monitor treats it as part of this network."
+        "known" -> "Seen while the monitor was learning this network, or marked as known, so it is treated as part of it."
         "private" -> "Uses a randomised (private) address, which phones change from network to network. " +
             "The monitor does not judge these by the learning window."
-        "unknown" -> "First seen after the learning window closed. If you do not recognise it, check your router."
+        "unknown" -> "First seen after the monitor finished learning this network. If it is yours, trust it; " +
+            "if you do not recognise it, check your router."
         else -> ""
     }
 
@@ -204,6 +208,13 @@ object Format {
         "hostname" -> "Name learned"
         "scan" -> "Sweep started"
         "scan_done" -> "Sweep finished"
+        "trusted" -> "Marked as known"
+        "forgotten" -> "Forgotten"
+        "router_changed" -> "Router changed"
+        "ip_conflict" -> "Address clash"
+        "dhcp_server" -> "Unexpected DHCP server"
+        "rogue_ap" -> "Unknown access point"
+        "weak_ap" -> "Weaker Wi-Fi security"
         EventHistory.TYPE_RESTART -> "Monitor restarted"
         else -> type.replaceFirstChar { it.uppercase() }
     }

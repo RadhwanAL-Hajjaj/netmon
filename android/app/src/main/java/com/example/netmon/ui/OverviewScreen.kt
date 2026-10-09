@@ -129,6 +129,8 @@ class OverviewScreen(host: MainActivity) : Screen(host) {
             h == null -> setVerdict("", T.TEXT2)
             h.inSetupMode -> setVerdict("Setup mode: the monitor could not join any Wi-Fi it knows. Pick a network in Settings.", T.WARN)
             !h.sweepable -> setVerdict("Not scanning: the monitor has no usable subnet.", T.WARN)
+            h.alerts == 1 -> setVerdict("The LAN watch noticed a change on the network. See Events.", T.BAD)
+            h.alerts > 1 -> setVerdict("The LAN watch noticed ${h.alerts} changes on the network. See Events.", T.BAD)
             unknown == 1 -> setVerdict("1 device is not recognised.", T.BAD)
             unknown > 1 -> setVerdict("$unknown devices are not recognised.", T.BAD)
             h.baselineOpen -> {

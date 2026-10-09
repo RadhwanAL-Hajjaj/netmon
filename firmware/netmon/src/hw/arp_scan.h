@@ -20,3 +20,7 @@ size_t arp_read_cache(ArpHit* out, size_t max);
 
 // How many slots the ARP cache has, for diagnostics on /api/health.
 size_t arp_cache_capacity();
+
+// The DHCP server that leased this board its own address, host order, or 0
+// with a fixed address or no lease. The LAN watch counts it as expected.
+uint32_t lan_dhcp_server();

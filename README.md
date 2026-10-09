@@ -32,12 +32,15 @@ router relays. It also gets one of three states:
 
 | State | Meaning |
 |---|---|
-| known | Seen during the 10-minute learning window after start-up |
+| known | On this network's list: seen during its first 10-minute learning window, or marked as known since |
 | private | Uses a randomised (locally administered) MAC, as most phones do. Never flagged |
-| unknown | Has a manufacturer-assigned MAC and first appeared after the learning window. **This is the case worth checking.** |
+| unknown | Has a manufacturer-assigned MAC and is not on the list. **This is the case worth checking.** |
 
-The page also shows uptime as the board has seen it, and the time each offline
-device was last seen.
+The list is kept on the board, one per network, so it survives restarts, power
+cuts and firmware updates. Pick a device in the table to **Trust** it (it
+becomes known and stays known) or **Forget** it (it comes off the list and is
+flagged if it turns up again). The page also shows uptime as the board has
+seen it, and the time each offline device was last seen.
 
 **Map** (`/map`). Draws your network around the router. Devices are grouped by
 what they are (phones, cameras, smart home, servers and so on), going by
@@ -65,7 +68,22 @@ the Settings page, uses the Android app over Bluetooth whenever the board
 doesn't answer on Wi-Fi: within about 10 metres, in setup mode, on another
 network. See [Using netmon over Bluetooth](docs/bluetooth.md).
 
-**Events** (`/events`) lists devices that appeared, went offline or came back.
+**Events** (`/events`) lists devices that appeared, went offline or came back,
+and opens with the **LAN watch**. That notices four things that should not
+change on a home network unless somebody changes them:
+
+| Alert | What changed | Looks like |
+|---|---|---|
+| Router changed | The router's address answers from a different MAC | ARP spoofing, or a replaced router |
+| Address clash | Two MACs keep taking turns answering for one address | Two devices on one fixed address, or one answering for another |
+| Unexpected DHCP server | A device took its address from a server the network doesn't use | A rogue DHCP server, or a second one you added |
+| Unknown or weaker access point | Your Wi-Fi name from an access point that isn't one of yours, or one of yours offering weaker security than before | An evil twin, or a new extender or mesh node |
+
+Each one is logged once and again hourly while it carries on. **Accept** a
+change you made yourself and it becomes the new normal; an address clash can
+only be dismissed. An alert clears by itself a day after it stops. The Devices
+page names the newest one at the top.
+
 **Internet** (`/isp`) shows your public address and provider, plus the
 router's maker and the latency to it. **Settings** (`/settings`) covers Wi-Fi
 setup and the saved-network history, DHCP or a fixed address, monitoring
@@ -91,7 +109,7 @@ intervals and firmware updates from the browser.
    - Board: **ESP32 Dev Module**
    - Partition Scheme: **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**.
      The default 1.2 MB app partition is too small now that Bluetooth is in.
-5. Upload. The image is about 1.55 MB, which is 78% of the app partition.
+5. Upload. The image is about 1.62 MB, which is 82% of the app partition.
 
 To do the same with arduino-cli:
 
@@ -123,7 +141,10 @@ update password keeps working too, as the way back in if you forget yours.
 
 For the first ten minutes everything it sees counts as **known**, because it
 is learning what normal looks like. After that, any new device with a
-manufacturer MAC shows as **unknown**.
+manufacturer MAC shows as **unknown**. What it learned is saved for that
+network, so after a restart or an update there is no second learning window:
+anything new is flagged from the first sweep. To start a network over, use
+**Settings → Recognised devices → Learn this network again**.
 
 The board remembers up to four networks and tries each one for 12 s at
 start-up. If none of them answers, it falls back to `netmon-setup`. While
@@ -196,8 +217,12 @@ the first three below needs a session, from `POST /api/login`, sent as the
 | `POST /api/login` | `{"password":"...","remember":true}`: a session, as the `nm_s` cookie and as `token` in the answer. `429` with `retry_s` after too many wrong passwords |
 | `POST /api/logout` | Ends the asker's session |
 | `POST /api/auth/password`, `POST /api/auth/signout` | `{"current":"...","new":"..."}` sets the login password (`"new":""` removes it) and ends every other session; sign out everywhere |
-| `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, free memory |
+| `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, whether this network's list is saved and how many devices are on it, LAN watch alerts, free memory |
 | `GET /api/devices` | Every device: MAC, IP, hostname, vendor, state, online, uptime, last seen |
+| `POST /api/devices/trust`, `POST /api/devices/forget` | `{"mac": "..."}`: mark a device as known on this network, or take it off the list and out of the table |
+| `GET /api/guard` | What the LAN watch keeps for this network (router MAC, DHCP servers, access points, how many devices are recognised) and its current alerts |
+| `POST /api/guard/accept` | `{"type": "...", "mac": "...", "ip": "..."}` from an alert: accept the change, or dismiss an address clash |
+| `POST /api/guard/relearn` | Forget everything learned on this network and open a new learning window |
 | `GET /api/events` | The last 48 events (appeared, offline, returned, hostname learned) |
 | `GET /api/latency` | Gateway round trip (TCP connect to port 80 or 443, not ICMP) |
 | `GET /api/dhcp` | DHCP listener state and the last request heard |
@@ -226,9 +251,16 @@ that added it.
 
 ## Limitations
 
-- The known/unknown baseline, the event history, the Nearby lists and the map
-  data are all kept in RAM. A restart, including one after an update, starts
-  the learning window again.
+- The event history, the Nearby lists, the map data and the LAN watch's current
+  alerts are kept in RAM and start over after a restart. What the board has
+  learned about each network (the recognised devices, the router's MAC, the
+  DHCP servers and the access points) is kept on flash.
+- The LAN watch sees only what reaches the board. It reads the router's MAC
+  from its own ARP cache, so it notices a spoofer that targets the board too,
+  as whole-network spoofing tools do. It learns a rogue DHCP server from the
+  requests of devices that took its offer. It checks access points only while
+  Nearby Wi-Fi scanning is on, and only on 2.4 GHz. Range extenders that
+  answer for their clients can show up as an address clash.
 - Sessions and the login password live in the board's flash. Lose every
   password and the update password still signs in; lose that too and the
   board needs reflashing over USB with a new `secrets.h`.
@@ -253,7 +285,7 @@ The hardware-independent logic lives in `firmware/netmon/src/core/` and is
 tested on a PC:
 
 ```sh
-cd firmware/test && make test        # 1940 checks, g++ or clang, C++17
+cd firmware/test && make test        # 2187 checks, g++ or clang, C++17
 ```
 
 The web pages are tested in headless Chromium against a simulated board. See

@@ -1,5 +1,6 @@
 package com.example.netmon.ui
 
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -55,6 +56,8 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
     private lateinit var matchNote: TextView
     private var renderedKey = ""
     private var pendingMac: String? = null
+    /** The open device sheet, closed once Trust or Forget has gone through. */
+    private var detail: AlertDialog? = null
 
     override fun build(): View {
         val c = ctx
@@ -306,6 +309,17 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
         if (d.online) body.addKV("Online for").set(Format.duration(d.upS))
         body.addKV("Last seen").set(Format.ago(d.lastSeenS))
 
+        // Firmware 0.14 keeps the recognised devices for this network on the
+        // board: Trust marks one as known for good, Forget takes one off the list.
+        if (Board.health?.lanWatch == true && !d.self) {
+            val manage = body.add(c.row(), top = 16)
+            if (d.isUnknown) {
+                manage.add(c.button("Trust", Btn.PRIMARY) { v -> trust(d, v) }, 0, WRAP, weight = 1f)
+            }
+            manage.add(c.button("Forget", Btn.DANGER) { v -> forget(d, v) }, 0, WRAP, weight = 1f,
+                start = if (d.isUnknown) 8 else 0)
+        }
+
         val actions = body.add(c.row(), top = 16)
         actions.add(c.button("Copy address", Btn.SECONDARY) { copy("IP address", d.ip) }, 0, WRAP, weight = 1f)
         actions.add(c.button("Copy MAC", Btn.SECONDARY) { copy("MAC address", d.mac) }, 0, WRAP, weight = 1f, start = 8)
@@ -318,7 +332,44 @@ class DevicesScreen(host: MainActivity) : Screen(host) {
                 }
             }, WRAP, WRAP, top = 6)
         }
-        c.dialog(Format.deviceName(d), body, "Close", null, negative = null)
+        detail = c.dialog(Format.deviceName(d), body, "Close", null, negative = null)
+    }
+
+    private fun trust(d: Device, v: View) {
+        v.isEnabled = false
+        Board.run({ it.trustDevice(d.mac) }) { _, err ->
+            v.isEnabled = true
+            if (err != null) {
+                Toast.makeText(ctx, err.message ?: "The monitor refused that.", Toast.LENGTH_LONG).show()
+            } else {
+                detail?.dismiss()
+                Toast.makeText(ctx, "${Format.deviceName(d)} is now known on this network.", Toast.LENGTH_SHORT).show()
+                Board.refresh(Board.Part.DEVICES, Board.Part.HEALTH, Board.Part.EVENTS)
+            }
+        }
+    }
+
+    private fun forget(d: Device, v: View) {
+        val c = ctx
+        val note = c.label(
+            if (d.isPrivate) "It comes off the list. A private address is never flagged, so nothing else changes."
+            else "The monitor stops recognising it on this network. If it is still connected it is back at the " +
+                "next sweep, flagged as unrecognised once the monitor has finished learning the network.",
+            14f, T.TEXT2,
+        )
+        c.dialog("Forget ${Format.deviceName(d)}?", note, "Forget", {
+            v.isEnabled = false
+            Board.run({ it.forgetDevice(d.mac) }) { _, err ->
+                v.isEnabled = true
+                if (err != null) {
+                    Toast.makeText(ctx, err.message ?: "The monitor refused that.", Toast.LENGTH_LONG).show()
+                } else {
+                    detail?.dismiss()
+                    Toast.makeText(ctx, "Forgotten.", Toast.LENGTH_SHORT).show()
+                    Board.refresh(Board.Part.DEVICES, Board.Part.HEALTH, Board.Part.EVENTS)
+                }
+            }
+        })
     }
 
     private fun copy(label: String, text: String) {

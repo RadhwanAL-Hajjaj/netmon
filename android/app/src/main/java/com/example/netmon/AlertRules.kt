@@ -4,11 +4,12 @@ enum class AlertMode(val key: String, val title: String, val detail: String) {
     OFF("off", "Off", "No notifications."),
     UNRECOGNISED(
         "unrecognised", "Unrecognised devices",
-        "When the monitor flags a device it does not recognise.",
+        "When the monitor flags a device it does not recognise, or its LAN watch notices a change.",
     ),
     EVERY_NEW(
         "every_new", "Every new device",
-        "Whenever a device this phone has not seen before joins, including phones with private addresses.",
+        "Whenever a device this phone has not seen before joins, including phones with private addresses, " +
+            "and when the LAN watch notices a change.",
     );
 
     companion object {

@@ -19,6 +19,9 @@ object EventRows {
         "back" -> T.OK
         "offline" -> T.WARN
         "hostname" -> T.PRIVATE
+        "trusted" -> T.OK
+        "forgotten" -> T.TEXT2
+        in Format.WATCH -> T.BAD
         EventHistory.TYPE_RESTART -> T.WARN
         else -> T.TEXT
     }
@@ -32,10 +35,16 @@ object EventRows {
         return AppState.nameFor(e.mac) ?: e.mac.ifEmpty { "Unknown device" }
     }
 
-    fun detail(e: LoggedEvent): String = when {
-        e.type == EventHistory.TYPE_RESTART -> "Power cut, update or restart. The board forgets its event list when it starts."
-        e.ip.isNotBlank() && e.mac.isNotBlank() -> "${e.ip}   ${e.mac}"
-        else -> e.mac
+    fun detail(e: LoggedEvent): String {
+        if (e.type == EventHistory.TYPE_RESTART) {
+            return "Power cut, update or restart. The board forgets its event list when it starts."
+        }
+        // An access point's event has no address; the board sends 0.0.0.0.
+        val ip = e.ip.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+        val where = if (ip != null && e.mac.isNotBlank()) "$ip   ${e.mac}" else ip ?: e.mac
+        // The LAN watch's, Trust's and Forget's own words say what happened.
+        val said = e.type in Format.WATCH || e.type == "trusted" || e.type == "forgotten"
+        return if (said && e.text.isNotBlank()) "${e.text}\n$where" else where
     }
 
     private val timeFormat: DateFormat get() = DateFormat.getTimeInstance(DateFormat.SHORT)

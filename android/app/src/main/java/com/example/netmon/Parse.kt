@@ -42,6 +42,10 @@ object Parse {
             bleLink = bool("ble_link"),
             clockUnset = has("clock") && !bool("clock"),
             wifiMac = str("wifi_mac").uppercase(),
+            lanWatch = has("known_saved"),
+            baselineSaved = bool("baseline_saved"),
+            knownSaved = int("known_saved"),
+            alerts = int("alerts"),
         )
     }
 
@@ -330,6 +334,9 @@ object Parse {
     }
 
     fun forgetBody(ssid: String): String = JSONObject().put("ssid", ssid).toString()
+
+    /** The body of POST /api/devices/trust and /api/devices/forget. */
+    fun macBody(mac: String): String = JSONObject().put("mac", mac).toString()
 
     // --- Nearby, Finder and Map --------------------------------------------
 

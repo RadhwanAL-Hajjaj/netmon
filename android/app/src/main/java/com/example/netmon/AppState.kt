@@ -64,10 +64,11 @@ object AppState {
         }
     }
 
-    /** Folds a reading of the board's event list into the on-phone history. */
-    fun absorbEvents(nowMs: Long, uptimeS: Long, events: List<BoardEvent>): Int {
+    /** Folds a reading of the board's event list into the on-phone history; what was new goes in [fresh]. */
+    fun absorbEvents(nowMs: Long, uptimeS: Long, events: List<BoardEvent>,
+                     fresh: MutableList<LoggedEvent>? = null): Int {
         synchronized(lock) {
-            val added = history.merge(nowMs, uptimeS, events)
+            val added = history.merge(nowMs, uptimeS, events, fresh)
             if (added > 0) history.save()
             return added
         }

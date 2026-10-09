@@ -39,6 +39,13 @@ data class Health(
     val clockUnset: Boolean = false,
     /** The address the board uses on Wi-Fi now (0.13): [mac] unless the owner set another. */
     val wifiMac: String = "",
+    // Firmware 0.14: whether it keeps recognised devices on the board (and so
+    // takes Trust and Forget), whether this network's list has been learned,
+    // how many devices are on it, and what the LAN watch is reporting.
+    val lanWatch: Boolean = false,
+    val baselineSaved: Boolean = false,
+    val knownSaved: Int = 0,
+    val alerts: Int = 0,
 ) {
     val inSetupMode: Boolean get() = wifi == "softap"
 }
@@ -63,7 +70,8 @@ data class Device(
 /** One row of GET /api/events, newest first. at_s counts seconds since the board started. */
 data class BoardEvent(
     val atS: Long,
-    val type: String,              // seen, back, offline, hostname, scan, scan_done
+    val type: String,              // seen, back, offline, hostname, scan, scan_done; from 0.14
+                                   // also trusted, forgotten and the LAN watch's: see Format.WATCH
     val mac: String,
     val ip: String,
     val text: String,

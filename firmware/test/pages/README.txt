@@ -13,6 +13,7 @@ The web pages, loaded in headless Chromium against a simulated board.
   python check_bluetooth.py shots
   python check_reports.py shots
   python check_login.py shots
+  python check_guard.py shots
 
 mock_nearby.py serves the pages straight out of pages.h and fakes the
 endpoints they call, behind the same sign-in as firmware 0.13 (its update
@@ -48,6 +49,10 @@ check_login.py  signing in: every page sends you to /login and back (with
                 the page refuses to send you to, Settings' Signing in
                 (own password, sign out, sign out everywhere) and MAC
                 address, phone width
+check_guard.py  Trust and Forget on the Devices page, the LAN watch's alerts
+                on Devices and Events with Accept and Dismiss, Learn again in
+                Settings, phone width in light and dark. Uses the mock's
+                POST /__guard?alerts=0|1&learning=0|1&reset=1 hook
 
 Each prints what it found and lists any script errors; screenshots go in the
 folder given.

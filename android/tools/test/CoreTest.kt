@@ -56,6 +56,7 @@ fun main() {
     authParseTests()
     client13Tests()
     link13Tests()
+    lanWatchTests()
     println("passed $passed, failed $failed")
     if (failed > 0) System.exit(1)
 }
@@ -1519,4 +1520,47 @@ fun link13Tests() {
         Link.transport = saved
         mock("/__reset", "POST")
     }
+}
+
+// Firmware 0.14: recognised devices kept on the board, Trust and Forget, and
+// the LAN watch's events.
+fun lanWatchTests() {
+    val old = Parse.health("""{"status":"ok","version":"0.13.0-login","wifi":"connected","uptime_s":10}""")
+    check(!old.lanWatch, "0.13 has no Trust or Forget")
+    eq(old.alerts, 0, "0.13 reports no alerts")
+    val h = Parse.health("""{"status":"ok","version":"0.14.0-guard","wifi":"connected","uptime_s":10,""" +
+        """"baseline_open":false,"baseline_saved":true,"known_saved":23,"alerts":2}""")
+    check(h.lanWatch, "0.14 takes Trust and Forget")
+    check(h.baselineSaved, "health.baseline_saved")
+    eq(h.knownSaved, 23, "health.known_saved")
+    eq(h.alerts, 2, "health.alerts")
+    // Saved, nothing learned yet: still a 0.14 board.
+    check(Parse.health("""{"known_saved":0}""").lanWatch, "known_saved present, even zero")
+
+    eq(JSONObject(Parse.macBody("AA:BB:CC:DD:EE:FF")).getString("mac"), "AA:BB:CC:DD:EE:FF", "trust/forget body")
+
+    for (t in listOf("router_changed", "ip_conflict", "dhcp_server", "rogue_ap", "weak_ap")) {
+        check(t in Format.WATCH, "$t is a LAN watch event")
+        check(Format.eventTitle(t) != t.replaceFirstChar { it.uppercase() }, "$t has a title of its own")
+    }
+    check("trusted" !in Format.WATCH && "seen" !in Format.WATCH, "only the watch's own")
+    eq(Format.eventTitle("trusted"), "Marked as known", "trusted title")
+    eq(Format.eventTitle("forgotten"), "Forgotten", "forgotten title")
+
+    // What is new to the phone, for notifications: each event once.
+    val tmp = File.createTempFile("watch", ".json")
+    tmp.delete()
+    val hist = EventHistory(tmp, capacity = 50)
+    val t0 = 1_800_000_000_000L
+    val ev = listOf(
+        BoardEvent(3700, "router_changed", "A4:CF:12:44:55:66", "192.168.2.1", "router was 50:91:E3:12:34:56"),
+        BoardEvent(3600, "seen", "B", "2", "device first seen"),
+    )
+    val fresh = ArrayList<LoggedEvent>()
+    eq(hist.merge(t0, 3725, ev, fresh), 2, "both new")
+    eq(fresh.map { it.type }, listOf("router_changed", "seen"), "fresh lists what was added")
+    val again = ArrayList<LoggedEvent>()
+    eq(hist.merge(t0 + 10_000, 3735, ev, again), 0, "nothing new the second time")
+    check(again.isEmpty(), "and nothing to notify")
+    tmp.delete()
 }

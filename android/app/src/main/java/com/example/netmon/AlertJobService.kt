@@ -63,13 +63,15 @@ object BackgroundCheck {
             return
         }
         val tell = AppState.absorbDevices(devices)
+        val fresh = ArrayList<LoggedEvent>()
         try {
-            AppState.absorbEvents(now, h.uptimeS, c.events())
+            AppState.absorbEvents(now, h.uptimeS, c.events(), fresh)
         } catch (e: ApiException) {
             // The history can wait for the next check.
         }
         AppState.flushLatency()
         Alerts.notifyDevices(context, tell)
+        Alerts.notifyWatch(context, fresh)
     }
 
     // With the session, and a new one from the saved password when it has

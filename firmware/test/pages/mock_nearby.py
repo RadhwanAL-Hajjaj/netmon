@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A stand-in netmon 0.13.0 board for testing the pages in a browser.
+"""A stand-in netmon 0.14.0 board for testing the pages in a browser.
 
 Serves the pages straight out of pages.h and answers the endpoints they call
 with bodies shaped like netmon.ino builds them. /api/nearby is simulated: a
@@ -16,6 +16,9 @@ pairing code, its window's tries and the board's MAC address are simulated.
 Test hooks: POST /__nearby?ble=0|1&wifi=0|1&unavailable=0|1  GET /__log
             POST /__find?turn_in_ms=&turn_s=&dir=&walk=  GET /__find
             POST /__auth?reset=1  POST /__ble?reset=1 | ?paired=0|1&why=&status=
+            POST /__guard?alerts=0|1&learning=0|1&reset=1   (the LAN watch, 0.14)
+Trust, Forget, the LAN watch's alerts and Learn again change this mock's state
+the way they change the board's.
 """
 import json, math, random, re, secrets, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,12 +29,18 @@ from extract_pages import extract
 
 PAGES_H = sys.argv[1] if len(sys.argv) > 1 else __file__.rsplit('/', 1)[0] + '/../../netmon/src/hw/pages.h'
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
-VERSION = "0.13.0-login"
+VERSION = "0.14.0-guard"
 BOOT = time.time() - 5400
 LOCK = threading.Lock()
 LOG = []
 CFG = {"wifi": True, "ble": True, "ble_ready": True, "background_s": 120}
 SIM = {"unavailable": False, "requested": False}
+# 0.14: devices marked as known or forgotten, the LAN watch, and the events
+# those add.
+OVERRIDE = {}
+FORGOTTEN = set()
+GUARD = {"learned": True, "learning": False, "alerts": []}
+EXTRA_EVENTS = []
 # The Bluetooth link, as GET /api/ble reports it; see ble_status().
 # Saved reports (firmware 0.12): slot -> the report as the board keeps it.
 CLOCK = {"boot_unix": 0}
@@ -336,9 +345,48 @@ def health():
             "devices": len(LAN), "scan_passes": 88, "scan_remaining": 0, "last_pass_ms": 6512,
             "pass_seen": sum(1 for d in LAN if d[5]), "pass_merges": 120, "arp_cache": 10, "latency_valid": True,
             "latency_ms": 4, "latency_age_s": 12, "dhcp_packets": 3, "events": 2,
-            "baseline_open": False, "baseline_anchored": True, "baseline_closes_in_s": 0,
+            "baseline_open": GUARD["learning"], "baseline_anchored": True,
+            "baseline_closes_in_s": 540 if GUARD["learning"] else 0,
             "names_known": 4, "mac": FACTORY_MAC, "wifi_mac": MAC["active"], "ble_link": LINK["enabled"],
-            "clock": CLOCK["boot_unix"] != 0}
+            "clock": CLOCK["boot_unix"] != 0, "baseline_saved": GUARD["learned"],
+            "known_saved": sum(1 for d in devices() if d["status"] == "known" and not d["self"]),
+            "alerts": len(GUARD["alerts"])}
+
+
+def sample_alerts():
+    t = up()
+    return [
+        {"type": "router_changed", "mac": "A4:CF:12:44:55:66", "other": "50:91:E3:12:34:56",
+         "ip": "192.168.2.1", "first_s": t - 900, "last_s": t - 20, "age_s": 20},
+        {"type": "ip_conflict", "mac": "3C:5A:B4:01:02:03", "other": "00:11:32:AA:BB:CC",
+         "ip": "192.168.2.10", "first_s": t - 300, "last_s": t - 60, "age_s": 60},
+        {"type": "dhcp_server", "mac": "DA:A1:19:77:88:99", "other": "", "ip": "192.168.2.73",
+         "first_s": t - 1800, "last_s": t - 400, "age_s": 400},
+        {"type": "rogue_ap", "mac": "9E:2B:3C:44:55:66", "other": "", "ip": "",
+         "first_s": t - 200, "last_s": t - 30, "age_s": 30},
+        {"type": "weak_ap", "mac": "52:91:E3:12:34:57", "other": "", "ip": "",
+         "first_s": t - 120, "last_s": t - 15, "age_s": 15},
+    ]
+
+
+def guard():
+    return {"network": "HOME-2.4", "learned": GUARD["learned"], "learning": GUARD["learning"],
+            "known": sum(1 for d in devices() if d["status"] == "known" and not d["self"]),
+            "router": "" if GUARD["learning"] else "50:91:E3:12:34:56",
+            "dhcp_own": "192.168.2.1", "dhcp": [] if GUARD["learning"] else ["192.168.2.1"],
+            "aps": [] if GUARD["learning"] else [{"bssid": "50:91:E3:12:34:56", "auth": "WPA2/WPA3"},
+                                                {"bssid": "52:91:E3:12:34:57", "auth": "WPA2/WPA3"}],
+            "wifi_watch": CFG["wifi"], "alerts": GUARD["alerts"]}
+
+
+def add_event(kind, mac, ip, text):
+    EXTRA_EVENTS.insert(0, {"at_s": up(), "type": kind, "mac": mac, "ip": ip, "text": text})
+
+
+def events():
+    base = [{"at_s": up() - 30, "type": "seen", "mac": "DA:A1:19:77:88:99",
+             "ip": "192.168.2.45", "text": "private device first seen"}]
+    return (EXTRA_EVENTS + base)[:48]
 
 
 def ble_status():
@@ -392,6 +440,9 @@ LAN = [
 def devices():
     out = []
     for mac, ip, host, vendor, status, online, t in LAN:
+        if mac in FORGOTTEN:
+            continue
+        status = OVERRIDE.get(mac, status)
         out.append(dict(mac=mac, ip=ip, hostname=host, vendor=vendor, status=status,
                         randomised=(int(mac[:2], 16) & 2) == 2, self=(ip == "192.168.2.27"),
                         online=online, last_seen_s=(20 if online else t), up_s=(t if online else 0)))
@@ -516,7 +567,7 @@ class H(BaseHTTPRequestHandler):
         if u.path in route:
             return self.send(200, pages[route[u.path]], "text/html")
         api = {"/api/nearby": nearby, "/api/health": health, "/api/devices": devices,
-               "/api/config": config,
+               "/api/config": config, "/api/guard": guard,
                "/api/nearby/config": lambda: CFG,
                "/api/networks": lambda: [{"order": 1, "ssid": "HOME-2.4", "has_password": True,
                                           "active": True, "boot": "joined", "boot_ms": 2100,
@@ -528,8 +579,7 @@ class H(BaseHTTPRequestHandler):
                                      "local": {"ip": "192.168.2.27", "mask": "255.255.255.0",
                                                "gateway": "192.168.2.1", "dns": "192.168.2.1",
                                                "mode": "dhcp", "hostname": "netmon"}},
-               "/api/events": lambda: [{"at_s": up() - 30, "type": "seen", "mac": "DA:A1:19:77:88:99",
-                                        "ip": "192.168.2.45", "text": "private device first seen"}],
+               "/api/events": events,
                "/api/isp": lambda: {"version": VERSION, "valid": False, "error": "offline test",
                                     "ip": "", "isp": "", "org": "", "asn": "", "city": "",
                                     "region": "", "country": "", "timezone": "", "rtt_ms": 0,
@@ -773,6 +823,65 @@ class H(BaseHTTPRequestHandler):
             if "turn_s" in q:
                 FIND["turn"] = {"start": time.time() + float(q.get("turn_in_ms", ["0"])[0]) / 1000.0,
                                 "T": float(q["turn_s"][0]), "dir": float(q.get("dir", ["0"])[0])}
+            return self.send(200, {"ok": True})
+        if u.path in ("/api/devices/trust", "/api/devices/forget"):
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            mac = str(j.get("mac", "")).upper()
+            row = next((d for d in devices() if d["mac"] == mac), None)
+            if row is not None and row["self"]:
+                return self.send(400, {"error": "this is the monitor itself"})
+            if u.path.endswith("/trust"):
+                if row is None:
+                    return self.send(400, {"error": "mac is not a MAC address"})
+                if row["randomised"]:
+                    return self.send(400, {"error": "a private address changes when the device rejoins, so "
+                                                    "there is nothing to remember. Private devices are never flagged."})
+                if row["status"] == "unknown":
+                    add_event("trusted", mac, row["ip"], "marked as known")
+                OVERRIDE[mac] = "known"
+                return self.send(200, {"status": "trusted"})
+            if row is None:
+                return self.send(404, {"error": "no such device"})
+            FORGOTTEN.add(mac)
+            add_event("forgotten", mac, row["ip"], "no longer recognised")
+            return self.send(200, {"status": "forgotten"})
+        if u.path == "/api/guard/accept":
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            kinds = ("router_changed", "ip_conflict", "dhcp_server", "rogue_ap", "weak_ap")
+            if j.get("type") not in kinds:
+                return self.send(400, {"error": "type is not one of the LAN watch's alerts"})
+            for a in GUARD["alerts"]:
+                same = a["ip"] == j.get("ip") if a["type"] == "dhcp_server" else a["mac"] == j.get("mac")
+                if a["type"] == j["type"] and same:
+                    GUARD["alerts"].remove(a)
+                    add_event("trusted", a["mac"], a["ip"], "dismissed" if a["type"] == "ip_conflict"
+                              else "accepted")
+                    return self.send(200, {"status": "accepted"})
+            return self.send(404, {"error": "no such alert"})
+        if u.path == "/api/guard/relearn":
+            GUARD.update(learned=False, learning=True, alerts=[])
+            return self.send(200, {"status": "learning"})
+        if u.path == "/__guard":
+            q = parse_qs(u.query)
+            if "reset" in q:
+                OVERRIDE.clear()
+                FORGOTTEN.clear()
+                del EXTRA_EVENTS[:]
+                GUARD.update(learned=True, learning=False, alerts=[])
+            if "alerts" in q:
+                GUARD["alerts"] = sample_alerts() if q["alerts"][0] == "1" else []
+                if q["alerts"][0] == "1":
+                    for a in reversed(GUARD["alerts"]):
+                        add_event(a["type"], a["mac"], a["ip"], "sample " + a["type"])
+            if "learning" in q:
+                GUARD["learning"] = q["learning"][0] == "1"
+                GUARD["learned"] = not GUARD["learning"]
             return self.send(200, {"ok": True})
         if u.path == "/__nearby":
             q = parse_qs(u.query)

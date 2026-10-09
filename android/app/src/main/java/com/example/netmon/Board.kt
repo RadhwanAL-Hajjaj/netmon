@@ -398,7 +398,9 @@ object Board {
                 val h = c.health()
                 val e = c.events()
                 AppState.absorbHealth(now, h)
-                AppState.absorbEvents(now, h.uptimeS, e)
+                val fresh = ArrayList<LoggedEvent>()
+                AppState.absorbEvents(now, h.uptimeS, e, fresh)
+                Alerts.notifyWatch(app, fresh)
                 publish(gen, part) { health = h }
             }
             Part.LATENCY -> {

@@ -39,6 +39,7 @@
 #include "src/core/air_plan.h"
 #include "src/core/air_wifi.h"
 #include "src/core/auth.h"
+#include "src/core/baseline.h"
 #include "src/core/ble_link.h"
 #include "src/core/ble_type.h"
 #include "src/core/ble_vendor.h"
@@ -46,6 +47,7 @@
 #include "src/core/classify.h"
 #include "src/core/device_table.h"
 #include "src/core/event_log.h"
+#include "src/core/lan_guard.h"
 #include "src/core/name_cache.h"
 #include "src/core/net_list.h"
 #include "src/core/origin.h"
@@ -58,6 +60,7 @@
 #include "src/hw/air_scan.h"
 #include "src/hw/arp_scan.h"
 #include "src/hw/auth_store.h"
+#include "src/hw/baseline_store.h"
 #include "src/hw/ble_link.h"
 #include "src/hw/config_store.h"
 #include "src/hw/dhcp_capture.h"
@@ -82,7 +85,7 @@ static_assert(sizeof(NETMON_UPDATE_PASSWORD) > 8,
 static_assert(!same_text(NETMON_UPDATE_PASSWORD, "change-me"),
               "netmon: choose your own NETMON_UPDATE_PASSWORD in secrets.h");
 
-static const char* kFirmwareVersion = "0.13.0-login";
+static const char* kFirmwareVersion = "0.14.0-guard";
 static const char* kOtaHostname = "netmon";
 static const char* kOtaPassword = NETMON_UPDATE_PASSWORD;
 
@@ -342,6 +345,25 @@ static Names g_names;
 static bool g_names_dirty = false;
 static uint32_t g_names_changed_ms = 0;
 
+// What the board has learned about the network it is on, kept on flash from
+// 0.14: the devices it recognises, the router's MAC, the DHCP servers and the
+// network's own access points. See baseline.h. Loaded once the board has
+// joined, by baseline_tick(), and for that network only.
+static Baseline g_base;
+static bool g_base_loaded = false;
+static bool g_base_dirty = false;
+static uint32_t g_base_changed_ms = 0;
+
+// The LAN watch: router MAC, address clashes, DHCP servers, access points.
+// See lan_guard.h. What it notices is logged once, then again hourly while it
+// carries on, and forgotten a day after it stops.
+static GuardLog<16> g_guard;
+static IpClaims<64> g_claims;
+static uint32_t g_own_dhcp = 0;             // the server that leased this board its address
+static uint32_t g_guard_expired_ms = 0;
+static const uint32_t kGuardQuietS = 3600;
+static const uint32_t kGuardForgetS = 86400;
+
 // The sweep is a small state machine driven from loop(), never a blocking
 // walk: the web server shares this thread, and a multi-second busy loop
 // would make the dashboard unresponsive during every scan.
@@ -439,6 +461,7 @@ static uint32_t now_s() { return uptime_s(); }
 
 static void append_json_escaped(String& out, const char* s);
 static void before_restart();
+static void guard_aps(uint32_t now);
 
 // Who has the radio. A pass is in flight from its first batch until the last
 // batch's replies are read. See air_plan.h for why the two never overlap.
@@ -488,6 +511,7 @@ static void air_wifi_absorb(int count) {
     }
     air_wifi_release();
     g_air_aps.scan_end(now);
+    guard_aps(now);
 }
 
 // A finished Finder look: at most the one access point it asked for. Into the
@@ -549,8 +573,9 @@ static uint32_t derived_mask() {
 
 // Seconds left before new devices start being classified as unknown. Reports
 // the full window while the baseline is unanchored, since the clock has not
-// started yet.
+// started yet, and none at all once this network's list has been learned.
 static uint32_t baseline_remaining_s() {
+    if (g_base.learned) return 0;
     const uint32_t window = g_settings.learning_window_s;
     if (g_first_scan_s == 0) return window;
     const uint32_t now = now_s();
@@ -624,16 +649,25 @@ static void handle_health() {
     // it flipped to false one minute after boot while the 600s window was
     // still wide open. This is the field you read to answer "will a new device
     // be flagged as an intruder?", so it now answers exactly that.
+    // From 0.14 a network learned before is never "open" again: its saved
+    // list decides from the first sweep after a restart.
     body += F(",\"baseline_open\":");
-    body += (in_learning_window(now_s(), g_first_scan_s,
-                                g_settings.learning_window_s) ? F("true")
-                                                              : F("false"));
+    body += (still_learning(now_s(), g_first_scan_s, g_settings.learning_window_s,
+                            g_base.learned) ? F("true") : F("false"));
     body += F(",\"baseline_anchored\":");
     body += (g_first_scan_s != 0 ? F("true") : F("false"));
     body += F(",\"baseline_closes_in_s\":");
     body += String(baseline_remaining_s());
     body += F(",\"names_known\":");
     body += String(g_names.size());
+    // From 0.14: the list kept on flash for this network, and what the LAN
+    // watch has noticed. /api/guard has the detail.
+    body += F(",\"baseline_saved\":");
+    body += (g_base.learned ? F("true") : F("false"));
+    body += F(",\"known_saved\":");
+    body += String(g_base.known_count);
+    body += F(",\"alerts\":");
+    body += String(g_guard.size());
     // From 0.12: who this board is, so a phone that reaches it both over
     // Wi-Fi and over Bluetooth knows the two are one board, and whether the
     // Bluetooth link is on. From 0.13 that is the chip's own Wi-Fi address
@@ -826,6 +860,197 @@ static void log_event(EventType type, const Mac& mac, uint32_t ip,
     g_events.stamp_last(now_s());
 }
 
+// --- remembered devices -------------------------------------------------------
+
+// Writes this network's record if anything in it changed since the last write.
+// Called before every deliberate restart too, like names_flush().
+static bool baseline_flush() {
+    if (!g_base_dirty || !g_base_loaded) return true;
+    if (!baseline_save(g_base)) return false;
+    g_base_dirty = false;
+    return true;
+}
+
+// Something worth keeping changed. `now` writes it straight away, for what
+// somebody has just done by hand; otherwise baseline_tick() writes it ten
+// seconds later, so a burst of changes costs one write.
+static void baseline_changed(bool now) {
+    if (!g_base_dirty) g_base_changed_ms = millis();
+    g_base_dirty = true;
+    if (now && !baseline_flush()) {
+        Serial.println(F("[base] could not write the record, will retry"));
+    }
+}
+
+// The learning window has closed on a network with nothing saved: what it
+// learned becomes the list, and from now on the list decides.
+static void baseline_learned() {
+    const Mac self = wifi_mac();
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        const Device& d = g_devices.at(i);
+        if (d.status != Status::Known || mac_is_local(d.mac) || mac_equal(d.mac, self)) continue;
+        base_known_add(g_base, d.mac);
+    }
+    g_base.learned = true;
+    baseline_changed(true);
+    Serial.print(F("[base] learned "));
+    Serial.print(g_base.known_count);
+    Serial.println(F(" devices; saved for this network"));
+}
+
+// Loads the record for the network the board has joined, and writes a changed
+// one once it has been quiet for ten seconds. The record belongs to one
+// network: should the board ever find itself on another without a restart,
+// it is put away and that network's own is loaded.
+static void baseline_tick() {
+    if (wifi_state() != WifiState::Connected) return;
+    const char* ssid = wifi_current_ssid();
+    if (ssid == nullptr || ssid[0] == '\0') return;
+    if (!g_base_loaded || std::strcmp(g_base.ssid, ssid) != 0) {
+        if (g_base_loaded) baseline_flush();
+        base_reset(g_base, ssid);
+        const bool had = baseline_load(g_base);
+        g_base_loaded = true;
+        g_base_dirty = false;
+        g_guard.clear_all();
+        g_claims.clear();
+        // With a fixed address there is no lease and no server of our own.
+        g_own_dhcp = g_settings.use_dhcp ? lan_dhcp_server() : 0;
+        if (had && g_base.learned) {
+            Serial.print(F("[base] this network was learned before: "));
+            Serial.print(g_base.known_count);
+            Serial.println(F(" devices recognised, no learning window"));
+        } else {
+            Serial.println(F("[base] nothing learned on this network yet"));
+        }
+    }
+    if (g_base_dirty && millis() - g_base_changed_ms >= 10000UL && !baseline_flush()) {
+        g_base_changed_ms = millis();
+        Serial.println(F("[base] could not write the record, will retry"));
+    }
+    if (millis() - g_guard_expired_ms >= 60000UL) {
+        g_guard_expired_ms = millis();
+        g_guard.expire(now_s(), kGuardForgetS);
+    }
+}
+
+static Status classify_for(const Mac& mac, uint32_t now) {
+    const bool randomised = mac_is_local(mac);
+    const bool listed = !randomised && base_known_has(g_base, mac);
+    return classify_remembered(now, g_first_scan_s, g_settings.learning_window_s,
+                               randomised, listed, g_base.learned);
+}
+
+// --- the LAN watch ------------------------------------------------------------
+
+static void guard_tell(GuardKind kind, const Mac& mac, const Mac& other,
+                       uint32_t ip, uint32_t now, const char* text) {
+    if (!g_guard.raise(kind, mac, other, ip, now, kGuardQuietS)) return;
+    log_event(guard_kind_event(kind), mac, ip, text);
+    char m[18];
+    mac_format(mac, m);
+    Serial.print(F("[guard] "));
+    Serial.print(guard_kind_text(kind));
+    Serial.print(' ');
+    Serial.print(m);
+    Serial.print(F(": "));
+    Serial.println(text);
+}
+
+// Two devices taking turns at one address are both heard within this long.
+static uint32_t claim_window_s() {
+    const uint32_t three = g_settings.scan_interval_s * 3;
+    return three > 600 ? three : 600;
+}
+
+// One entry of the ARP cache. What answers for the router's address is checked
+// against the record; every other address, for a second device answering.
+static void guard_arp(const ArpHit& hit, uint32_t now) {
+    const uint32_t gw = wifi_gateway();
+    if (gw != 0 && hit.ip == gw) {
+        switch (guard_router_check(g_base, hit.mac)) {
+            case RouterVerdict::Learn:
+                g_base.router = hit.mac;
+                g_base.has_router = true;
+                // Written with the rest when the window closes; at once on a
+                // network learned by an older firmware, which kept no router.
+                if (g_base.learned) baseline_changed(false);
+                break;
+            case RouterVerdict::Changed: {
+                char was[18], text[64];
+                mac_format(g_base.router, was);
+                snprintf(text, sizeof(text), "router was %s", was);
+                guard_tell(GuardKind::RouterChanged, hit.mac, g_base.router, gw, now, text);
+                break;
+            }
+            case RouterVerdict::Same:
+                break;
+        }
+        return;
+    }
+    Mac rival{};
+    if (g_claims.observe(hit.ip, hit.mac, now, claim_window_s(), rival)) {
+        char other[18], text[64];
+        mac_format(rival, other);
+        snprintf(text, sizeof(text), "also answered by %s", other);
+        guard_tell(GuardKind::IpConflict, hit.mac, rival, hit.ip, now, text);
+    }
+}
+
+// A DHCP REQUEST names, in option 54, the server whose offer the client took.
+// While learning, every server heard is taken as this network's, the router
+// included: recorded, it stays expected once another one is on record too.
+// After, one that is not on record is told.
+static void guard_dhcp(const DhcpInfo& info, uint32_t now) {
+    if (info.msg_type != 3 || info.server_ip == 0) return;
+    if (!g_base.learned) {
+        base_add_dhcp(g_base, info.server_ip);
+        return;
+    }
+    if (guard_dhcp_expected(g_base, info.server_ip, g_own_dhcp, wifi_gateway())) return;
+    char sip[16], text[64];
+    ipv4_format(info.server_ip, sip);
+    snprintf(text, sizeof(text), "took an address from DHCP server %s", sip);
+    guard_tell(GuardKind::DhcpServer, info.client, Mac{}, info.server_ip, now, text);
+}
+
+// After a Nearby Wi-Fi scan: every access point just heard with this
+// network's name, against the record of its own.
+static void guard_aps(uint32_t now) {
+    if (wifi_state() != WifiState::Connected || !g_base_loaded) return;
+    const char* ssid = wifi_current_ssid();
+    if (ssid == nullptr || ssid[0] == '\0') return;
+    for (size_t i = 0; i < g_air_aps.size(); ++i) {
+        const AirAp& a = g_air_aps.at(i);
+        if (!g_air_aps.heard_last(a) || std::strcmp(a.ssid, ssid) != 0) continue;
+        char text[64];
+        switch (guard_ap_check(g_base, a.bssid, a.auth)) {
+            case ApVerdict::Learn:
+                // Written when the window closes, or now when this network was
+                // learned with no scan heard (Nearby Wi-Fi off at the time).
+                if (base_put_ap(g_base, a.bssid, a.auth) && g_base.learned) baseline_changed(false);
+                break;
+            case ApVerdict::Stronger:
+                if (base_put_ap(g_base, a.bssid, a.auth)) baseline_changed(false);
+                break;
+            case ApVerdict::Unknown:
+                snprintf(text, sizeof(text), "unknown access point with your Wi-Fi name: %s",
+                         air_auth_text(a.auth));
+                guard_tell(GuardKind::RogueAp, a.bssid, Mac{}, 0, now, text);
+                break;
+            case ApVerdict::Weaker: {
+                const BaseAp* was = base_find_ap(g_base, a.bssid);
+                snprintf(text, sizeof(text), "now offers %s, was %s", air_auth_text(a.auth),
+                         was != nullptr ? air_auth_text(was->auth) : "more");
+                guard_tell(GuardKind::WeakAp, a.bssid, Mac{}, 0, now, text);
+                break;
+            }
+            case ApVerdict::Fine:
+                break;
+        }
+    }
+}
+
 // Every sighting goes through here, whether the sweep or a DHCP request
 // noticed the device, so both log the same events. The DHCP path used to
 // refresh the row without checking whether the device had been offline, and
@@ -835,11 +1060,10 @@ static void record_sighting(const Mac& mac, uint32_t ip, uint32_t now,
                             const char* first_text) {
     bool created = false;
     bool returned = false;
-    g_devices.sight(mac, ip, now,
-                    classify_device(now, g_first_scan_s,
-                                    g_settings.learning_window_s,
-                                    mac_is_local(mac)),
-                    created, returned);
+    // Status is decided when a row is made, so the list is only looked at then.
+    const Status if_new = g_devices.find(mac) != nullptr ? Status::Known
+                                                         : classify_for(mac, now);
+    g_devices.sight(mac, ip, now, if_new, created, returned);
     if (!created && !returned) return;
 
     char m[18];
@@ -863,6 +1087,7 @@ static void merge_hit(const ArpHit& hit, uint32_t now) {
                     mac_is_local(hit.mac) ? "private device first seen"
                                           : "device first seen");
     ++g_pass_hits;
+    guard_arp(hit, now);
 }
 
 static void finish_pass() {
@@ -905,6 +1130,16 @@ static void finish_pass() {
                           "device went offline");
             }
         }
+    }
+    // Recency for the remembered list, once a pass. It only decides what makes
+    // room when the list is full, and it lives in RAM.
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        const Device& d = g_devices.at(i);
+        if (d.online && d.last_seen >= g_pass_started_s) base_known_touch(g_base, d.mac);
+    }
+    if (!g_base.learned && g_first_scan_s != 0 &&
+        !in_learning_window(now, g_first_scan_s, g_settings.learning_window_s)) {
+        baseline_learned();
     }
     // No "sweep finished" event, nor "sweep started": two a pass filled the
     // 48-entry history in about 26 minutes, pushing out the device events it
@@ -1023,6 +1258,7 @@ static void dhcp_tick() {
             record_sighting(info.client, info.requested_ip, now,
                             "device learned from DHCP");
         }
+        guard_dhcp(info, now);
 
         if (named) {
             // Remembered by MAC even when the sweep has not found the device
@@ -1940,6 +2176,205 @@ static void handle_devices() {
     api_send(200, "application/json", body);
 }
 
+// --- trust, forget and the LAN watch's answers ---------------------------------
+
+// The body of a POST that names a device, as {"mac": "..."}. Answers the
+// request itself and returns false when there is nothing to act on.
+static bool posted_mac(Mac& out) {
+    if (refuse_other_site()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return false;
+    }
+    if (!mac_parse(doc["mac"] | "", out)) {
+        send_config_error("mac is not a MAC address");
+        return false;
+    }
+    if (mac_equal(out, wifi_mac())) {
+        send_config_error("this is the monitor itself");
+        return false;
+    }
+    if (!g_base_loaded) {
+        api_send(503, "application/json",
+                      F("{\"error\":\"the board is not on a network yet\"}"));
+        return false;
+    }
+    return true;
+}
+
+// Marks a device as known on this network, now and after every restart.
+static void handle_device_trust() {
+    Mac m{};
+    if (!posted_mac(m)) return;
+    // A private address changes when the device rejoins, so remembering it
+    // would not last; and private devices are never flagged in the first place.
+    if (mac_is_local(m)) {
+        send_config_error("a private address changes when the device rejoins, so "
+                          "there is nothing to remember. Private devices are never flagged.");
+        return;
+    }
+    const bool added = base_known_add(g_base, m);
+    Device* d = g_devices.find(m);
+    const bool was_unknown = d != nullptr && d->status == Status::Unknown;
+    if (d != nullptr) d->status = Status::Known;
+    if (added) baseline_changed(true);
+    if (added || was_unknown) log_event(EventType::Trusted, m, d != nullptr ? d->ip : 0, "marked as known");
+    api_send(200, "application/json", F("{\"status\":\"trusted\"}"));
+}
+
+// Stops recognising a device: off the list and out of the table. Still on the
+// network, it is back at the next sweep, as unknown once this network has been
+// learned and as known while a learning window is still open.
+static void handle_device_forget() {
+    Mac m{};
+    if (!posted_mac(m)) return;
+    const Device* d = g_devices.find(m);
+    const uint32_t ip = d != nullptr ? d->ip : 0;
+    const bool listed = base_known_remove(g_base, m);
+    const bool removed = g_devices.remove(m);
+    if (!listed && !removed) {
+        api_send(404, "application/json", F("{\"error\":\"no such device\"}"));
+        return;
+    }
+    if (listed) baseline_changed(true);
+    log_event(EventType::Forgotten, m, ip, "no longer recognised");
+    api_send(200, "application/json", F("{\"status\":\"forgotten\"}"));
+}
+
+// What the board keeps for this network and what the LAN watch has noticed.
+static void handle_guard() {
+    const uint32_t now = now_s();
+    JsonDocument doc;
+    doc["network"] = g_base_loaded ? g_base.ssid : "";
+    doc["learned"] = g_base.learned;
+    doc["learning"] = still_learning(now, g_first_scan_s, g_settings.learning_window_s,
+                                     g_base.learned);
+    doc["known"] = g_base.known_count;
+    char m[18] = "";
+    if (g_base.has_router) mac_format(g_base.router, m);
+    doc["router"] = m;
+    char ip[16] = "";
+    if (g_own_dhcp != 0) ipv4_format(g_own_dhcp, ip);
+    doc["dhcp_own"] = ip;
+    JsonArray dhcp = doc["dhcp"].to<JsonArray>();
+    for (size_t i = 0; i < g_base.dhcp_count; ++i) {
+        ipv4_format(g_base.dhcp[i], ip);
+        dhcp.add(ip);
+    }
+    JsonArray aps = doc["aps"].to<JsonArray>();
+    for (size_t i = 0; i < g_base.ap_count; ++i) {
+        JsonObject o = aps.add<JsonObject>();
+        mac_format(g_base.aps[i].bssid, m);
+        o["bssid"] = m;
+        o["auth"] = air_auth_rank(g_base.aps[i].auth) == 255 ? "" : air_auth_text(g_base.aps[i].auth);
+    }
+    // The access point checks run on the Nearby page's Wi-Fi scans.
+    doc["wifi_watch"] = g_settings.air_wifi;
+    JsonArray alerts = doc["alerts"].to<JsonArray>();
+    for (size_t i = 0; i < g_guard.size(); ++i) {
+        const GuardEntry& e = g_guard.at(i);
+        JsonObject o = alerts.add<JsonObject>();
+        o["type"] = guard_kind_text(e.kind);
+        mac_format(e.mac, m);
+        o["mac"] = m;
+        char om[18] = "";
+        if (e.kind == GuardKind::RouterChanged || e.kind == GuardKind::IpConflict) mac_format(e.other, om);
+        o["other"] = om;
+        char eip[16] = "";
+        if (e.ip != 0) ipv4_format(e.ip, eip);
+        o["ip"] = eip;
+        o["first_s"] = e.first_s;
+        o["last_s"] = e.last_s;
+        o["age_s"] = now >= e.last_s ? now - e.last_s : 0;
+    }
+    String body;
+    serializeJson(doc, body);
+    api_send(200, "application/json", body);
+}
+
+// Somebody says a change the LAN watch noticed was theirs: a new router, a
+// second DHCP server, another access point. That becomes the record and the
+// alert goes. An address clash has nothing to record, and is only dismissed.
+static void handle_guard_accept() {
+    if (refuse_other_site()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    GuardKind kind = GuardKind::RouterChanged;
+    if (!guard_kind_parse(doc["type"] | "", kind)) {
+        send_config_error("type is not one of the LAN watch's alerts");
+        return;
+    }
+    Mac mac{};
+    uint32_t ip = 0;
+    mac_parse(doc["mac"] | "", mac);
+    ipv4_parse(doc["ip"] | "", ip);
+    const GuardEntry* found = g_guard.get(kind, mac, ip);
+    if (found == nullptr) {
+        api_send(404, "application/json", F("{\"error\":\"no such alert\"}"));
+        return;
+    }
+    const GuardEntry e = *found;       // clear() below moves the entries
+    const char* text = "dismissed";
+    bool changed = false;
+    switch (kind) {
+        case GuardKind::RouterChanged:
+            g_base.router = e.mac;
+            g_base.has_router = true;
+            changed = true;
+            text = "accepted as the router";
+            break;
+        case GuardKind::DhcpServer:
+            changed = base_add_dhcp(g_base, e.ip);
+            text = "accepted as a DHCP server";
+            break;
+        case GuardKind::RogueAp:
+        case GuardKind::WeakAp: {
+            // The mode it offers now, when the Nearby table still has it; when
+            // not, none, and the next scan that hears it records one.
+            const AirAp* a = g_air_aps.get(e.mac);
+            changed = base_put_ap(g_base, e.mac, a != nullptr ? a->auth : 255);
+            text = "accepted as this network's access point";
+            break;
+        }
+        case GuardKind::IpConflict:
+            break;
+    }
+    g_guard.clear(kind, mac, ip);
+    if (changed) baseline_changed(true);
+    log_event(EventType::Trusted, e.mac, e.ip, text);
+    api_send(200, "application/json", F("{\"status\":\"accepted\"}"));
+}
+
+// Starts this network over: the list, the router, the DHCP servers and the
+// access points are forgotten, and a fresh learning window opens at the next
+// sweep. What is on the network now counts as known, as anything seen during
+// a window always has.
+static void handle_guard_relearn() {
+    if (refuse_other_site()) return;
+    if (!g_base_loaded) {
+        api_send(503, "application/json",
+                      F("{\"error\":\"the board is not on a network yet\"}"));
+        return;
+    }
+    char ssid[sizeof(g_base.ssid)];
+    std::memcpy(ssid, g_base.ssid, sizeof(ssid));
+    base_reset(g_base, ssid);
+    g_first_scan_s = 0;
+    g_guard.clear_all();
+    g_claims.clear();
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        Device& d = g_devices.at(i);
+        if (!mac_is_local(d.mac)) d.status = Status::Known;
+    }
+    baseline_changed(true);
+    Serial.println(F("[base] learning this network again"));
+    api_send(200, "application/json", F("{\"status\":\"learning\"}"));
+}
+
 static uint32_t update_max_bytes() {
     const esp_partition_t* p = esp_ota_get_next_update_partition(nullptr);
     return p != nullptr ? p->size : 0;
@@ -2109,6 +2544,8 @@ static void handle_network_forget() {
         return;
     }
     g_settings = s;
+    // What the board learned there goes with it.
+    baseline_remove(ssid);
     Serial.print(F("[cfg] forgot a network, remembered now: "));
     Serial.println(g_settings.net_count);
     api_send(200, "application/json", F("{\"status\":\"forgotten\"}"));
@@ -2868,6 +3305,7 @@ static void report_tick() {
 // written down.
 static void before_restart() {
     names_flush();
+    baseline_flush();
     const char* why = "";
     if (wifi_state() == WifiState::Connected && g_passes_done > 0 && !report_save(why)) {
         Serial.print(F("[report] not saved before the restart: "));
@@ -3062,6 +3500,12 @@ static const ApiRoute kApiRoutes[] = {
     {"/api/reports/save", kPost, handle_report_save},
     {"/api/reports/delete", kPost, handle_report_delete},
     {"/api/clock", kPost, handle_clock},
+    // Recognised devices and the LAN watch (0.14).
+    {"/api/devices/trust", kPost, handle_device_trust},
+    {"/api/devices/forget", kPost, handle_device_forget},
+    {"/api/guard", kGet, handle_guard},
+    {"/api/guard/accept", kPost, handle_guard_accept},
+    {"/api/guard/relearn", kPost, handle_guard_relearn},
     // Signing in (0.13). Only these three answer anyone; see src/core/auth.h.
     {"/api/auth", kGet, handle_auth_get, true},
     {"/api/login", kPost, handle_login, true},
@@ -3154,6 +3598,7 @@ static void setup_retry_tick() {
     Serial.println(F("[wifi] nobody on netmon-setup for 3 minutes, restarting "
                      "to try the saved networks again"));
     names_flush();
+    baseline_flush();
     delay(100);
     ESP.restart();
 }
@@ -3187,6 +3632,11 @@ void setup() {
     names_load(g_names);
     Serial.print(F("[boot] remembered names: "));
     Serial.println(g_names.size());
+    const size_t pruned = baseline_prune(g_settings);
+    if (pruned) {
+        Serial.print(F("[boot] dropped what was learned on networks no longer saved: "));
+        Serial.println(pruned);
+    }
     reports_load(g_reports);
     // The login password and who is signed in, kept across restarts (0.13).
     if (auth_load(g_auth)) {
@@ -3303,6 +3753,7 @@ void loop() {
     auth_tick();
     report_tick();
     dhcp_listener_tick();
+    baseline_tick();
     dhcp_tick();
     names_tick();
     latency_tick();

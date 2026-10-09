@@ -2993,6 +2993,403 @@ static void test_mac_rule() {
     }
 }
 
+// ---- 0.14: remembered devices and the LAN watch ----------------------------
+
+#include <string>
+#include "../netmon/src/core/baseline.h"
+#include "../netmon/src/core/lan_guard.h"
+
+// Once the list has been learned it decides, before the window does; a device
+// on it is known whatever the window says, and a private address is private.
+static void test_classify_remembered() {
+    // Nothing learned: exactly the old rules.
+    CHECK(classify_remembered(1100, 1000, 600, false, false, false) == Status::Known);
+    CHECK(classify_remembered(9000, 1000, 600, false, false, false) == Status::Unknown);
+    CHECK(classify_remembered(50000, 0, 600, false, false, false) == Status::Known);
+    // On the list: known, even long after the window.
+    CHECK(classify_remembered(9000, 1000, 600, false, true, true) == Status::Known);
+    CHECK(classify_remembered(9000, 1000, 600, false, true, false) == Status::Known);
+    // Learned before, not on the list: unknown at once after a restart, with
+    // the window not even anchored yet. This is the hole 0.12 closes.
+    CHECK(classify_remembered(5, 0, 600, false, false, true) == Status::Unknown);
+    CHECK(classify_remembered(1100, 1000, 600, false, false, true) == Status::Unknown);
+    // Private beats everything.
+    CHECK(classify_remembered(1100, 1000, 600, true, true, true) == Status::Private);
+    CHECK(classify_remembered(9000, 1000, 600, true, false, true) == Status::Private);
+
+    CHECK(still_learning(1100, 1000, 600, false));
+    CHECK(!still_learning(1100, 1000, 600, true));
+    CHECK(!still_learning(9000, 1000, 600, false));
+    CHECK(still_learning(5, 0, 600, false));
+}
+
+static void test_table_trust_forget() {
+    DeviceTable<4> t;
+    bool created = false;
+    t.upsert(mk("AA:BB:CC:00:00:01"), 1, 100, Status::Known, created);
+    t.upsert(mk("AA:BB:CC:00:00:02"), 2, 110, Status::Unknown, created);
+    t.upsert(mk("AA:BB:CC:00:00:03"), 3, 120, Status::Known, created);
+
+    CHECK(t.set_status(mk("AA:BB:CC:00:00:02"), Status::Known));
+    CHECK(t.find(mk("AA:BB:CC:00:00:02"))->status == Status::Known);
+    CHECK(!t.set_status(mk("AA:BB:CC:00:00:09"), Status::Known));
+
+    CHECK(t.remove(mk("AA:BB:CC:00:00:02")));
+    CHECK(t.size() == 2);
+    CHECK(t.find(mk("AA:BB:CC:00:00:02")) == nullptr);
+    // The rest keep their order and their data.
+    CHECK(t.at(0).ip == 1 && t.at(1).ip == 3);
+    CHECK(!t.remove(mk("AA:BB:CC:00:00:02")));
+    // Seen again, it is a new device and judged afresh.
+    t.upsert(mk("AA:BB:CC:00:00:02"), 2, 200, Status::Unknown, created);
+    CHECK(created);
+    CHECK(t.find(mk("AA:BB:CC:00:00:02"))->status == Status::Unknown);
+    CHECK(t.remove(mk("AA:BB:CC:00:00:01")));
+    CHECK(t.remove(mk("AA:BB:CC:00:00:03")));
+    CHECK(t.remove(mk("AA:BB:CC:00:00:02")));
+    CHECK(t.size() == 0);
+}
+
+static void test_auth_rank() {
+    // Open < WEP < WPA < WPA/WPA2 < WPA2 < WPA2/WPA3 < WPA3.
+    CHECK(air_auth_rank(0) < air_auth_rank(1));
+    CHECK(air_auth_rank(1) < air_auth_rank(2));
+    CHECK(air_auth_rank(2) < air_auth_rank(4));
+    CHECK(air_auth_rank(4) < air_auth_rank(3));
+    CHECK(air_auth_rank(3) < air_auth_rank(7));
+    CHECK(air_auth_rank(7) < air_auth_rank(6));
+    CHECK(air_auth_rank(3) == air_auth_rank(5));   // personal and enterprise alike
+    CHECK(air_auth_rank(9) < air_auth_rank(3));    // OWE: anybody may join
+    CHECK(air_auth_rank(200) == 255);              // a mode not known yet
+    bool all_ranked = true;
+    for (uint8_t a = 0; a <= 16; ++a) all_ranked = all_ranked && air_auth_rank(a) != 255;
+    CHECK(all_ranked);
+}
+
+static void test_event_names_012() {
+    CHECK_STR(event_type_text(EventType::Trusted), "trusted");
+    CHECK_STR(event_type_text(EventType::Forgotten), "forgotten");
+    CHECK_STR(event_type_text(EventType::RouterChanged), "router_changed");
+    CHECK_STR(event_type_text(EventType::IpConflict), "ip_conflict");
+    CHECK_STR(event_type_text(EventType::DhcpServer), "dhcp_server");
+    CHECK_STR(event_type_text(EventType::RogueAp), "rogue_ap");
+    CHECK_STR(event_type_text(EventType::WeakAp), "weak_ap");
+    // Each alert is logged under the event of the same name.
+    for (uint8_t i = 0; i <= static_cast<uint8_t>(GuardKind::WeakAp); ++i) {
+        const GuardKind k = static_cast<GuardKind>(i);
+        CHECK_STR(event_type_text(guard_kind_event(k)), guard_kind_text(k));
+        GuardKind back = GuardKind::WeakAp;
+        CHECK(guard_kind_parse(guard_kind_text(k), back) && back == k);
+    }
+    GuardKind k = GuardKind::RouterChanged;
+    CHECK(!guard_kind_parse("seen", k));
+    CHECK(!guard_kind_parse("", k));
+    CHECK(!guard_kind_parse(nullptr, k));
+}
+
+static void test_baseline_lists() {
+    Baseline b;
+    base_reset(b, "Home");
+    CHECK_STR(b.ssid, "Home");
+    CHECK(!b.learned && b.known_count == 0 && !b.has_router);
+
+    CHECK(base_known_add(b, test_mac_n(1)));
+    CHECK(!base_known_add(b, test_mac_n(1)));          // already there
+    CHECK(base_known_add(b, test_mac_n(2)));
+    CHECK(base_known_has(b, test_mac_n(2)));
+    CHECK(!base_known_has(b, test_mac_n(3)));
+    CHECK(base_known_remove(b, test_mac_n(1)));
+    CHECK(!base_known_remove(b, test_mac_n(1)));
+    CHECK(b.known_count == 1 && base_known_has(b, test_mac_n(2)));
+
+    // Full: the device seen longest ago makes room.
+    base_reset(b, "Home");
+    for (uint8_t i = 0; i < kBaseKnownMax; ++i) base_known_add(b, test_mac_n(i));
+    CHECK(b.known_count == kBaseKnownMax);
+    base_known_touch(b, test_mac_n(0));                // 0 seen again: 1 is now oldest
+    CHECK(base_known_add(b, test_mac_n(200)));
+    CHECK(b.known_count == kBaseKnownMax);
+    CHECK(base_known_has(b, test_mac_n(0)));
+    CHECK(!base_known_has(b, test_mac_n(1)));
+    CHECK(base_known_has(b, test_mac_n(200)));
+
+    // DHCP servers: no duplicates, no zero; full, the oldest goes.
+    base_reset(b, "Home");
+    CHECK(!base_add_dhcp(b, 0));
+    CHECK(base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    CHECK(!base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    for (uint8_t i = 2; i <= 5; ++i) base_add_dhcp(b, ipv4_from_octets(192, 168, 2, i));
+    CHECK(b.dhcp_count == kBaseDhcpMax);
+    CHECK(!base_has_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    CHECK(base_has_dhcp(b, ipv4_from_octets(192, 168, 2, 5)));
+
+    // Access points: added, updated, the oldest dropped when full.
+    CHECK(base_put_ap(b, test_mac_n(1), 3));
+    CHECK(!base_put_ap(b, test_mac_n(1), 3));
+    CHECK(base_put_ap(b, test_mac_n(1), 7));
+    CHECK(base_find_ap(b, test_mac_n(1))->auth == 7);
+    CHECK(b.ap_count == 1);
+    for (uint8_t i = 2; i <= kBaseApMax + 1; ++i) base_put_ap(b, test_mac_n(i), 3);
+    CHECK(b.ap_count == kBaseApMax);
+    CHECK(base_find_ap(b, test_mac_n(1)) == nullptr);
+    CHECK(base_find_ap(b, test_mac_n(kBaseApMax + 1)) != nullptr);
+}
+
+static std::string base_text(const Baseline& b) {
+    std::string out;
+    bool lines_ok = true;
+    CHECK(base_write(b, [&](const char* line, size_t n) {
+        lines_ok = lines_ok && std::strlen(line) == n && n < kBaseLineMax && line[n - 1] == '\n';
+        out.append(line, n);
+        return true;
+    }));
+    CHECK(lines_ok);
+    return out;
+}
+
+static void base_load_text(Baseline& b, const std::string& text, int& refused) {
+    refused = 0;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        if (!base_read_line(b, line.c_str())) ++refused;
+        at = nl + 1;
+    }
+    base_read_done(b);
+}
+
+static void test_baseline_file() {
+    // An SSID may hold anything: tabs, newlines, non-Latin text, 32 bytes.
+    const char* names[] = {"Home", "a\tb\nc", "\xD8\xB4\xD8\xA8\xD9\x83\xD8\xA9", "0123456789abcdef0123456789abcdef", ""};
+    for (const char* name : names) {
+        Baseline b;
+        base_reset(b, name);
+        b.learned = true;
+        b.has_router = true;
+        b.router = mk("F4:F2:6D:11:22:33");
+        base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1));
+        base_add_dhcp(b, ipv4_from_octets(10, 0, 0, 2));
+        base_put_ap(b, mk("F4:F2:6D:11:22:34"), 3);
+        base_put_ap(b, mk("F4:F2:6D:11:22:35"), 15);
+        for (uint8_t i = 0; i < 40; ++i) base_known_add(b, test_mac_n(i));
+        base_known_touch(b, test_mac_n(7));          // most recent
+        const std::string text = base_text(b);
+
+        Baseline r;
+        base_reset(r, "something else");
+        int refused = 0;
+        base_load_text(r, text, refused);
+        CHECK(refused == 0);
+        CHECK_STR(r.ssid, name);
+        CHECK(r.learned);
+        CHECK(r.has_router && mac_equal(r.router, b.router));
+        CHECK(r.dhcp_count == 2 && base_has_dhcp(r, ipv4_from_octets(10, 0, 0, 2)));
+        CHECK(r.ap_count == 2 && base_find_ap(r, mk("F4:F2:6D:11:22:35"))->auth == 15);
+        CHECK(r.known_count == 40);
+        bool all_back = true;
+        for (uint8_t i = 0; i < 40; ++i) all_back = all_back && base_known_has(r, test_mac_n(i));
+        CHECK(all_back);
+        // Recency survives: 7 first, then the newest of the rest, 39.
+        CHECK(mac_equal(r.known[0], test_mac_n(7)));
+        CHECK(mac_equal(r.known[1], test_mac_n(39)));
+        // And what is read back writes the same file.
+        CHECK(base_text(r) == text);
+    }
+
+    // Nothing learned yet, no router: those lines are simply absent.
+    Baseline e;
+    base_reset(e, "Cafe");
+    const std::string text = base_text(e);
+    CHECK(text.find("learned") == std::string::npos);
+    CHECK(text.find("router") == std::string::npos);
+
+    // A damaged file loses the damaged lines and nothing else.
+    Baseline r;
+    base_reset(r, "");
+    int refused = 0;
+    base_load_text(r,
+                   "v\t1\nssid\t486F6D65\nlearned\t1\nrouter\tF4F26D11223\n"
+                   "router\tZZF26D112233\nknown\tAABBCCDDEEFF\nknown\tAABBCCDDEEFF\n"
+                   "known\tAABBCCDDEEF0\r\nap\tAABBCCDDEEFF\t3x\nap\tAABBCCDDEEFF\t999\n"
+                   "dhcp\tC0A8020\nfuture\tthing\nnonsense\nssid\t48006F\nssid\t486\n",
+                   refused);
+    CHECK(refused == 10);
+    CHECK_STR(r.ssid, "Home");
+    CHECK(r.learned);
+    CHECK(!r.has_router);
+    CHECK(r.known_count == 2);
+    CHECK(r.ap_count == 0 && r.dhcp_count == 0);
+
+    char f1[24], f2[24], f3[24];
+    base_file_name("Home", f1);
+    base_file_name("Home", f2);
+    base_file_name("home", f3);
+    CHECK_STR(f1, f2);
+    CHECK(std::strcmp(f1, f3) != 0);
+    CHECK(std::strlen(f1) == 18);
+    CHECK(std::strncmp(f1, "/base-", 6) == 0);
+    CHECK(std::strcmp(f1 + 14, ".txt") == 0);
+    base_file_name("", f1);
+    CHECK_STR(f1, "/base-811c9dc5.txt");       // the FNV-1a offset basis
+}
+
+static void test_guard_log() {
+    GuardLog<3> g;
+    const Mac spoof = test_mac_n(9), router = test_mac_n(1);
+    const uint32_t gw = ipv4_from_octets(192, 168, 2, 1);
+
+    CHECK(g.raise(GuardKind::RouterChanged, spoof, router, gw, 100, 3600));
+    CHECK(g.size() == 1);
+    // Noticed forty times a pass, logged once an hour.
+    bool quiet = true;
+    for (uint32_t t = 101; t < 3700; t += 37) {
+        quiet = quiet && !g.raise(GuardKind::RouterChanged, spoof, router, gw, t, 3600);
+    }
+    CHECK(quiet);
+    CHECK(g.raise(GuardKind::RouterChanged, spoof, router, gw, 3701, 3600));
+    CHECK(g.at(0).first_s == 100 && g.at(0).last_s == 3701 && g.at(0).told_s == 3701);
+    // A different MAC is a different problem, told at once.
+    CHECK(g.raise(GuardKind::RouterChanged, test_mac_n(8), router, gw, 3702, 3600));
+    CHECK(g.size() == 2);
+
+    // A DHCP server is one problem whichever client it answers.
+    const uint32_t rogue = ipv4_from_octets(192, 168, 2, 50);
+    CHECK(g.raise(GuardKind::DhcpServer, test_mac_n(20), Mac{}, rogue, 4000, 3600));
+    CHECK(!g.raise(GuardKind::DhcpServer, test_mac_n(21), Mac{}, rogue, 4010, 3600));
+    CHECK(g.size() == 3);
+    const GuardEntry* d = g.get(GuardKind::DhcpServer, test_mac_n(99), rogue);
+    CHECK(d != nullptr && mac_equal(d->mac, test_mac_n(21)));
+
+    // Full: the one noticed longest ago gives way.
+    CHECK(g.raise(GuardKind::RogueAp, test_mac_n(30), Mac{}, 0, 4020, 3600));
+    CHECK(g.size() == 3);
+    CHECK(g.get(GuardKind::RouterChanged, spoof, gw) == nullptr);   // last 3701
+    CHECK(g.get(GuardKind::RouterChanged, test_mac_n(8), gw) != nullptr);
+
+    // Accepting clears it; an accepted change noticed again is a new problem.
+    CHECK(g.clear(GuardKind::RogueAp, test_mac_n(30), 0));
+    CHECK(!g.clear(GuardKind::RogueAp, test_mac_n(30), 0));
+    CHECK(g.size() == 2);
+    CHECK(g.raise(GuardKind::RogueAp, test_mac_n(30), Mac{}, 0, 4030, 3600));
+
+    // What stopped happening goes after a day.
+    g.expire(4030 + 86400, 86400);
+    CHECK(g.size() == 1);                 // only the one noticed at 4030 is left
+    g.expire(4031 + 86400, 86400);
+    CHECK(g.size() == 0);
+    g.raise(GuardKind::WeakAp, test_mac_n(31), Mac{}, 0, 10, 3600);
+    g.clear_all();
+    CHECK(g.size() == 0);
+}
+
+static void test_ip_claims() {
+    IpClaims<4> c;
+    Mac rival{};
+    const uint32_t x = ipv4_from_octets(192, 168, 2, 45);
+    const Mac a = test_mac_n(1), b = test_mac_n(2), z = test_mac_n(3);
+
+    // A holds it; B takes over: an address handed on, as DHCP does. Quiet.
+    CHECK(!c.observe(x, a, 100, 600, rival));
+    CHECK(!c.observe(x, a, 160, 600, rival));
+    CHECK(!c.observe(x, b, 220, 600, rival));
+    // Back to A a minute later: once is not enough, a sleep proxy does that.
+    CHECK(!c.observe(x, a, 280, 600, rival));
+    // And to B again: they are taking turns.
+    CHECK(c.observe(x, b, 340, 600, rival));
+    CHECK(mac_equal(rival, a));
+    // And on every turn after.
+    CHECK(c.observe(x, a, 400, 600, rival));
+    CHECK(mac_equal(rival, b));
+    CHECK(!c.observe(x, a, 460, 600, rival));         // no change, nothing to say
+
+    // A Mac asleep behind a sleep proxy, waking for a minute each hour: the
+    // address goes over and back once per wake, never three times in a row.
+    const uint32_t y = ipv4_from_octets(192, 168, 2, 46);
+    const Mac mac_book = test_mac_n(4), proxy = test_mac_n(5);
+    bool quiet = !c.observe(y, mac_book, 0, 600, rival);
+    for (uint32_t hour = 0; hour < 6; ++hour) {
+        const uint32_t t = 60 + hour * 3600;
+        quiet = quiet && !c.observe(y, proxy, t, 600, rival);               // falls asleep
+        for (uint32_t k = 1; k < 59; ++k) quiet = quiet && !c.observe(y, proxy, t + 60 * k, 600, rival);
+        quiet = quiet && !c.observe(y, mac_book, t + 3540, 600, rival);     // wakes
+        quiet = quiet && !c.observe(y, mac_book, t + 3570, 600, rival);
+    }
+    CHECK(quiet);
+
+    // Handed on and never handed back: quiet, however long it goes on.
+    const uint32_t v = ipv4_from_octets(192, 168, 2, 48);
+    CHECK(!c.observe(v, a, 100, 600, rival));
+    CHECK(!c.observe(v, b, 5000, 600, rival));
+    CHECK(!c.observe(v, b, 5060, 600, rival));
+
+    // A third device in the middle starts the count again.
+    const uint32_t w = ipv4_from_octets(192, 168, 2, 47);
+    CHECK(!c.observe(w, a, 100, 600, rival));
+    CHECK(!c.observe(w, b, 110, 600, rival));
+    CHECK(!c.observe(w, a, 120, 600, rival));
+    CHECK(!c.observe(w, z, 130, 600, rival));
+    CHECK(!c.observe(w, a, 140, 600, rival));
+    CHECK(c.observe(w, z, 150, 600, rival));        // z and a now take turns
+    CHECK(mac_equal(rival, a));
+    // Too slow: changes more than the window apart do not add up.
+    CHECK(!c.observe(w, a, 2000, 600, rival));
+    CHECK(!c.observe(w, z, 2700, 600, rival));
+    CHECK(!c.observe(w, a, 3400, 600, rival));
+
+    // Full, the address heard from longest ago gives way.
+    CHECK(c.size() == 4);
+    CHECK(!c.observe(ipv4_from_octets(192, 168, 2, 49), a, 10001, 600, rival));
+    CHECK(c.size() == 4);
+    c.clear();
+    CHECK(c.size() == 0);
+}
+
+static void test_guard_judgements() {
+    Baseline b;
+    base_reset(b, "Home");
+    const uint32_t gw = ipv4_from_octets(192, 168, 2, 1);
+    const uint32_t other = ipv4_from_octets(192, 168, 2, 50);
+
+    // Router: the first MAC heard becomes the record.
+    CHECK(guard_router_check(b, test_mac_n(1)) == RouterVerdict::Learn);
+    b.has_router = true;
+    b.router = test_mac_n(1);
+    CHECK(guard_router_check(b, test_mac_n(1)) == RouterVerdict::Same);
+    CHECK(guard_router_check(b, test_mac_n(2)) == RouterVerdict::Changed);
+
+    // DHCP: nothing on record, the router is the server.
+    CHECK(guard_dhcp_expected(b, gw, 0, gw));
+    CHECK(!guard_dhcp_expected(b, other, 0, gw));
+    CHECK(guard_dhcp_expected(b, 0, 0, gw));          // a REQUEST with no option 54
+    // The one that leased this board its address, always.
+    CHECK(guard_dhcp_expected(b, other, other, gw));
+    // Once one is on record, the router is not assumed any more.
+    base_add_dhcp(b, other);
+    CHECK(guard_dhcp_expected(b, other, 0, gw));
+    CHECK(!guard_dhcp_expected(b, gw, 0, gw));
+
+    // Access points: learned while learning, judged after.
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Learn);
+    // Learned with no scan heard: the first scan after records what it hears.
+    b.learned = true;
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Learn);
+    base_put_ap(b, test_mac_n(5), 3);
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Fine);
+    CHECK(guard_ap_check(b, test_mac_n(5), 5) == ApVerdict::Fine);       // WPA2-Enterprise: same rank
+    CHECK(guard_ap_check(b, test_mac_n(5), 0) == ApVerdict::Weaker);     // now open
+    CHECK(guard_ap_check(b, test_mac_n(5), 4) == ApVerdict::Weaker);     // WPA/WPA2
+    CHECK(guard_ap_check(b, test_mac_n(5), 7) == ApVerdict::Stronger);   // WPA3 added
+    CHECK(guard_ap_check(b, test_mac_n(5), 200) == ApVerdict::Fine);     // unknown mode
+    CHECK(guard_ap_check(b, test_mac_n(6), 3) == ApVerdict::Unknown);    // a twin
+    // Accepted while out of range, with no mode on record: the first one heard
+    // is taken, never called weaker.
+    base_put_ap(b, test_mac_n(7), 255);
+    CHECK(guard_ap_check(b, test_mac_n(7), 0) == ApVerdict::Stronger);
+    CHECK(guard_ap_check(b, test_mac_n(7), 255) == ApVerdict::Fine);
+}
+
 int main() {
     test_mac();
     test_event_log();
@@ -3050,6 +3447,15 @@ int main() {
     test_auth_password();
     test_auth_throttle();
     test_mac_rule();
+    test_classify_remembered();
+    test_table_trust_forget();
+    test_auth_rank();
+    test_event_names_012();
+    test_baseline_lists();
+    test_baseline_file();
+    test_guard_log();
+    test_ip_claims();
+    test_guard_judgements();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

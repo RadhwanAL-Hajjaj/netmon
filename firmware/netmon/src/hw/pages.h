@@ -198,6 +198,25 @@ tr.off{opacity:.55}
 tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
 .tag{font-size:.72rem;color:var(--mut);margin-left:.35rem}
 .none{padding:1.6rem 1rem;color:var(--mut)}
+.verdict a{color:inherit}
+tbody tr{cursor:pointer}
+tbody tr.sel td{background:var(--tint)}
+.act{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .6rem;
+ margin:0 1rem .85rem;padding:.6rem .7rem;border:1px solid var(--edge);border-radius:9px}
+.act .who{flex:1 1 12rem;min-width:0;font-size:.88rem}
+.act .who b{font-weight:600;overflow-wrap:anywhere}
+.act .who span{display:block;font-family:var(--mono);font-size:.76rem;color:var(--mut);
+ overflow-wrap:anywhere}
+.act button{padding:.35rem .75rem;font-size:.84rem}
+.act button.go{border-color:var(--ok);color:var(--ok);font-weight:600}
+.act button.arm{border-color:var(--bad);color:var(--bad)}
+.act button:disabled{opacity:.5;cursor:default}
+.act p{flex-basis:100%;margin:0;font-size:.78rem;color:var(--mut)}
+.act p.err{color:var(--bad)}
+.act p.ok{color:var(--ok)}
+/* Narrow: the name and the close button on one line, the actions under. */
+@media(max-width:520px){.act .who{order:1;flex-basis:calc(100% - 3.4rem)}
+ .act #aclose{order:2}.act #atrust{order:3}.act #aforget{order:4}.act p{order:5}}
 </style>
 <div class=sh>
 <header><a class=brand href="/">
@@ -214,6 +233,13 @@ tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
  <input id=q type=search autocomplete=off
   placeholder="Search address, vendor or MAC">
  <p class=hits id=hits></p>
+</div>
+<div class=act id=act hidden role=region aria-label="Selected device">
+ <div class=who><b id=aname></b><span id=aaddr></span></div>
+ <button type=button class=go id=atrust>Trust</button>
+ <button type=button id=aforget>Forget</button>
+ <button type=button id=aclose aria-label="Close">&#x2715;</button>
+ <p id=amsg aria-live=polite></p>
 </div>
 <div class=wrap id=wrap><table id=tbl><colgroup id=cg></colgroup>
 <thead><tr id=hrow></tr></thead><tbody id=rows></tbody></table></div>
@@ -305,7 +331,8 @@ function render(){
   :'No devices found yet. The first sweep runs a minute after start-up.';
   return}
  rows.innerHTML=show.slice().sort(cmp).map(function(x){
-  return '<tr class="'+x.status+(x.self?' self':'')+(x.online?'':' off')+'">'
+  return '<tr tabindex=0 data-m="'+esc(x.mac)+'" class="'+x.status+(x.self?' self':'')
+   +(x.online?'':' off')+(x.mac==sel?' sel':'')+'">'
    +'<td class=st>'+x.status+'</td>'
    +'<td class=ip>'+esc(x.ip||'')
    +(x.self?'<span class=tag>this</span>':'')+'</td>'
@@ -333,20 +360,72 @@ function load(){
   if(!h.sweepable){verdict.className='verdict idle';
    verdict.textContent='Not scanning. No usable subnet, so the board is in setup mode.';
    return}
-  return fetch('/api/devices').then(function(r){return r.json()})
-   .then(function(d){all=d;
+  return Promise.all([fetch('/api/devices').then(function(r){return r.json()}),
+   h.alerts?fetch('/api/guard').then(function(r){return r.json()})
+    .catch(function(){return null}):null])
+   .then(function(res){var d=res[0],g=res[1];all=d;
     var u=d.filter(function(x){return x.status=='unknown'}).length;
-    if(u){verdict.className='verdict flag';
-     verdict.textContent=u==1?'1 device is not recognised.'
-      :u+' devices are not recognised.'}
+    var un=u?(u==1?'1 device is not recognised.':u+' devices are not recognised.'):'';
+    var al=g&&g.alerts?g.alerts.slice().sort(function(a,b){return a.age_s-b.age_s}):[];
+    if(al.length){verdict.className='verdict flag';
+     verdict.innerHTML=esc((ALERT[al[0].type]||'The network changed.')
+      +(al.length>1?' And '+(al.length-1)+' more.':'')+(un?' '+un:''))
+      +' <a href="/events">Review</a>'}
+    else if(u){verdict.className='verdict flag';
+     verdict.textContent=un+' Pick '+(u==1?'it':'one')+' in the list to trust or forget it.'}
     else{verdict.className='verdict clear';
      verdict.textContent=h.baseline_open
       ?'Still learning. Everything seen so far counts as known for '
        +Math.max(1,Math.round(h.baseline_closes_in_s/60))+' more minutes.'
       :'Everything here is recognised.'}
-    render()})})
+    render();showact()})})
  .catch(function(){verdict.className='verdict flag';
   verdict.textContent='Cannot reach the monitor.'})}
+// What each LAN watch alert means, for the line at the top. Events has more.
+var ALERT={router_changed:'The router\u2019s address answers from a different device.',
+ ip_conflict:'Two devices are answering for one address.',
+ dhcp_server:'An unexpected DHCP server is handing out addresses.',
+ rogue_ap:'An unknown access point is using your Wi-Fi name.',
+ weak_ap:'One of your access points offers weaker security than before.'};
+// A row picked in the table: who it is, and Trust or Forget. Trust keeps an
+// unknown device known on this network after restarts; Forget takes a device
+// off the list, so it is flagged if it turns up again. Forget takes two taps.
+var sel=null,busy=false,armT=0;
+function pick(m){sel=sel==m?null:m;disarm();amsg.textContent='';amsg.className='';
+ render();showact();if(sel)act.scrollIntoView({block:'nearest'})}
+function cur(){for(var i=0;i<all.length;i++)if(all[i].mac==sel)return all[i];return null}
+function showact(){var x=sel&&cur();act.hidden=!x;if(!x)return;
+ aname.textContent=x.hostname||(x.vendor?shortv(x.vendor)+' device'
+  :x.randomised?'Device with a private address':'Unnamed device');
+ aaddr.textContent=(x.ip?x.ip+' \u00b7 ':'')+x.mac;
+ atrust.hidden=x.self||x.status!='unknown';aforget.hidden=x.self;
+ if(amsg.className!='err'&&amsg.className!='ok')amsg.textContent=x.self?'This is the monitor itself.'
+  :x.status=='unknown'?'Not recognised. Trust it if it is yours: it stays known after restarts.'
+  :x.status=='private'?'A private address, which is never flagged. Forget takes it off the list.'
+  :'Recognised on this network. Forget it to have it flagged if it turns up again.'}
+function disarm(){clearTimeout(armT);aforget.textContent='Forget';aforget.className=''}
+function post(path,done){var m=sel;busy=true;atrust.disabled=aforget.disabled=true;
+ fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({mac:m})})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){busy=false;atrust.disabled=aforget.disabled=false;
+  if(!res.ok){amsg.textContent=res.j.error||'The board refused that.';amsg.className='err';return}
+  done();load()})
+ .catch(function(){busy=false;atrust.disabled=aforget.disabled=false;
+  amsg.textContent='Could not reach the monitor.';amsg.className='err'})}
+atrust.onclick=function(){if(busy||!sel)return;amsg.className='';
+ amsg.textContent='Marking it as known\u2026';
+ post('/api/devices/trust',function(){amsg.textContent='Marked as known.';amsg.className='ok'})};
+aforget.onclick=function(){if(busy||!sel)return;
+ if(aforget.className!='arm'){aforget.textContent='Confirm';aforget.className='arm';
+  armT=setTimeout(disarm,4000);return}
+ disarm();post('/api/devices/forget',function(){sel=null;act.hidden=true})};
+aclose.onclick=function(){pick(sel)};
+rows.onclick=function(e){var t=e.target.closest&&e.target.closest('tr[data-m]');
+ if(t)pick(t.getAttribute('data-m'))};
+rows.onkeydown=function(e){if(e.key!='Enter'&&e.key!=' ')return;
+ var t=e.target.closest&&e.target.closest('tr[data-m]');
+ if(t){e.preventDefault();pick(t.getAttribute('data-m'))}};
 sortk=get('s')||'ip';sortd=+get('d')||1;
 initWidths();head();
 q.addEventListener('input',render);
@@ -361,10 +440,12 @@ static const char SETTINGS_HTML[] PROGMEM =
 "<!doctype html><title>Settings - Network Monitor</title>"
 NM_HEAD
 R"HTML(<style>
-#msg,#fwmsg,#netmsg{margin:.75rem 0 0;font-size:.85rem;min-height:1.2em}
-#msg.err,#fwmsg.err,#netmsg.err{color:var(--bad)}
-#msg.ok,#fwmsg.ok{color:var(--ok)}
-#netmsg:empty{display:none}
+#msg,#fwmsg,#netmsg,#basemsg{margin:.75rem 0 0;font-size:.85rem;min-height:1.2em}
+#msg.err,#fwmsg.err,#netmsg.err,#basemsg.err{color:var(--bad)}
+#msg.ok,#fwmsg.ok,#basemsg.ok{color:var(--ok)}
+#netmsg:empty,#basemsg:empty{display:none}
+#relearn{margin-top:.75rem}
+#relearn.arm{border-color:var(--bad);color:var(--bad)}
 button:disabled{opacity:.5;cursor:default}
 .nets{width:100%;border-collapse:collapse;margin:.8rem 0 0;font-size:.85rem}
 .nets th{text-align:left;font-weight:500;font-size:.76rem;color:var(--mut);
@@ -464,6 +545,12 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  <h2>DHCP information</h2>
  <dl id=dhcp><dt>Status</dt><dd>Waiting for DHCP traffic…</dd></dl>
  <p class=hint>Learned from the DHCP requests devices broadcast when they join the network, which is also where hostnames come from. A device that stays connected shows up here only after it reconnects or restarts. Names are remembered across restarts.</p>
+</section>
+<section>
+ <h2>Recognised devices</h2>
+ <p class=hint id=basenote>Checking</p>
+ <button type=button id=relearn>Learn this network again</button>
+ <p id=basemsg></p>
 </section>
 <section>
  <h2>Advanced monitoring</h2>
@@ -984,7 +1071,34 @@ function delpw(){
   pwarmT=setTimeout(function(){pwarm=false;pwdel.textContent='Remove it';pwdel.className=''},4000);return}
  clearTimeout(pwarmT);pwarm=false;pwdel.textContent='Remove it';pwdel.className='';
  pwsend(pwcur.value,'')}
-loadcfg();loadnets();loaddhcp();loadble();loadreps();loadauth();
+// What the board keeps for this network, and starting it over. Learning again
+// forgets every recognised device here, the router's MAC, the DHCP servers and
+// the access points; what is on the network for the next window becomes known.
+function loadbase(){Promise.all([fetch('/api/guard').then(function(r){return r.json()}),
+  fetch('/api/health').then(function(r){return r.json()})])
+ .then(function(res){var g=res[0],h=res[1];relearn.hidden=!g.network;
+  basenote.textContent=!g.network?'Not on a network yet.'
+   :g.learning?'Learning '+g.network+'. Everything seen counts as known for about '
+    +Math.max(1,Math.round(h.baseline_closes_in_s/60))+' more minutes, then the list is kept on '
+    +'the board and survives restarts and updates.'
+   :g.learned?g.known+(g.known==1?' device is':' devices are')+' recognised on '+g.network
+    +', kept across restarts and updates. Mark others as known from the Devices page.'
+   :'Nothing learned on '+g.network+' yet. Learning starts at the first sweep that finds something.'})
+ .catch(function(){basenote.textContent='Could not read what the board keeps for this network.'})}
+var rlT=0;
+function rldisarm(){clearTimeout(rlT);relearn.className='';relearn.textContent='Learn this network again'}
+relearn.onclick=function(){
+ if(relearn.className!='arm'){relearn.className='arm';relearn.textContent='Confirm: forget every recognised device';
+  rlT=setTimeout(rldisarm,4000);return}
+ rldisarm();relearn.disabled=true;basemsg.textContent='';basemsg.className='';
+ fetch('/api/guard/relearn',{method:'POST'})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){relearn.disabled=false;
+  basemsg.textContent=res.ok?'Learning again. Devices on the network over the next window become known.'
+   :(res.j.error||'The board refused that.');basemsg.className=res.ok?'ok':'err';loadbase()})
+ .catch(function(){relearn.disabled=false;basemsg.textContent='Could not reach the board.';
+  basemsg.className='err'})};
+loadcfg();loadnets();loaddhcp();loadble();loadreps();loadauth();loadbase();
 setInterval(function(){if(!busy)loaddhcp()},10000);
 setInterval(function(){if(!busy)loadreps()},60000);
 </script>
@@ -1076,10 +1190,27 @@ R"HTML(<style>
 .event .type{font-weight:600}
 .event.offline .type{color:var(--warn)}
 .event.hostname .type{color:var(--link)}
+.event.router_changed .type,.event.ip_conflict .type,.event.dhcp_server .type,
+.event.rogue_ap .type,.event.weak_ap .type{color:var(--bad)}
+.event.trusted .type{color:var(--ok)}
+.event.forgotten .type{color:var(--mut)}
 .empty{padding:1.5rem 1rem;color:var(--mut)}
+.al{display:flex;gap:.75rem;align-items:flex-start;margin:.8rem 0 0;padding:.7rem .75rem;
+ border:1px solid var(--edge);border-left:3px solid var(--bad);border-radius:9px;font-size:.85rem}
+.al div{flex:1;min-width:0;overflow-wrap:anywhere}
+.al b{display:block;font-weight:600;color:var(--bad)}
+.al small{display:block;margin-top:.25rem;color:var(--mut)}
+.al code{font-family:var(--mono);font-size:.8rem}
+.al button{flex:none;padding:.35rem .7rem;font-size:.82rem}
+.al button:disabled{opacity:.5;cursor:default}
+#almsg{margin:.6rem 0 0;font-size:.82rem}
+#almsg:empty{display:none}
+#almsg.err{color:var(--bad)}
 </style>
 <div class=sh>
 <header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a><nav><a href="/">Devices</a><a href="/map">Map</a><a href="/nearby">Nearby</a><span>Events</span><a href="/isp">Internet</a><a href="/settings">Settings</a></nav></header>
+<section><h2>LAN watch</h2><p class=hint id=watch>Checking</p><div id=alerts></div>
+<p id=almsg aria-live=polite></p></section>
 <section><h2>Recent events</h2><p class=hint>Stored in RAM; history is cleared when the monitor restarts.</p></section>
 <div id=list></div><p class=empty id=empty hidden>No events yet.</p>
 <p class=foot><a href="/api/events">Event JSON</a> · <a href="/api/latency">Latency JSON</a></p>
@@ -1088,15 +1219,66 @@ R"HTML(<style>
 function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
 function ago(s){if(!s)return 'now';if(s<60)return s+'s ago';if(s<3600)return((s/60)|0)+'m ago';
  if(s<86400)return((s/3600)|0)+'h ago';return((s/86400)|0)+'d ago'}
+// The LAN watch's events go by shorter names in the list.
+var LABEL={router_changed:'router',ip_conflict:'clash',dhcp_server:'dhcp',
+ rogue_ap:'rogue ap',weak_ap:'weak ap'};
+var ATITLE={router_changed:'The router answers from a different device',
+ ip_conflict:'Two devices on one address',dhcp_server:'An unexpected DHCP server',
+ rogue_ap:'An unknown access point with your Wi-Fi name',
+ weak_ap:'An access point offers weaker security'};
+function code(t){return '<code>'+esc(t)+'</code>'}
+function adesc(a,g){switch(a.type){
+ case 'router_changed':return 'The router\u2019s address '+code(a.ip)+' now answers from '
+  +code(a.mac)+', not '+code(a.other)+'. ARP spoofing looks like this, and so does a replaced router.';
+ case 'ip_conflict':return code(a.mac)+' and '+code(a.other)+' both answer for '+code(a.ip)
+  +'. Two devices set to one address look like this, and so does one answering for another.';
+ case 'dhcp_server':return 'A DHCP server at '+code(a.ip)+' handed out an address, most recently to '
+  +code(a.mac)+'. A second server can send devices through itself.';
+ case 'rogue_ap':return code(a.mac)+' uses the name '+esc(g.network)+' but is not one of this '
+  +'network\u2019s access points. An evil twin looks like this, and so does a new extender.';
+ case 'weak_ap':return 'Your access point '+code(a.mac)+' now offers weaker security than it '
+  +'did. The event list below says what changed.'}
+ return esc(a.type)}
+var galerts=[],busy=false;
+function showguard(g,now){
+ galerts=(g.alerts||[]).slice().sort(function(a,b){return a.age_s-b.age_s});
+ var w=[];if(g.router)w.push('the router at '+g.router);
+ var d=g.dhcp_own||(g.dhcp||[]).join(', ');if(d)w.push('DHCP from '+d);
+ var n=(g.aps||[]).length;if(n)w.push(n+(n==1?' access point':' access points'));
+ watch.textContent=(g.learning?'Learning this network: what is seen now becomes the normal. '
+  :galerts.length?'':'Nothing unusual. ')
+  +(w.length?'Watching '+w.join(', ')+'.':'')
+  +(g.wifi_watch?'':' Access points are checked only while Nearby Wi-Fi scanning is on.');
+ alerts.innerHTML=galerts.map(function(a,i){
+  return '<div class=al><div><b>'+esc(ATITLE[a.type]||a.type)+'</b>'+adesc(a,g)
+   +'<small>First noticed '+ago(now>=a.first_s?now-a.first_s:0)+', last '
+   +ago(a.age_s)+'.</small></div><button type=button data-i='+i+'>'
+   +(a.type=='ip_conflict'?'Dismiss':'Accept')+'</button></div>'}).join('')
+  +(galerts.length?'<p class=hint>Accept a change you made yourself: it becomes the normal '
+   +'for this network. An alert also clears by itself a day after it stops.</p>':'')}
+alerts.onclick=function(e){var b=e.target.closest&&e.target.closest('button[data-i]');
+ var a=b&&galerts[+b.getAttribute('data-i')];if(!a||busy)return;
+ busy=true;b.disabled=true;almsg.textContent='';almsg.className='';
+ fetch('/api/guard/accept',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({type:a.type,mac:a.mac,ip:a.ip})})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){busy=false;
+  if(!res.ok){almsg.textContent=res.j.error||'The board refused that.';almsg.className='err'}
+  load()})
+ .catch(function(){busy=false;almsg.textContent='Could not reach the monitor.';
+  almsg.className='err';load()})};
 function load(){fetch('/api/health').then(function(r){return r.json()}).then(function(h){
- ver.textContent=h.version||'';return fetch('/api/events').then(function(r){return r.json()})
- .then(function(es){var now=h.uptime_s||0;empty.hidden=es.length>0;
+ ver.textContent=h.version||'';var now=h.uptime_s||0;
+ fetch('/api/guard').then(function(r){return r.json()}).then(function(g){showguard(g,now)})
+  .catch(function(){watch.textContent='The LAN watch did not answer.'});
+ return fetch('/api/events').then(function(r){return r.json()})
+ .then(function(es){empty.hidden=es.length>0;
  list.innerHTML=es.map(function(e){var age=now>=e.at_s?now-e.at_s:0;
  return '<div class="event '+esc(e.type)+'"><div class=time>'+age+'s</div>'
-  +'<div class=type>'+esc(e.type)+'</div><div><span class=mac>'+esc(e.mac)
-  +'</span> · '+esc(e.ip)+'<br>'+esc(e.text)+'</div></div>'}).join('')})})
+  +'<div class=type>'+esc(LABEL[e.type]||e.type)+'</div><div><span class=mac>'+esc(e.mac)
+  +'</span>'+(e.ip&&e.ip!='0.0.0.0'?' · '+esc(e.ip):'')+'<br>'+esc(e.text)+'</div></div>'}).join('')})})
  .catch(function(){list.innerHTML='<p class=empty>Cannot reach the monitor.</p>'})}
-load();setInterval(load,10000);
+load();setInterval(function(){if(!busy)load()},10000);
 </script>
 )HTML";
 

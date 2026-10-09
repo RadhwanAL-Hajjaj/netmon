@@ -3,6 +3,61 @@
 Firmware releases, newest first. The Android app's notes are in
 [android/README.md](android/README.md).
 
+## 0.14.0-guard
+
+Recognised devices are kept on the board, and a LAN watch notices the changes
+an attacker on the network would have to make.
+
+- **Recognised devices survive restarts.** When a network's learning window
+  closes, the board saves the devices it learned, one list per network, in
+  LittleFS (`/base-<hash>.txt`, `src/core/baseline.h`). After a restart, a power
+  cut or an update there is no second window: a device with a manufacturer MAC
+  that is not on the list is unknown from the first sweep. Before, the first
+  ten minutes after every restart counted whatever was on the network as known,
+  an intruder included. Forgetting a network in Settings deletes its list, and
+  lists for networks no longer saved are removed at start-up.
+- **Trust and Forget.** Pick a device on the Devices page. Trust makes an
+  unknown device known and keeps it that way; Forget takes a device off the
+  list and out of the table, so it is flagged if it turns up again. Forget
+  takes two taps. Both are logged as events (`trusted`, `forgotten`).
+- **Learn this network again**, in Settings, forgets the list and everything
+  the LAN watch keeps, and opens a new learning window.
+- **LAN watch** (`src/core/lan_guard.h`). The board notices and logs:
+  - `router_changed`: the router's address answers from a different MAC, as
+    ARP spoofing makes it. The first MAC seen there becomes the record.
+  - `ip_conflict`: two MACs take turns answering for one address, A, B, A, B,
+    each change within ten minutes of the last. A DHCP server handing an
+    address on is not one, nor is a sleep proxy answering for a sleeping Mac.
+  - `dhcp_server`: a device took a lease from a DHCP server the network does
+    not use, read from option 54 of its REQUEST. Expected are the server that
+    leased the board its own address, those seen while learning, and, with
+    none on record, the router.
+  - `rogue_ap` and `weak_ap`: after a Nearby Wi-Fi scan, an access point with
+    this network's name that is not one of its own, or one of its own offering
+    weaker security than before. The access points heard while learning are
+    the network's own; with none on record, the first scan that hears the name
+    records them.
+
+  Each is logged once, then again hourly while it carries on, and forgotten a
+  day after it stops. The Events page lists them with **Accept** (or
+  **Dismiss** for a clash), and the Devices page names the newest at the top.
+- **API.** `POST /api/devices/trust` and `/api/devices/forget` take
+  `{"mac"}`. `GET /api/guard` gives `network`, `learned`, `learning`, `known`,
+  `router`, `dhcp_own`, `dhcp`, `aps` (`bssid`, `auth`), `wifi_watch` and
+  `alerts` (`type`, `mac`, `other`, `ip`, `first_s`, `last_s`, `age_s`).
+  `POST /api/guard/accept` takes an alert's `type`, `mac` and `ip`;
+  `POST /api/guard/relearn` takes nothing. `/api/health` gains
+  `baseline_saved`, `known_saved` and `alerts`, and `baseline_open` is false
+  on a network learned before. Like every other endpoint they need a session,
+  the POSTs get the Origin check, and all of them answer over the Bluetooth
+  link too.
+- **Upgrade.** From 0.13 over the air; the partition scheme is unchanged and
+  settings, sessions, reports and paired phones are kept. Each network learns
+  once more after the update (a 10-minute window), then its list is saved.
+- 2187 host checks, clean under AddressSanitizer and UBSan, and new page checks
+  in `firmware/test/pages/check_guard.py`.
+- Image: 1,621,171 bytes, 82% of the 1.9 MB app partition.
+
 ## 0.13.0-login
 
 Every page and API call now needs signing in, Bluetooth pairing works on the

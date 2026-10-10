@@ -192,9 +192,9 @@ class ConnectScreen(host: MainActivity) : Screen(host), Discovery.Listener {
         val c = ctx
         val box = c.column()
         box.add(c.label(if (h.pairing) "Enter the 6-digit code the monitor's Settings page shows, or your own pairing code."
-            else "This monitor has no pairing window open. On any phone or computer on its Wi-Fi, open its Settings " +
-                "page and press Pair a phone in the Bluetooth section. Then enter the code it shows, or your own " +
-                "pairing code.", 15f, T.TEXT2))
+            else "Enter your 6-digit pairing code. The monitor opens a pairing window at startup — if it isn't " +
+                "responding, restart it and try within 2 minutes. You can also open Settings on its Wi-Fi to start " +
+                "a pairing window manually.", 15f, T.TEXT2))
         val code = box.add(c.input("6-digit code", InputType.TYPE_CLASS_NUMBER), top = 12)
         code.filters = arrayOf(InputFilter.LengthFilter(6))
         code.letterSpacing = 0.12f

@@ -6,11 +6,11 @@ including the Wi-Fi and Bluetooth radars, the Finder and the network map, plus
 notifications, a longer event history kept on the phone, the board's saved
 reports, and firmware updates from the phone.
 
-Version 1.3.1, for Android 8.0 and later. It works with netmon firmware 0.9.x
+Version 1.4.0, for Android 8.0 and later. It works with netmon firmware 0.9.x
 and later, and shows what each board has: network history needs firmware 0.9.4
 or later, the DHCP listener status 0.9.6, Nearby 0.10, the Finder and the
 access points on the map 0.11, Bluetooth and saved reports 0.12, and signing
-in 0.13. On older firmware those screens say what they need instead. Firmware
+in 0.13, Trust, Forget and the LAN watch 0.14. On older firmware those screens say what they need instead. Firmware
 0.13 needs this version: earlier apps cannot sign in.
 
 ## Install
@@ -305,9 +305,13 @@ app/src/main/java/com/example/netmon/
 
 ## Changes
 
-**Unreleased**
+**1.4.0**
 - Trust and Forget in a device's details, and the LAN watch's alerts in
   Events, on the Overview and as notifications (firmware 0.14).
+- Pairing over Bluetooth no longer sends you to the board's Settings page
+  first. From firmware 0.15 the board opens a pairing window as it starts:
+  with your own pairing code set, restart the board and pair within two
+  minutes, with nothing on its Wi-Fi.
 
 **1.3.1**
 - Fixed: the app stopped when *Find your monitor* was opened while it was

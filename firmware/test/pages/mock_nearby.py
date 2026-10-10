@@ -39,6 +39,25 @@ SIM = {"unavailable": False, "requested": False}
 # those add.
 OVERRIDE = {}
 FORGOTTEN = set()
+# The port scan (firmware 0.15): one device at a time, about four seconds a
+# scan, with open ports that depend only on the address.
+PORTSCAN = {"ip": "", "start": 0.0}
+SCAN_PORTS = [(21, "FTP"), (22, "SSH"), (23, "Telnet"), (25, "SMTP"), (53, "DNS"), (80, "HTTP"),
+              (110, "POP3"), (443, "HTTPS"), (445, "SMB"), (554, "RTSP"), (1883, "MQTT"),
+              (3389, "RDP"), (8080, "HTTP-alt"), (8443, "HTTPS-alt"), (8883, "MQTT-TLS"),
+              (9100, "Printer")]
+
+
+def portscan(query):
+    want = query.get("ip", [""])[0]
+    if not PORTSCAN["ip"] or (want and want != PORTSCAN["ip"]):
+        return {"state": "idle", "total": len(SCAN_PORTS)}
+    last = int(PORTSCAN["ip"].rsplit(".", 1)[1])
+    opened = {1: {53, 80, 443}, 11: {22, 80, 443, 445, 8080}}.get(last, {80, 8080} if last % 2 == 0 else set())
+    probed = min(len(SCAN_PORTS), int((time.time() - PORTSCAN["start"]) / 0.25))
+    return {"state": "done" if probed == len(SCAN_PORTS) else "scanning", "total": len(SCAN_PORTS),
+            "ip": PORTSCAN["ip"], "probed": probed, "elapsed_ms": int((time.time() - PORTSCAN["start"]) * 1000),
+            "open": [{"port": p, "name": n} for p, n in SCAN_PORTS[:probed] if p in opened]}
 GUARD = {"learned": True, "learning": False, "alerts": []}
 EXTRA_EVENTS = []
 # The Bluetooth link, as GET /api/ble reports it; see ble_status().
@@ -562,6 +581,8 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, pages["LOGIN_HTML"], "text/html", headers=(("Cache-Control", "no-store"),))
         if u.path == "/api/auth":
             return self.send(200, self.auth_get(), headers=(("Cache-Control", "no-store"),))
+        if u.path == "/api/portscan":
+            return self.send(200, portscan(parse_qs(u.query)))
         route = {"/": "DASHBOARD_HTML", "/settings": "SETTINGS_HTML", "/isp": "ISP_HTML",
                  "/events": "EVENTS_HTML", "/nearby": "NEARBY_HTML", "/map": "MAP_HTML"}
         if u.path in route:
@@ -824,6 +845,16 @@ class H(BaseHTTPRequestHandler):
                 FIND["turn"] = {"start": time.time() + float(q.get("turn_in_ms", ["0"])[0]) / 1000.0,
                                 "T": float(q["turn_s"][0]), "dir": float(q.get("dir", ["0"])[0])}
             return self.send(200, {"ok": True})
+        if u.path == "/api/portscan":
+            try:
+                j = json.loads(body or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "request body is not valid JSON"})
+            ip = str(j.get("ip", ""))
+            if not ip.startswith("192.168.2.") or ip.endswith((".0", ".255")):
+                return self.send(400, {"error": "only devices on the board's own network can be scanned"})
+            PORTSCAN.update(ip=ip, start=time.time())
+            return self.send(200, {"status": "started"})
         if u.path in ("/api/devices/trust", "/api/devices/forget"):
             try:
                 j = json.loads(body or b"{}")

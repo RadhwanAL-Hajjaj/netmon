@@ -3,6 +3,25 @@
 Firmware releases, newest first. The Android app's notes are in
 [android/README.md](android/README.md).
 
+## 0.15.0-ports
+
+A port scan on the Devices page, and Bluetooth pairing that needs no Wi-Fi.
+
+- **Scan ports.** Pick a device on the Devices page and press Scan ports. The
+  board tries 16 common TCP ports (FTP, SSH, Telnet, SMTP, DNS, HTTP, POP3,
+  HTTPS, SMB, RTSP, MQTT, RDP, 8080, 8443, MQTT over TLS, printing) and lists
+  the ones that accept a connection. Two ports at a time, 1.5 s each at most,
+  on non-blocking sockets, so the pages and the Bluetooth link stay responsive
+  while it runs. Only addresses on the board's own network, one scan at a
+  time, never on its own. API: `POST /api/portscan {"ip":"..."}` starts it,
+  `GET /api/portscan?ip=...` reports it (`src/hw/port_scan.h`).
+- **Pairing window at start-up.** With the Bluetooth link on, the board opens
+  its two-minute pairing window as it starts. With your own pairing code set
+  in Settings, a new phone pairs by restarting the board and pairing in the
+  app within two minutes: nothing has to be on the board's Wi-Fi. Phones
+  already paired reconnect as before, window or not. The Android app's pairing
+  dialog says so instead of sending you to the Settings page.
+
 ## 0.14.0-guard
 
 Recognised devices are kept on the board, and a LAN watch notices the changes

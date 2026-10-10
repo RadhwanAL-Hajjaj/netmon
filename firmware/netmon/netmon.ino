@@ -9,7 +9,10 @@
 // keeps a saved report of each network it has been on (src/core/report.h).
 // From 0.13.0 everything needs signing in (src/core/auth.h), the owner can set
 // the pairing code and the board's Wi-Fi MAC address, and pairing is started
-// by the phone alone, which is what made it fail before.
+// by the phone alone, which is what made it fail before. From 0.15.0 the
+// Devices page can scan a device's common TCP ports (src/hw/port_scan.h), and
+// the board opens a pairing window at start-up, so a phone can pair without
+// anything on the board's Wi-Fi.
 //
 // Board:     ESP32 Dev Module
 // Partition: Minimal SPIFFS (1.9MB APP with OTA)
@@ -53,6 +56,7 @@
 #include "src/core/origin.h"
 #include "src/core/oui_table.h"
 #include "src/core/refresh.h"
+#include "src/hw/port_scan.h"
 #include "src/core/report.h"
 #include "src/core/scan_list.h"
 #include "src/core/sweep.h"
@@ -85,7 +89,7 @@ static_assert(sizeof(NETMON_UPDATE_PASSWORD) > 8,
 static_assert(!same_text(NETMON_UPDATE_PASSWORD, "change-me"),
               "netmon: choose your own NETMON_UPDATE_PASSWORD in secrets.h");
 
-static const char* kFirmwareVersion = "0.14.0-guard";
+static const char* kFirmwareVersion = "0.15.0-ports";
 static const char* kOtaHostname = "netmon";
 static const char* kOtaPassword = NETMON_UPDATE_PASSWORD;
 
@@ -431,6 +435,10 @@ static uint32_t g_air_bursts = 0;
 static uint32_t g_air_burst_end_s = 0;
 static uint32_t g_air_expired_ms = 0;
 static bool g_updating = false;           // a firmware update has the board
+
+// Port scanner: probes a fixed list of common TCP ports on one LAN host.
+// One scan at a time; results survive until a new scan starts.
+static PortScanner g_portscan;
 
 // The Finder: one device listened for closely while somebody walks up to it.
 // See air_find.h. What the device called itself is copied when it is picked,
@@ -2242,6 +2250,72 @@ static void handle_device_forget() {
     api_send(200, "application/json", F("{\"status\":\"forgotten\"}"));
 }
 
+// --- Port scanner (0.15) ----------------------------------------------------
+//
+// POST /api/portscan {"ip":"192.168.2.40"} starts a scan of one device;
+// GET /api/portscan?ip=... reports it, with the open ports found so far.
+// Only addresses on the board's own network: this looks at your devices,
+// it is not for probing the internet. See src/hw/port_scan.h.
+
+static void handle_portscan_post() {
+    if (refuse_other_site()) return;
+    if (wifi_state() != WifiState::Connected) {
+        api_send(503, "application/json",
+                      F("{\"error\":\"the board is not on a network yet\"}"));
+        return;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, api_body())) {
+        send_config_error("request body is not valid JSON");
+        return;
+    }
+    uint32_t ip = 0;
+    if (!ipv4_parse(doc["ip"] | "", ip)) {
+        send_config_error("ip is not an IPv4 address");
+        return;
+    }
+    const uint32_t net = derived_subnet();
+    const uint32_t mask = derived_mask();
+    if (!subnet_contains(net, mask, ip) || ip == net || ip == (net | ~mask)) {
+        send_config_error("only devices on the board's own network can be scanned");
+        return;
+    }
+    g_portscan.begin(ip);
+    api_send(200, "application/json", F("{\"status\":\"started\"}"));
+}
+
+// With ?ip= the answer is "idle" unless that address is the one scanned, so a
+// page never shows one device's ports under another.
+static void handle_portscan_get() {
+    const ScanState st = g_portscan.state();
+    bool match = st != ScanState::Idle;
+    if (match && api_has_arg("ip")) {
+        uint32_t want = 0;
+        match = ipv4_parse(api_arg("ip").c_str(), want) && want == g_portscan.ip();
+    }
+    JsonDocument doc;
+    doc["state"] = !match ? "idle" : st == ScanState::Scanning ? "scanning" : "done";
+    doc["total"] = g_portscan.total();
+    if (match) {
+        char ip[16];
+        ipv4_format(g_portscan.ip(), ip);
+        doc["ip"] = ip;
+        doc["probed"] = g_portscan.probed();
+        doc["elapsed_ms"] = g_portscan.elapsed_ms();
+        JsonArray open = doc["open"].to<JsonArray>();
+        for (size_t i = 0; i < kScanPortCount; ++i) {
+            const PortResult& r = g_portscan.results()[i];
+            if (!r.open) continue;
+            JsonObject o = open.add<JsonObject>();
+            o["port"] = r.port;
+            o["name"] = r.name;
+        }
+    }
+    String out;
+    serializeJson(doc, out);
+    api_send(200, "application/json", out);
+}
+
 // What the board keeps for this network and what the LAN watch has noticed.
 static void handle_guard() {
     const uint32_t now = now_s();
@@ -3500,6 +3574,9 @@ static const ApiRoute kApiRoutes[] = {
     {"/api/reports/save", kPost, handle_report_save},
     {"/api/reports/delete", kPost, handle_report_delete},
     {"/api/clock", kPost, handle_clock},
+    // Port scanner: probes common TCP ports on one LAN host (0.15).
+    {"/api/portscan", kGet,  handle_portscan_get},
+    {"/api/portscan", kPost, handle_portscan_post},
     // Recognised devices and the LAN watch (0.14).
     {"/api/devices/trust", kPost, handle_device_trust},
     {"/api/devices/forget", kPost, handle_device_forget},
@@ -3700,9 +3777,18 @@ void setup() {
     // The Bluetooth link: the same API, for phones paired with a 6-digit code.
     // Off in settings, the stack is not started for it at all.
     if (g_settings.ble_link) {
-        Serial.println(ble_link_begin(true)
-                           ? F("[link] Bluetooth link up, advertising as netmon")
-                           : F("[link] Bluetooth link could not start"));
+        if (ble_link_begin(true)) {
+            Serial.println(F("[link] Bluetooth link up, advertising as netmon"));
+            // Open a pairing window immediately so a phone can pair without
+            // needing access to the board's Wi-Fi first (0.15). The window
+            // uses the owner's fixed code if one is set, or a random code
+            // shown in Settings. After the window closes the board keeps
+            // advertising and already-paired phones reconnect without a window.
+            ble_link_pair(true);
+            Serial.println(F("[link] pairing window open for 2 minutes"));
+        } else {
+            Serial.println(F("[link] Bluetooth link could not start"));
+        }
     }
 
     g_server.on("/", handle_dashboard);
@@ -3760,4 +3846,5 @@ void loop() {
     scan_tick();
     air_tick();
     setup_retry_tick();
+    g_portscan.tick();
 }

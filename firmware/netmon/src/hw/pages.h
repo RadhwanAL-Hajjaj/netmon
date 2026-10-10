@@ -216,7 +216,16 @@ tbody tr.sel td{background:var(--tint)}
 .act p.ok{color:var(--ok)}
 /* Narrow: the name and the close button on one line, the actions under. */
 @media(max-width:520px){.act .who{order:1;flex-basis:calc(100% - 3.4rem)}
- .act #aclose{order:2}.act #atrust{order:3}.act #aforget{order:4}.act p{order:5}}
+ .act #aclose{order:2}.act #atrust{order:3}.act #aforget{order:4}
+ .act #ascan{order:5}.act p{order:6}.act #aports{order:7}}
+/* Port scan results */
+#aports{flex-basis:100%;margin:0}
+#aports .ps-bar{height:3px;border-radius:2px;background:var(--edge);margin:.35rem 0 .5rem;overflow:hidden}
+#aports .ps-fill{height:100%;border-radius:2px;background:var(--ok);transition:width .3s}
+#aports .ps-list{display:flex;flex-wrap:wrap;gap:.3rem .5rem;font-size:.78rem}
+#aports .ps-port{padding:.18rem .5rem;border-radius:5px;background:var(--tint);
+ font-family:var(--mono);color:var(--ok);font-weight:600}
+#aports .ps-none{font-size:.78rem;color:var(--mut)}
 </style>
 <div class=sh>
 <header><a class=brand href="/">
@@ -238,8 +247,10 @@ tbody tr.sel td{background:var(--tint)}
  <div class=who><b id=aname></b><span id=aaddr></span></div>
  <button type=button class=go id=atrust>Trust</button>
  <button type=button id=aforget>Forget</button>
+ <button type=button id=ascan>Scan ports</button>
  <button type=button id=aclose aria-label="Close">&#x2715;</button>
  <p id=amsg aria-live=polite></p>
+ <div id=aports hidden></div>
 </div>
 <div class=wrap id=wrap><table id=tbl><colgroup id=cg></colgroup>
 <thead><tr id=hrow></tr></thead><tbody id=rows></tbody></table></div>
@@ -392,13 +403,14 @@ var ALERT={router_changed:'The router\u2019s address answers from a different de
 // off the list, so it is flagged if it turns up again. Forget takes two taps.
 var sel=null,busy=false,armT=0;
 function pick(m){sel=sel==m?null:m;disarm();amsg.textContent='';amsg.className='';
- render();showact();if(sel)act.scrollIntoView({block:'nearest'})}
+ scanReset();render();showact();if(sel)act.scrollIntoView({block:'nearest'})}
 function cur(){for(var i=0;i<all.length;i++)if(all[i].mac==sel)return all[i];return null}
 function showact(){var x=sel&&cur();act.hidden=!x;if(!x)return;
  aname.textContent=x.hostname||(x.vendor?shortv(x.vendor)+' device'
   :x.randomised?'Device with a private address':'Unnamed device');
  aaddr.textContent=(x.ip?x.ip+' \u00b7 ':'')+x.mac;
  atrust.hidden=x.self||x.status!='unknown';aforget.hidden=x.self;
+ ascan.hidden=x.self||!x.ip;
  if(amsg.className!='err'&&amsg.className!='ok')amsg.textContent=x.self?'This is the monitor itself.'
   :x.status=='unknown'?'Not recognised. Trust it if it is yours: it stays known after restarts.'
   :x.status=='private'?'A private address, which is never flagged. Forget takes it off the list.'
@@ -421,6 +433,41 @@ aforget.onclick=function(){if(busy||!sel)return;
   armT=setTimeout(disarm,4000);return}
  disarm();post('/api/devices/forget',function(){sel=null;act.hidden=true})};
 aclose.onclick=function(){pick(sel)};
+// Port scanner: starts a TCP probe of the selected device's common ports.
+var scanIp=null,scanT=0;
+function scanReset(){clearInterval(scanT);scanT=0;scanIp=null;
+ aports.hidden=true;aports.innerHTML='';ascan.disabled=false;ascan.textContent='Scan ports'}
+function scanRender(d){
+ var pct=d.total>0?Math.round(d.probed/d.total*100):0;
+ var html='<div class=ps-bar><div class=ps-fill style="width:'+pct+'%"></div></div>';
+ if(d.state=='done'){
+  clearInterval(scanT);scanT=0;ascan.disabled=false;ascan.textContent='Scan ports';
+  if(d.open&&d.open.length){
+   html+='<div class=ps-list>';
+   for(var i=0;i<d.open.length;i++)
+    html+='<span class=ps-port>'+d.open[i].port+' <span style="font-family:inherit;font-weight:400;color:var(--mut)">'+d.open[i].name+'</span></span>';
+   html+='</div>'}
+  else html+='<p class=ps-none>No open ports found.</p>'}
+ else if(d.state=='scanning')
+  html+='<p class=ps-none>Scanning… '+d.probed+' / '+d.total+'</p>';
+ aports.innerHTML=html;aports.hidden=false}
+function scanPoll(){
+ if(!scanIp)return;
+ fetch('/api/portscan?ip='+encodeURIComponent(scanIp))
+ .then(function(r){return r.json()})
+ .then(function(d){if(d.state=='idle'&&scanIp){scanReset();return}scanRender(d)})
+ .catch(function(){});}
+ascan.onclick=function(){
+ if(!sel)return;var x=cur();if(!x||!x.ip)return;
+ scanReset();scanIp=x.ip;ascan.disabled=true;ascan.textContent='Scanning…';
+ aports.innerHTML='<div class=ps-bar><div class=ps-fill style="width:0%"></div></div><p class=ps-none>Starting…</p>';
+ aports.hidden=false;
+ fetch('/api/portscan',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({ip:x.ip})})
+ .then(function(r){return r.json()})
+ .then(function(d){if(d.status=='started'){scanT=setInterval(scanPoll,800)}
+  else{scanReset();amsg.textContent=d.error||'Scan failed.';amsg.className='err'}})
+ .catch(function(){scanReset();amsg.textContent='Could not reach the monitor.';amsg.className='err'})};
 rows.onclick=function(e){var t=e.target.closest&&e.target.closest('tr[data-m]');
  if(t)pick(t.getAttribute('data-m'))};
 rows.onkeydown=function(e){if(e.key!='Enter'&&e.key!=' ')return;

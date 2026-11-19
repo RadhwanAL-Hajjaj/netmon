@@ -5,6 +5,8 @@
 // The update password protects firmware updates: the Firmware update section
 // of the Settings page, POST /api/update (used by the Android app) and
 // ArduinoOTA. Anyone who knows it, on the same network as the board, can
-// install new firmware on it. At least 8 characters; the build refuses the
-// placeholder below.
+// install new firmware on it. From firmware 0.13 it also signs in to the
+// pages and the app: until you set a login password of your own on the
+// Settings page, and always after, as the way back in. At least 8 characters;
+// the build refuses the placeholder below.
 #define NETMON_UPDATE_PASSWORD "change-me"

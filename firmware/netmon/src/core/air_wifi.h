@@ -61,6 +61,33 @@ inline const char* air_auth_text(uint8_t auth) {
     }
 }
 
+// How much protection a network advertises, for noticing a downgrade: an
+// access point with your network's name offering less than it used to is how
+// an evil twin lures devices across. Higher is stronger. 255 for a mode number
+// this code does not know, so that nothing is concluded from it.
+inline uint8_t air_auth_rank(uint8_t auth) {
+    switch (auth) {
+        case 0:  return 0;      // Open
+        case 1:  return 1;      // WEP
+        case 9:  return 1;      // OWE: encrypted, but anybody may join
+        case 2:  return 2;      // WPA
+        case 16: return 2;      // WPA-Enterprise
+        case 4:  return 3;      // WPA/WPA2
+        case 3:  return 4;      // WPA2
+        case 5:  return 4;      // WPA2-Enterprise
+        case 8:  return 4;      // WAPI
+        case 7:  return 5;      // WPA2/WPA3
+        case 12: return 5;      // WPA3 extended key, transition mode
+        case 15: return 5;      // WPA2/WPA3-Enterprise
+        case 6:  return 6;      // WPA3
+        case 10: return 6;      // WPA3-Enterprise 192
+        case 11: return 6;      // WPA3 extended key
+        case 13: return 6;      // DPP
+        case 14: return 6;      // WPA3-Enterprise
+        default: return 255;
+    }
+}
+
 // Centre frequency of a 2.4 GHz channel in MHz, 0 for anything else. The
 // ESP32's radio has no 5 GHz band, so a channel outside 1 to 14 is not one
 // this board can have heard.

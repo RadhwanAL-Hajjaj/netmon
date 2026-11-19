@@ -3,6 +3,9 @@ picking from the list and from a table, readings arriving, the turn giving a
 direction, stopping, the tab and hash routing, and keyboard tab switching."""
 import asyncio, json, sys, re
 from playwright.async_api import async_playwright
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import signin
 BASE = "http://127.0.0.1:8765"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "shots"
 
@@ -10,7 +13,7 @@ async def main():
     res, errors = {}, []
     async with async_playwright() as p:
         b = await p.chromium.launch()
-        ctx = await b.new_context(viewport={"width": 1100, "height": 900})
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 900})
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror", str(e))))
         page.on("console", lambda m: m.type == "error" and errors.append(("console", m.text)))
@@ -121,7 +124,7 @@ async def main():
         await ctx.close()
 
         # Two pages finding different things: the first gives way, no tug of war.
-        ctx = await b.new_context(viewport={"width": 1100, "height": 900})
+        ctx = await signin.context(b, viewport={"width": 1100, "height": 900})
         p1 = await ctx.new_page()
         p2 = await ctx.new_page()
         for pg, tag in ((p1, "p1"), (p2, "p2")):
@@ -143,7 +146,7 @@ async def main():
         await ctx.close()
 
         # Phone: the finder fits, distance above the fold.
-        ctx = await b.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2,
+        ctx = await signin.context(b, viewport={"width": 390, "height": 844}, device_scale_factor=2,
                                   is_mobile=True, has_touch=True)
         page = await ctx.new_page()
         page.on("pageerror", lambda e: errors.append(("pageerror", "phone", str(e))))

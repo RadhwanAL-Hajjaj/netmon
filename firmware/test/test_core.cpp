@@ -584,33 +584,36 @@ static void test_sweep() {
 #include "../netmon/src/core/oui_table.h"
 
 static void test_oui_table_is_sorted() {
-    // oui_lookup binary-searches, so an out-of-order table fails silently
+    // oui_vendor binary-searches, so an out-of-order table fails silently
     // on some prefixes and works on others — the worst kind of bug.
-    CHECK(BUILTIN_OUI_COUNT > 20);
-    for (size_t i = 1; i < BUILTIN_OUI_COUNT; ++i) {
-        CHECK(BUILTIN_OUI[i - 1].prefix < BUILTIN_OUI[i].prefix);
+    const size_t names = sizeof(OUI_NAMES) / sizeof(OUI_NAMES[0]);
+    CHECK(OUI_PACKED_COUNT > 20);
+    CHECK(names <= 256);                          // index fits the low byte
+    for (size_t i = 1; i < OUI_PACKED_COUNT; ++i) {
+        CHECK((OUI_PACKED[i - 1] >> 8) < (OUI_PACKED[i] >> 8));
     }
-    for (size_t i = 0; i < BUILTIN_OUI_COUNT; ++i) {
-        CHECK(BUILTIN_OUI[i].vendor != nullptr);
-        CHECK(BUILTIN_OUI[i].vendor[0] != '\0');
-        CHECK(BUILTIN_OUI[i].prefix <= 0xFFFFFFu);   // three octets only
+    for (size_t i = 0; i < OUI_PACKED_COUNT; ++i) {
+        const size_t idx = OUI_PACKED[i] & 0xFFu;
+        CHECK(idx < names);
+        if (idx < names) {
+            CHECK(OUI_NAMES[idx] != nullptr);
+            CHECK(OUI_NAMES[idx][0] != '\0');
+        }
     }
 
     // Every entry must be findable through the real lookup path.
-    for (size_t i = 0; i < BUILTIN_OUI_COUNT; ++i) {
-        CHECK(oui_lookup(BUILTIN_OUI[i].prefix, BUILTIN_OUI, BUILTIN_OUI_COUNT) !=
-              nullptr);
+    for (size_t i = 0; i < OUI_PACKED_COUNT; ++i) {
+        CHECK(oui_vendor(OUI_PACKED[i] >> 8) != nullptr);
     }
 
     // Spot-checks against real hardware.
     Mac m{};
-    mac_parse("B8:27:EB:12:34:56", m);
-    CHECK_STR(oui_lookup(mac_oui(m), BUILTIN_OUI, BUILTIN_OUI_COUNT),
-              "Raspberry Pi Foundation");
-    mac_parse("D4:E9:F4:12:34:56", m);           // the monitor board itself
-    CHECK(oui_lookup(mac_oui(m), BUILTIN_OUI, BUILTIN_OUI_COUNT) != nullptr);
+    mac_parse("B8:27:EB:12:34:56", m);           // Raspberry Pi
+    CHECK(oui_vendor(mac_oui(m)) != nullptr);
+    mac_parse("D4:E9:F4:12:34:56", m);           // the old DevKit monitor board
+    CHECK(oui_vendor(mac_oui(m)) != nullptr);
     mac_parse("AA:AA:AA:00:00:01", m);
-    CHECK(oui_lookup(mac_oui(m), BUILTIN_OUI, BUILTIN_OUI_COUNT) == nullptr);
+    CHECK(oui_vendor(mac_oui(m)) == nullptr);
 }
 
 #include "../netmon/src/hw/config_store.h"
@@ -1873,6 +1876,1523 @@ static void test_air_table_get() {
     CHECK(w.get(test_mac_n(5))->last_seen_s == 115);
 }
 
+// --- The Bluetooth link ------------------------------------------------------
+
+#include "../netmon/src/core/ble_link.h"
+#include <string>
+#include <vector>
+
+static std::vector<uint8_t> test_hex(const char* hex) {
+    std::vector<uint8_t> out;
+    int hi = -1;
+    for (const char* p = hex; *p; ++p) {
+        const int v = link_hex(*p);
+        if (v < 0) continue;
+        if (hi < 0) {
+            hi = v;
+        } else {
+            out.push_back(static_cast<uint8_t>(hi * 16 + v));
+            hi = -1;
+        }
+    }
+    return out;
+}
+
+static std::string test_hex_of(const uint8_t* b, size_t n) {
+    static const char* d = "0123456789abcdef";
+    std::string s;
+    for (size_t i = 0; i < n; ++i) {
+        if (i) s += ' ';
+        s += d[b[i] >> 4];
+        s += d[b[i] & 15];
+    }
+    return s;
+}
+
+// Frames split from a request the way the app splits them (LinkCodec.kt):
+// as much as fits in each, first and last flags.
+static std::vector<std::vector<uint8_t>> test_request_frames(const std::string& text, uint8_t id, size_t cap) {
+    std::vector<std::vector<uint8_t>> frames;
+    const size_t room = cap - kLinkHeader;
+    size_t off = 0;
+    do {
+        const size_t n = std::min(room, text.size() - off);
+        std::vector<uint8_t> f;
+        uint8_t flags = 0;
+        if (off == 0) flags |= kLinkFirst;
+        if (off + n == text.size()) flags |= kLinkLast;
+        f.push_back(flags);
+        f.push_back(id);
+        f.insert(f.end(), text.begin() + static_cast<long>(off), text.begin() + static_cast<long>(off + n));
+        frames.push_back(f);
+        off += n;
+    } while (off < text.size());
+    return frames;
+}
+
+struct TestChunks {
+    std::vector<std::string> parts;
+    size_t count() const { return parts.size(); }
+    const uint8_t* data(size_t i) const { return reinterpret_cast<const uint8_t*>(parts[i].data()); }
+    size_t size(size_t i) const { return parts[i].size(); }
+};
+
+// Every frame of an answer, cut the way the board's pump cuts them.
+static std::vector<std::vector<uint8_t>> test_answer_frames(const TestChunks& c, uint8_t id, uint16_t status,
+                                                            size_t cap) {
+    std::vector<std::vector<uint8_t>> frames;
+    size_t chunk = 0, offset = 0;
+    bool first = true;
+    for (int guard = 0; guard < 100000; ++guard) {
+        std::vector<uint8_t> buf(cap);
+        const LinkCut cut = link_cut(c, chunk, offset, first, true, id, status, buf.data(), cap);
+        if (cut.len == 0) break;
+        buf.resize(cut.len);
+        frames.push_back(buf);
+        chunk = cut.chunk;
+        offset = cut.offset;
+        first = false;
+        if (cut.last) break;
+    }
+    return frames;
+}
+
+// The vectors below are repeated, byte for byte, in the app's own tests
+// (android/tools/test/CoreTest.kt, linkTests), so the two ends agree on the
+// format and not merely each with itself.
+static void test_link_vectors() {
+    // A request that fits one 20-byte frame (an ATT MTU of 23, the smallest).
+    {
+        const auto f = test_request_frames("GET /api/health\n\n", 7, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) ==
+              "03 07 47 45 54 20 2f 61 70 69 2f 68 65 61 6c 74 68 0a 0a");
+    }
+    // One that takes two.
+    {
+        const auto f = test_request_frames("POST /api/nearby/find\n\n{\"stop\":true}", 0x2a, 20);
+        CHECK(f.size() == 2);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) ==
+              "01 2a 50 4f 53 54 20 2f 61 70 69 2f 6e 65 61 72 62 79 2f 66");
+        CHECK(test_hex_of(f[1].data(), f[1].size()) ==
+              "02 2a 69 6e 64 0a 0a 7b 22 73 74 6f 70 22 3a 74 72 75 65 7d");
+    }
+    // An answer in one frame: status 200, least significant byte first.
+    {
+        TestChunks c{{"{\"ok\":true}"}};
+        const auto f = test_answer_frames(c, 7, 200, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "03 07 c8 00 7b 22 6f 6b 22 3a 74 72 75 65 7d");
+    }
+    // An answer in two, with a frame of 8 bytes.
+    {
+        TestChunks c{{"not found"}};
+        const auto f = test_answer_frames(c, 9, 404, 8);
+        CHECK(f.size() == 2);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "01 09 94 01 6e 6f 74 20");
+        CHECK(test_hex_of(f[1].data(), f[1].size()) == "02 09 66 6f 75 6e 64");
+    }
+    // An empty answer is one frame: both flags, the status, nothing else.
+    {
+        TestChunks c;
+        const auto f = test_answer_frames(c, 1, 204, 20);
+        CHECK(f.size() == 1);
+        CHECK(test_hex_of(f[0].data(), f[0].size()) == "03 01 cc 00");
+    }
+    // And the hex helper reads what it writes.
+    const auto back = test_hex("03 07 c8 00");
+    CHECK(back.size() == 4 && back[2] == 0xc8);
+}
+
+static void test_link_assembler() {
+    LinkAssembler<64> a;
+    // Too short to be a frame, or with a bit nobody defined.
+    const uint8_t tiny[1] = {0x03};
+    CHECK(a.feed(tiny, 1) == LinkAssembler<64>::Step::Ignored);
+    const uint8_t odd[4] = {0x07, 1, 'x', 'y'};
+    CHECK(a.feed(odd, 4) == LinkAssembler<64>::Step::Ignored);
+    CHECK(a.feed(nullptr, 9) == LinkAssembler<64>::Step::Ignored);
+
+    // One frame, both flags.
+    for (const auto& f : test_request_frames("GET /api/map\n\n", 5, 20)) {
+        CHECK(a.feed(f.data(), f.size()) == LinkAssembler<64>::Step::Done);
+    }
+    CHECK(a.id() == 5);
+    CHECK(a.size() == 14);
+    CHECK_STR(a.data(), "GET /api/map\n\n");
+    CHECK(!a.busy());
+
+    // Several frames.
+    const std::string text = "POST /api/config\n\n{\"ssid\":\"Home\",\"pass\":\"\"}";
+    const auto frames = test_request_frames(text, 200, 9);
+    CHECK(frames.size() > 3);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto step = a.feed(frames[i].data(), frames[i].size());
+        CHECK(step == (i + 1 < frames.size() ? LinkAssembler<64>::Step::More : LinkAssembler<64>::Step::Done));
+        if (i + 1 < frames.size()) CHECK(a.busy());
+    }
+    CHECK(a.id() == 200);
+    CHECK(std::string(a.data(), a.size()) == text);
+
+    // A continuation with no message open, or with another number, is dropped.
+    const uint8_t stray[4] = {kLinkLast, 200, 'z', 'z'};
+    CHECK(a.feed(stray, 4) == LinkAssembler<64>::Step::Ignored);
+    const auto f1 = test_request_frames(text, 1, 9);
+    CHECK(a.feed(f1[0].data(), f1[0].size()) == LinkAssembler<64>::Step::More);
+    const uint8_t other[4] = {kLinkLast, 2, 'z', 'z'};
+    CHECK(a.feed(other, 4) == LinkAssembler<64>::Step::Ignored);
+    CHECK(a.busy());
+
+    // A new first frame drops the half-received request and starts over.
+    for (const auto& f : test_request_frames("GET /api/ble\n\n", 3, 20)) a.feed(f.data(), f.size());
+    CHECK(a.id() == 3);
+    CHECK_STR(a.data(), "GET /api/ble\n\n");
+
+    // Longer than the buffer: swallowed to the end, then reported once, with
+    // its number, for a 413.
+    const std::string big(100, 'a');
+    const auto bf = test_request_frames("POST /api/config\n\n" + big, 77, 20);
+    LinkAssembler<64>::Step last = LinkAssembler<64>::Step::Ignored;
+    int too = 0;
+    for (const auto& f : bf) {
+        last = a.feed(f.data(), f.size());
+        if (last == LinkAssembler<64>::Step::TooLarge) ++too;
+    }
+    CHECK(last == LinkAssembler<64>::Step::TooLarge);
+    CHECK(too == 1);
+    CHECK(a.id() == 77);
+    CHECK(a.size() == 0);
+    // And the next request is fine.
+    for (const auto& f : test_request_frames("GET /api/health\n\n", 78, 20)) {
+        CHECK(a.feed(f.data(), f.size()) == LinkAssembler<64>::Step::Done);
+    }
+    CHECK_STR(a.data(), "GET /api/health\n\n");
+
+    // Exactly the buffer's size fits; the NUL is extra.
+    LinkAssembler<16> small;
+    const std::string exact = "GET /api/x?a=1\n\n";
+    CHECK(exact.size() == 16);
+    for (const auto& f : test_request_frames(exact, 1, 6)) small.feed(f.data(), f.size());
+    CHECK(std::string(small.data(), small.size()) == exact);
+    const std::string over = "GET /api/x?ab=1\n\n";
+    LinkAssembler<16>::Step st = LinkAssembler<16>::Step::Ignored;
+    for (const auto& f : test_request_frames(over, 2, 6)) st = small.feed(f.data(), f.size());
+    CHECK(st == LinkAssembler<16>::Step::TooLarge);
+}
+
+static void test_link_parse() {
+    LinkRequest r{};
+    const char* g = "GET /api/nearby/find?after=12\n\n";
+    CHECK(link_parse(g, std::strlen(g), r) == LinkParse::Ok);
+    CHECK(!r.post);
+    CHECK_STR(r.path, "/api/nearby/find");
+    CHECK_STR(r.query, "after=12");
+    CHECK(r.body_len == 0);
+    CHECK_STR(r.key, "");
+
+    const char* p = "POST /api/config\r\nContent-Type: application/json\r\n\r\n{\"ssid\":\"a b\"}";
+    CHECK(link_parse(p, std::strlen(p), r) == LinkParse::Ok);
+    CHECK(r.post);
+    CHECK_STR(r.path, "/api/config");
+    CHECK_STR(r.query, "");
+    CHECK(r.body_len == 14);
+    CHECK(std::string(r.body, r.body_len) == "{\"ssid\":\"a b\"}");
+
+    // The update password, whatever the case of its name.
+    const char* k = "POST /api/update/check\nx-netmon-key:   s3cret pass\nOther: 1\n\n";
+    CHECK(link_parse(k, std::strlen(k), r) == LinkParse::Ok);
+    CHECK_STR(r.key, "s3cret pass");
+    CHECK(r.body_len == 0);
+
+    // " HTTP/1.1" after the target is allowed and ignored; so is a missing
+    // blank line.
+    const char* h = "GET /api/isp?force HTTP/1.1";
+    CHECK(link_parse(h, std::strlen(h), r) == LinkParse::Ok);
+    CHECK_STR(r.path, "/api/isp");
+    CHECK_STR(r.query, "force");
+    CHECK(r.body_len == 0);
+
+    // A body may carry blank lines of its own.
+    const char* b = "POST /api/x\n\nline1\n\nline3";
+    CHECK(link_parse(b, std::strlen(b), r) == LinkParse::Ok);
+    CHECK(std::string(r.body, r.body_len) == "line1\n\nline3");
+
+    const char* bad[] = {"", "GET", "PUT /api/x\n\n", "get /api/x\n\n", "GET api/x\n\n", "GET \n\n",
+                         "GET /api/\x01x\n\n"};
+    CHECK(link_parse(bad[0], 0, r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[1], 3, r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[2], std::strlen(bad[2]), r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[3], std::strlen(bad[3]), r) == LinkParse::BadMethod);
+    CHECK(link_parse(bad[4], std::strlen(bad[4]), r) == LinkParse::BadTarget);
+    CHECK(link_parse(bad[5], std::strlen(bad[5]), r) == LinkParse::BadTarget);
+    CHECK(link_parse(bad[6], std::strlen(bad[6]), r) == LinkParse::BadTarget);
+
+    std::string longpath = "GET /api/" + std::string(60, 'a') + "\n\n";
+    CHECK(link_parse(longpath.c_str(), longpath.size(), r) == LinkParse::TooLong);
+    std::string longq = "GET /api/x?" + std::string(200, 'q') + "\n\n";
+    CHECK(link_parse(longq.c_str(), longq.size(), r) == LinkParse::TooLong);
+    std::string longkey = "POST /api/x\nX-Netmon-Key: " + std::string(100, 'k') + "\n\n";
+    CHECK(link_parse(longkey.c_str(), longkey.size(), r) == LinkParse::TooLong);
+}
+
+static void test_link_arg() {
+    char v[16];
+    CHECK(link_arg("after=12", "after", v, sizeof(v)));
+    CHECK_STR(v, "12");
+    CHECK(link_arg("force", "force", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(link_arg("a=1&b=2&c", "b", v, sizeof(v)));
+    CHECK_STR(v, "2");
+    CHECK(link_arg("a=1&b=2&c", "c", v, sizeof(v)));
+    CHECK(!link_arg("a=1&b=2&c", "d", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(!link_arg("ab=1", "a", v, sizeof(v)));
+    CHECK(!link_arg("", "a", v, sizeof(v)));
+    CHECK(!link_arg(nullptr, "a", v, sizeof(v)));
+    CHECK(link_arg("n=a%20b+c%2Fd", "n", v, sizeof(v)));
+    CHECK_STR(v, "a b c/d");
+    // A broken escape is kept as it came.
+    CHECK(link_arg("n=50%", "n", v, sizeof(v)));
+    CHECK_STR(v, "50%");
+    CHECK(link_arg("n=%zz", "n", v, sizeof(v)));
+    CHECK_STR(v, "%zz");
+    // Cut short, never overrun.
+    char s[4];
+    CHECK(link_arg("n=abcdefg", "n", s, sizeof(s)));
+    CHECK_STR(s, "abc");
+    // The first of a repeated name wins.
+    CHECK(link_arg("x=1&x=2", "x", v, sizeof(v)));
+    CHECK_STR(v, "1");
+}
+
+static uint32_t g_link_rng = 12345;
+static uint32_t test_link_rand() {
+    g_link_rng = g_link_rng * 1103515245u + 12345u;
+    return g_link_rng >> 8;
+}
+
+// Answers cut from bodies split every which way come back whole, whatever the
+// frame size, with the flags in the right places and no empty frame in the
+// middle.
+static void test_link_cut() {
+    bool all_ok = true;
+    for (int round = 0; round < 400; ++round) {
+        const size_t len = test_link_rand() % 3000;
+        std::string body;
+        for (size_t i = 0; i < len; ++i) body += static_cast<char>('a' + test_link_rand() % 26);
+        TestChunks c;
+        size_t at = 0;
+        while (at < len) {
+            size_t n = test_link_rand() % 600;
+            if (n > len - at) n = len - at;
+            c.parts.push_back(body.substr(at, n));     // empty pieces too
+            at += n;
+        }
+        if (test_link_rand() % 4 == 0) c.parts.push_back("");
+        const size_t cap = 5 + test_link_rand() % 250;
+        const uint16_t status = static_cast<uint16_t>(100 + test_link_rand() % 500);
+        const uint8_t id = static_cast<uint8_t>(test_link_rand());
+        const auto frames = test_answer_frames(c, id, status, cap);
+        bool ok = !frames.empty();
+        std::string got;
+        uint16_t st = 0;
+        for (size_t i = 0; ok && i < frames.size(); ++i) {
+            const auto& f = frames[i];
+            const bool first = i == 0, last = i + 1 == frames.size();
+            ok = f.size() <= cap && f[1] == id &&
+                 f[0] == ((first ? kLinkFirst : 0) | (last ? kLinkLast : 0));
+            size_t from = kLinkHeader;
+            if (first) {
+                st = static_cast<uint16_t>(f[2] | (f[3] << 8));
+                from += kLinkStatus;
+            }
+            // Only the last frame may be short of data; none but it empty.
+            if (!last) ok = ok && f.size() == cap;
+            got.append(reinterpret_cast<const char*>(f.data() + from), f.size() - from);
+        }
+        all_ok = all_ok && ok && st == status && got == body;
+    }
+    CHECK(all_ok);
+
+    // While the handler is still producing, a used-up body means wait, not
+    // an empty frame; and nothing is marked last.
+    TestChunks c{{"abc"}};
+    uint8_t buf[32];
+    LinkCut cut = link_cut(c, 0, 0, true, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 7);
+    CHECK(buf[0] == kLinkFirst);
+    CHECK(!cut.last);
+    cut = link_cut(c, cut.chunk, cut.offset, false, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 0);
+    // More arrives, then the handler finishes.
+    c.parts.push_back("de");
+    cut = link_cut(c, 1, 0, false, false, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 4);
+    CHECK(buf[0] == 0);
+    cut = link_cut(c, cut.chunk, cut.offset, false, true, 4, 200, buf, sizeof(buf));
+    CHECK(cut.len == 2);
+    CHECK(buf[0] == kLinkLast);
+    CHECK(cut.last);
+    // A frame too small to carry anything is never cut.
+    cut = link_cut(c, 0, 0, true, true, 4, 200, buf, 4);
+    CHECK(cut.len == 0);
+}
+
+static void test_link_pairing() {
+    PairWindow w{};
+    CHECK(!pair_live(w, 0));
+    CHECK(pair_left_ms(w, 0) == 0);
+    pair_open(w, 1000, 4123456);
+    CHECK(pair_live(w, 1000));
+    CHECK(w.code == 123456);
+    CHECK(pair_left_ms(w, 1000) == kPairWindowMs);
+    CHECK(pair_passkey(w, 5000, 999) == 123456);
+    // Asking again while open keeps the code and restarts the two minutes.
+    pair_open(w, 61000, 777777);
+    CHECK(w.code == 123456);
+    CHECK(pair_left_ms(w, 61000) == kPairWindowMs);
+    CHECK(pair_live(w, 61000 + kPairWindowMs - 1));
+    CHECK(!pair_live(w, 61000 + kPairWindowMs));
+    // Closed: any other attempt gets a code nobody was shown.
+    CHECK(pair_passkey(w, 61000 + kPairWindowMs, 2000042) == 42);
+    // Reopened later: a fresh code.
+    pair_open(w, 400000, 31);
+    CHECK(w.code == 31);
+    char t[7];
+    pair_code_text(w.code, t);
+    CHECK_STR(t, "000031");
+    pair_code_text(999999, t);
+    CHECK_STR(t, "999999");
+    pair_code_text(1000001, t);
+    CHECK_STR(t, "000001");
+    // A failure that says something about the code costs one of three tries;
+    // the window stays open, with the same code, until the third.
+    CHECK(pair_tries_left(w) == kPairTries);
+    pair_done(w, 410000, false, PairWhy::WrongCode);
+    CHECK(pair_live(w, 410000));
+    CHECK(w.code == 31);
+    CHECK(pair_tries_left(w) == kPairTries - 1);
+    CHECK_STR(pair_result_text(w.result), "failed");
+    CHECK_STR(pair_why_key(w.why), "wrong_code");
+    // A dropped connection or a timeout never got to the code: free.
+    pair_done(w, 411000, false, PairWhy::Dropped);
+    pair_done(w, 412000, false, PairWhy::TimedOut);
+    CHECK(pair_live(w, 412000));
+    CHECK(pair_tries_left(w) == kPairTries - 1);
+    CHECK_STR(pair_why_key(w.why), "timed_out");
+    pair_done(w, 413000, false, PairWhy::Cancelled);
+    CHECK(pair_live(w, 413000));
+    pair_done(w, 414000, false, PairWhy::WrongCode);
+    CHECK(!pair_live(w, 414000));
+    CHECK(pair_tries_left(w) == 0);
+    CHECK(pair_passkey(w, 414001, 1000007) == 7);
+    // A fresh window starts the count again.
+    pair_open(w, 420000, 5);
+    CHECK_STR(pair_result_text(w.result), "");
+    CHECK_STR(pair_why_key(w.why), "");
+    CHECK(pair_tries_left(w) == kPairTries);
+    pair_done(w, 421000, true);
+    CHECK_STR(pair_result_text(w.result), "paired");
+    CHECK_STR(pair_why_key(w.why), "paired");
+    CHECK(!pair_live(w, 421000));      // a phone that pairs closes it
+    pair_open(w, 430000, 6);
+    pair_close(w);
+    CHECK(!pair_live(w, 430001));
+
+    // The owner's own code: every window, never a random one.
+    PairWindow f{};
+    pair_open(f, 1000, 123, 4242);
+    CHECK(f.code == 4242);
+    CHECK(pair_passkey(f, 2000, 77) == 4242);
+    pair_code_text(f.code, t);
+    CHECK_STR(t, "004242");
+    pair_done(f, 3000, false, PairWhy::WrongCode);
+    pair_done(f, 3001, false, PairWhy::WrongCode);
+    pair_done(f, 3002, false, PairWhy::WrongCode);
+    CHECK(!pair_live(f, 3003));
+    CHECK(pair_passkey(f, 3003, 1000077) == 77);     // closed: not the owner's code
+    pair_open(f, 5000, 999, 4242);
+    CHECK(f.code == 4242);
+    CHECK(pair_tries_left(f) == kPairTries);
+    // Changed while open: the new code from then on.
+    pair_open(f, 6000, 1, 7);
+    CHECK(f.code == 7);
+    // Back to random codes: the open window keeps the one it has.
+    pair_open(f, 7000, 555555);
+    CHECK(f.code == 7);
+    pair_close(f);
+    pair_open(f, 8000, 555555);
+    CHECK(f.code == 555555);
+    // The clock wrapping is no different from any other two minutes.
+    PairWindow z{};
+    pair_open(z, 0xFFFFFF00u, 9);
+    CHECK(pair_live(z, 0x00000100u));
+    CHECK(pair_left_ms(z, 0x00000100u) == kPairWindowMs - 0x200);
+
+    // Unpaired connections are let go; paired ones never.
+    CHECK(!link_drop_unpaired(false, 0, kLinkUnpairedMs, false));
+    CHECK(link_drop_unpaired(false, 0, kLinkUnpairedMs + 1, false));
+    CHECK(!link_drop_unpaired(false, 0, kLinkUnpairedMs + 1, true));
+    CHECK(link_drop_unpaired(false, 0, kLinkPairingMs + 1, true));
+    CHECK(!link_drop_unpaired(true, 0, 10 * kLinkPairingMs, false));
+}
+
+// How the end of an attempt reads, from the statuses NimBLE reports.
+static void test_link_pair_why() {
+    CHECK(pair_why_of(0, true, true) == PairWhy::Paired);
+    CHECK(pair_why_of(0, true, false) == PairWhy::NoCode);
+    CHECK(pair_why_of(0, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(kNimTimeout, false, false) == PairWhy::TimedOut);
+    CHECK(pair_why_of(kNimNotConn, false, false) == PairWhy::Dropped);
+    // Confirm value failed, found by the board or by the phone; DHKey check.
+    CHECK(pair_why_of(0x404, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x504, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x50b, false, false) == PairWhy::WrongCode);
+    CHECK(pair_why_of(0x501, false, false) == PairWhy::Cancelled);
+    CHECK(pair_why_of(0x509, false, false) == PairWhy::TooMany);
+    CHECK(pair_why_of(0x503, false, false) == PairWhy::Refused);
+    CHECK(pair_why_of(0x405, false, false) == PairWhy::Refused);
+    CHECK(pair_why_of(0x508, false, false) == PairWhy::Other);
+    // The controller's own reasons for a connection going.
+    CHECK(pair_why_of(0x208, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x213, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x23e, false, false) == PairWhy::Dropped);
+    CHECK(pair_why_of(0x206, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(0x400, false, false) == PairWhy::Other);
+    CHECK(pair_why_of(12345, false, false) == PairWhy::Other);
+    // Every reason has a key and words; none has neither.
+    for (uint8_t w = 1; w <= static_cast<uint8_t>(PairWhy::Other); ++w) {
+        CHECK(pair_why_key(w)[0] != '\0');
+        CHECK(pair_why_text(w)[0] != '\0');
+    }
+    CHECK_STR(pair_why_key(0), "");
+    CHECK_STR(pair_why_text(0), "");
+    CHECK(!pair_counts(PairWhy::Dropped));
+    CHECK(!pair_counts(PairWhy::TimedOut));
+    CHECK(pair_counts(PairWhy::WrongCode));
+    CHECK(pair_counts(PairWhy::Other));
+}
+
+// The session travels with every request over the link, as it does over Wi-Fi.
+static void test_link_parse_auth() {
+    LinkRequest r;
+    const char* a =
+        "GET /api/devices\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\nX-Netmon-Key: k1\n\n";
+    CHECK(link_parse(a, std::strlen(a), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "Bearer 0123456789abcdef0123456789abcdef");
+    CHECK_STR(r.key, "k1");
+    const char* b = "GET /api/devices\r\nauthorization:   Bearer x\r\n\r\n";
+    CHECK(link_parse(b, std::strlen(b), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "Bearer x");
+    CHECK_STR(r.key, "");
+    const char* c = "GET /api/devices\n\n";
+    CHECK(link_parse(c, std::strlen(c), r) == LinkParse::Ok);
+    CHECK_STR(r.auth, "");
+    std::string longer = "GET /api/devices\nAuthorization: Bearer " + std::string(kLinkAuthMax, 'a') + "\n\n";
+    CHECK(link_parse(longer.c_str(), longer.size(), r) == LinkParse::TooLong);
+}
+
+// --- Saved reports -------------------------------------------------------------
+
+#include "../netmon/src/core/report.h"
+
+static void test_clock() {
+    Clock c{};
+    CHECK(!clock_known(c));
+    CHECK(clock_now(c, 100) == 0);
+    // Too early, too late, before the board even started, or no source.
+    CHECK(!clock_set(c, 1600000000u, 10, ClockSource::Client));
+    CHECK(!clock_set(c, 4200000000u, 10, ClockSource::Client));
+    CHECK(!clock_set(c, 1791136862u, 10, ClockSource::None));
+    CHECK(!clock_known(c));
+    // A phone's clock, read at uptime 100.
+    CHECK(clock_set(c, 1791136862u, 100, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136762u);
+    CHECK(clock_now(c, 160) == 1791136922u);
+    // Another client may correct it; then the internet's word outranks them.
+    CHECK(clock_set(c, 1791136900u, 100, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136800u);
+    CHECK(clock_set(c, 1791136950u, 200, ClockSource::Internet));
+    CHECK(c.boot_unix == 1791136750u);
+    CHECK(!clock_set(c, 1791139999u, 200, ClockSource::Client));
+    CHECK(c.boot_unix == 1791136750u);
+    CHECK(clock_set(c, 1791136960u, 205, ClockSource::Internet));
+    CHECK_STR(clock_source_text(c.source), "internet");
+    CHECK_STR(clock_source_text(ClockSource::Client), "client");
+    CHECK_STR(clock_source_text(ClockSource::None), "none");
+}
+
+static void test_http_date() {
+    uint32_t t = 0;
+    CHECK(http_date_parse("Sun, 04 Oct 2026 18:01:02 GMT", t));
+    CHECK(t == 1791136862u);
+    CHECK(http_date_parse("Thu, 29 Feb 2024 12:00:00 GMT", t));
+    CHECK(t == 1709208000u);
+    CHECK(http_date_parse("Thu, 01 Jan 1970 00:00:00 GMT", t));
+    CHECK(t == 0);
+    CHECK(http_date_parse("Fri, 31 Dec 2099 23:59:59 GMT", t));
+    CHECK(t == 4102444799u);
+    // The obsolete forms, and broken ones, are refused.
+    CHECK(!http_date_parse("Sunday, 04-Oct-26 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun Oct  4 18:01:02 2026", t));
+    CHECK(!http_date_parse("Sun, 04 Okt 2026 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 04 Oct 2026 24:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 4 Oct 2026 18:01:02 GMT", t));
+    CHECK(!http_date_parse("Sun, 04 Oct 2026 18:01:02 UTC", t));
+    CHECK(!http_date_parse("", t));
+    CHECK(!http_date_parse(nullptr, t));
+
+    const char* h = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nX-Date: nope\r\n"
+                    "date:  Sun, 04 Oct 2026 18:01:02 GMT\r\nContent-Length: 12\r\n";
+    CHECK(http_date_header(h, std::strlen(h), t));
+    CHECK(t == 1791136862u);
+    const char* none = "HTTP/1.0 200 OK\r\nUpdated: Sun, 04 Oct 2026 18:01:02 GMT\r\n";
+    CHECK(!http_date_header(none, std::strlen(none), t));
+    // Only within the length given.
+    CHECK(!http_date_header(h, 40, t));
+    CHECK(!http_date_header(nullptr, 10, t));
+}
+
+static ReportSlot test_slot(const char* ssid, const char* subnet, uint32_t seq) {
+    ReportSlot s{};
+    s.used = true;
+    std::strncpy(s.ssid, ssid, sizeof(s.ssid) - 1);
+    std::strncpy(s.subnet, subnet, sizeof(s.subnet) - 1);
+    s.seq = seq;
+    return s;
+}
+
+static void test_report_slots() {
+    ReportSlot s[4]{};
+    CHECK(report_slot_for(s, 4, "Home", "192.168.2.0/24") == 0);
+    CHECK(report_next_seq(s, 4) == 1);
+    s[0] = test_slot("Home", "192.168.2.0/24", 5);
+    s[2] = test_slot("Office", "10.0.0.0/16", 9);
+    // Its own slot, else the first empty one.
+    CHECK(report_slot_for(s, 4, "Home", "192.168.2.0/24") == 0);
+    CHECK(report_slot_for(s, 4, "Office", "10.0.0.0/16") == 2);
+    CHECK(report_slot_for(s, 4, "Home", "192.168.3.0/24") == 1);   // same name, another subnet
+    CHECK(report_slot_for(s, 4, "home", "192.168.2.0/24") == 1);   // names are case sensitive
+    CHECK(report_next_seq(s, 4) == 10);
+    // All four used: the one saved longest ago gives way.
+    s[1] = test_slot("Cafe", "192.168.1.0/24", 7);
+    s[3] = test_slot("Lab", "172.16.0.0/24", 3);
+    CHECK(report_slot_for(s, 4, "Friend", "192.168.0.0/24") == 3);
+    s[3].seq = 11;
+    CHECK(report_slot_for(s, 4, "Friend", "192.168.0.0/24") == 0);
+    CHECK(report_slot_for(s, 4, "Lab", "172.16.0.0/24") == 3);
+    CHECK(!report_same(s[0], nullptr, "x"));
+
+    // Ages and gaps: from the uptime this boot, else from the clock.
+    ReportSlot r = test_slot("Home", "192.168.2.0/24", 1);
+    r.this_boot = true;
+    r.saved_up_s = 1000;
+    CHECK(report_age_s(r, 1600, 0) == 600);
+    uint32_t gap = 0;
+    CHECK(report_gap_s(r, 1600, 0, gap) && gap == 600);
+    r.this_boot = false;
+    r.saved_unix = 1791130000u;
+    CHECK(report_age_s(r, 50, 0) == -1);
+    CHECK(!report_gap_s(r, 50, 0, gap));
+    CHECK(report_age_s(r, 50, 1791136862u) == 6862);
+    CHECK(report_gap_s(r, 50, 1791136862u, gap) && gap == 6862);
+    r.saved_unix = 0;
+    CHECK(report_age_s(r, 50, 1791136862u) == -1);
+    CHECK(!report_gap_s(r, 50, 1791136862u, gap));
+    ReportSlot empty{};
+    CHECK(report_age_s(empty, 50, 1791136862u) == -1);
+}
+
+static ReportRow test_row(uint8_t n, uint32_t ago, uint32_t seen_unix, const char* name = "") {
+    ReportRow r{};
+    r.mac = test_mac_n(n);
+    r.ip = 0xC0A80200u + n;
+    r.status = Status::Known;
+    r.online = true;
+    r.up_s = 50;
+    r.ago_s = ago;
+    r.seen_unix = seen_unix;
+    std::strncpy(r.hostname, name, sizeof(r.hostname) - 1);
+    return r;
+}
+
+static void test_report_rows() {
+    // A device from the board's table, saved at uptime 1000 with the clock
+    // known: dated, and aged from the uptime.
+    Device d{};
+    d.mac = test_mac_n(4);
+    d.ip = 0xC0A8022Du;
+    d.first_seen = 100;
+    d.online_since = 400;
+    d.last_seen = 990;
+    d.status = Status::Private;
+    d.online = true;
+    std::strncpy(d.hostname, "Pixel-7", sizeof(d.hostname) - 1);
+    Clock clk{};
+    clock_set(clk, 1791136862u, 1000, ClockSource::Client);
+    ReportRow r{};
+    report_row_from(d, 1000, clk, false, r);
+    CHECK(r.ago_s == 10);
+    CHECK(r.up_s == 600);
+    CHECK(r.seen_unix == 1791136852u);
+    CHECK(r.first_unix == 1791135962u);
+    CHECK(!r.carried);
+    CHECK_STR(r.hostname, "Pixel-7");
+    // Without a clock: ages only. Offline: no uptime.
+    d.online = false;
+    report_row_from(d, 1000, Clock{}, true, r);
+    CHECK(r.seen_unix == 0 && r.first_unix == 0);
+    CHECK(r.up_s == 0);
+    CHECK(r.self);
+
+    // Merging: this boot's rows 1 and 2; the last report had 2, 3, 4 and 5.
+    ReportRow rows[8]{};
+    rows[0] = test_row(1, 5, 0, "desk");
+    rows[1] = test_row(2, 0, 0, "");
+    rows[2] = test_row(2, 30, 1791130000u, "nas");      // the same device: its name fills the gap
+    rows[2].first_unix = 1700000000u;
+    rows[3] = test_row(3, 900, 1791129000u, "tv");
+    rows[4] = test_row(4, 60, 1791129900u, "phone");
+    rows[5] = test_row(5, 200, 0, "");
+    rows[5].self = true;
+    size_t n = report_merge(rows, 2, 4, true, 600, 8);
+    CHECK(n == 5);
+    CHECK(mac_equal(rows[0].mac, test_mac_n(1)) && !rows[0].carried);
+    CHECK(mac_equal(rows[1].mac, test_mac_n(2)) && !rows[1].carried);
+    CHECK_STR(rows[1].hostname, "nas");
+    CHECK(rows[1].first_unix == 1700000000u);
+    CHECK(rows[1].ago_s == 0);                       // this boot's sighting stands
+    // Carried over, most recently seen first, aged by the gap, offline.
+    CHECK(mac_equal(rows[2].mac, test_mac_n(4)) && rows[2].carried && rows[2].ago_s == 660);
+    CHECK(mac_equal(rows[3].mac, test_mac_n(5)) && rows[3].ago_s == 800 && !rows[3].self);
+    CHECK(mac_equal(rows[4].mac, test_mac_n(3)) && rows[4].ago_s == 1500);
+    CHECK(!rows[2].online && rows[2].up_s == 0);
+    CHECK(rows[2].seen_unix == 1791129900u);         // a date stays as it was
+
+    // A gap that cannot be told leaves the ages as they were; a cap drops the
+    // oldest; a device twice in the old report is kept once.
+    ReportRow r2[6]{};
+    r2[0] = test_row(1, 0, 0);
+    r2[1] = test_row(7, 100, 0);
+    r2[2] = test_row(8, 50, 0);
+    r2[3] = test_row(7, 100, 0);
+    r2[4] = test_row(9, 400, 0);
+    n = report_merge(r2, 1, 4, false, 0, 3);
+    CHECK(n == 3);
+    CHECK(mac_equal(r2[1].mac, test_mac_n(8)) && r2[1].ago_s == 50);
+    CHECK(mac_equal(r2[2].mac, test_mac_n(7)) && r2[2].ago_s == 100);
+    // Ages never wrap.
+    ReportRow r3[2]{};
+    r3[0] = test_row(1, 0xFFFFFF00u, 0);
+    n = report_merge(r3, 0, 1, true, 0x1000, 2);
+    CHECK(n == 1 && r3[0].ago_s == 0xFFFFFFFFu);
+    // Nothing from before: this boot's rows as they are.
+    ReportRow r4[2]{};
+    r4[0] = test_row(1, 3, 0);
+    CHECK(report_merge(r4, 1, 0, true, 10, 2) == 1);
+}
+
+static void test_report_lines() {
+    ReportMeta m{};
+    std::strcpy(m.ssid, "Home \"5\"");
+    std::strcpy(m.subnet, "192.168.2.0/24");
+    std::strcpy(m.gateway, "192.168.2.1");
+    std::strcpy(m.gateway_mac, "50:91:E3:12:34:56");
+    std::strcpy(m.board_ip, "192.168.2.27");
+    std::strcpy(m.board_mac, "D4:E9:F4:12:34:56");
+    std::strcpy(m.version, "0.12.0-bluetooth");
+    m.seq = 7;
+    m.saved_unix = 1791136862u;
+    m.saved_up_s = 5400;
+    m.clock = ClockSource::Client;
+    m.passes = 88;
+    m.learning = false;
+    m.count = 2;
+    m.online = 1;
+    char buf[kReportLineMax];
+    const size_t n = report_header_line(m, buf, sizeof(buf));
+    CHECK(n == std::strlen(buf));
+    CHECK_STR(buf, "{\"report\":1,\"ssid\":\"Home \\\"5\\\"\",\"subnet\":\"192.168.2.0/24\","
+                   "\"gateway\":\"192.168.2.1\",\"gateway_mac\":\"50:91:E3:12:34:56\","
+                   "\"board_ip\":\"192.168.2.27\",\"board_mac\":\"D4:E9:F4:12:34:56\","
+                   "\"version\":\"0.12.0-bluetooth\",\"seq\":7,\"saved_unix\":1791136862,"
+                   "\"saved_up_s\":5400,\"clock\":\"client\",\"passes\":88,\"learning\":false,"
+                   "\"count\":2,\"online\":1,\"devices\":[\n");
+    // Too small a buffer: nothing, never a broken line.
+    char tiny[40];
+    CHECK(report_header_line(m, tiny, sizeof(tiny)) == 0);
+
+    ReportRow r = test_row(4, 10, 1791136852u, "Desk\\PC\x01");
+    r.mac.b[0] = 0xDA;                      // a private address
+    r.status = Status::Private;
+    r.first_unix = 1791135962u;
+    const size_t k = report_row_line(r, "Acme \"Co\"", false, buf, sizeof(buf));
+    CHECK(k == std::strlen(buf));
+    CHECK_STR(buf, "{\"mac\":\"DA:00:00:00:00:04\",\"ip\":\"192.168.2.4\",\"hostname\":\"Desk\\\\PC\","
+                   "\"vendor\":\"Acme \\\"Co\\\"\",\"status\":\"private\",\"randomised\":true,"
+                   "\"self\":false,\"online\":true,\"up_s\":50,\"last_seen_s\":10,"
+                   "\"seen_unix\":1791136852,\"first_unix\":1791135962,\"carried\":false},\n");
+    r.carried = true;
+    report_row_line(r, nullptr, true, buf, sizeof(buf));
+    CHECK(std::strstr(buf, "\"vendor\":\"\"") != nullptr);
+    CHECK(std::strstr(buf, "\"carried\":true}\n") != nullptr);
+    // The longest a row can be still fits a line.
+    ReportRow big{};
+    big.mac = test_mac_n(1);
+    big.ip = 0xFFFFFFFFu;
+    std::memset(big.hostname, '"', sizeof(big.hostname) - 1);
+    big.ago_s = big.up_s = big.seen_unix = big.first_unix = 0xFFFFFFFFu;
+    char vendor[64];
+    std::memset(vendor, '"', sizeof(vendor) - 1);
+    vendor[sizeof(vendor) - 1] = '\0';
+    CHECK(report_row_line(big, vendor, false, buf, sizeof(buf)) > 0);
+
+    CHECK(report_status_of("known") == Status::Known);
+    CHECK(report_status_of("private") == Status::Private);
+    CHECK(report_status_of("unknown") == Status::Unknown);
+    CHECK(report_status_of(nullptr) == Status::Unknown);
+    CHECK(report_clock_of("internet") == ClockSource::Internet);
+    CHECK(report_clock_of("client") == ClockSource::Client);
+    CHECK(report_clock_of("x") == ClockSource::None);
+}
+
+// --- Signing in (0.13) ---------------------------------------------------------
+
+#include "../netmon/src/core/auth.h"
+
+static std::string hex_of(const uint8_t* b, size_t n) {
+    std::vector<char> s(2 * n + 1);
+    hex_encode(b, n, s.data());
+    return std::string(s.data());
+}
+
+static void test_sha256() {
+    uint8_t h[32];
+    sha256("", 0, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    sha256("abc", 3, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const char* m448 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha256(m448, std::strlen(m448), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // Lengths either side of where the padding needs a second block.
+    std::string x55(55, 'x'), x56(56, 'x'), x64(64, 'x');
+    sha256(x55.data(), x55.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072");
+    sha256(x56.data(), x56.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e");
+    sha256(x64.data(), x64.size(), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c");
+    // A million a's, fed in uneven pieces.
+    Sha256 s;
+    sha256_init(s);
+    std::string a(1000, 'a');
+    size_t fed = 0, step = 1;
+    while (fed < 1000000) {
+        size_t n = step % 997 + 1;
+        if (n > 1000000 - fed) n = 1000000 - fed;
+        sha256_update(s, a.data(), n);
+        fed += n;
+        step = step * 7 + 3;
+    }
+    sha256_final(s, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+
+    // HMAC, RFC 4231 cases 1, 2 and 6 (a key longer than a block).
+    uint8_t k1[20];
+    std::memset(k1, 0x0b, sizeof(k1));
+    hmac_sha256(k1, sizeof(k1), reinterpret_cast<const uint8_t*>("Hi There"), 8, h);
+    CHECK_STR(hex_of(h, 32).c_str(), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    const char* q = "what do ya want for nothing?";
+    hmac_sha256(reinterpret_cast<const uint8_t*>("Jefe"), 4, reinterpret_cast<const uint8_t*>(q), std::strlen(q), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    uint8_t k6[131];
+    std::memset(k6, 0xaa, sizeof(k6));
+    const char* m6 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    hmac_sha256(k6, sizeof(k6), reinterpret_cast<const uint8_t*>(m6), std::strlen(m6), h);
+    CHECK_STR(hex_of(h, 32).c_str(), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+    // PBKDF2-HMAC-SHA-256: the published vectors, two blocks of output and more.
+    const uint8_t* pw = reinterpret_cast<const uint8_t*>("password");
+    const uint8_t* salt = reinterpret_cast<const uint8_t*>("salt");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 1, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 2, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    CHECK(pbkdf2_sha256(pw, 8, salt, 4, 4096, h, 32));
+    CHECK_STR(hex_of(h, 32).c_str(), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    uint8_t d40[40];
+    const char* p2 = "passwordPASSWORDpassword";
+    const char* s2 = "saltSALTsaltSALTsaltSALTsaltSALTsalt";
+    CHECK(pbkdf2_sha256(reinterpret_cast<const uint8_t*>(p2), std::strlen(p2),
+                        reinterpret_cast<const uint8_t*>(s2), std::strlen(s2), 4096, d40, sizeof(d40)));
+    CHECK_STR(hex_of(d40, 40).c_str(),
+              "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+    uint8_t d64[64];
+    CHECK(pbkdf2_sha256(reinterpret_cast<const uint8_t*>("passwd"), 6, salt, 4, 1, d64, sizeof(d64)));
+    CHECK_STR(hex_of(d64, 64).c_str(),
+              "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+              "49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783");
+    uint8_t long_salt[61] = {0};
+    CHECK(!pbkdf2_sha256(pw, 8, long_salt, sizeof(long_salt), 1, h, 32));
+    CHECK(!pbkdf2_sha256(pw, 8, salt, 4, 0, h, 32));
+
+    // Comparing and hex.
+    uint8_t x[4] = {1, 2, 3, 4}, y[4] = {1, 2, 3, 4};
+    CHECK(same_bytes(x, y, 4));
+    y[3] = 5;
+    CHECK(!same_bytes(x, y, 4));
+    CHECK(same_text_ct("netmon-update", "netmon-update"));
+    CHECK(!same_text_ct("netmon-updat", "netmon-update"));
+    CHECK(!same_text_ct("netmon-update!", "netmon-update"));
+    CHECK(!same_text_ct("", "netmon-update"));
+    CHECK(!same_text_ct(nullptr, "x"));
+    uint8_t back[4];
+    CHECK(hex_decode("0aFf10e9", back, 4));
+    CHECK(back[0] == 0x0a && back[1] == 0xff && back[2] == 0x10 && back[3] == 0xe9);
+    CHECK(!hex_decode("0aFf10e", back, 4));
+    CHECK(!hex_decode("0aFf10eg", back, 4));
+    CHECK(!hex_decode(nullptr, back, 4));
+}
+
+static void test_auth_sessions() {
+    CHECK(token_well_formed("0123456789abcdef0123456789abcdef"));
+    CHECK(!token_well_formed("0123456789ABCDEF0123456789abcdef"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcde"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcdef0"));
+    CHECK(!token_well_formed("0123456789abcdef0123456789abcdeg"));
+    CHECK(!token_well_formed(nullptr));
+    uint8_t h1[32], h2[32], h3[32];
+    token_hash("0123456789abcdef0123456789abcdef", h1);
+    CHECK_STR(hex_of(h1, 32).c_str(), "3eb1bd439947eb762998e566ccc2e099c791118b2f40579cc4f7da2b5061b7f9");
+    token_hash("11111111111111111111111111111111", h2);
+    token_hash("22222222222222222222222222222222", h3);
+
+    SessionTable<4> t;
+    t.clear();
+    CHECK(t.find(h1, 100, 0) == -1);
+    CHECK(t.count(100, 0) == 0);
+    // A session not kept: alive while used, gone after 12 hours idle.
+    const int a = static_cast<int>(t.add(h1, false, 100, 0));
+    CHECK(t.find(h1, 101, 0) == a);
+    CHECK(t.find(h2, 101, 0) == -1);
+    CHECK(t.find(h1, 100 + kSessionIdleS - 1, 0) == a);
+    CHECK(t.find(h1, 100 + kSessionIdleS, 0) == -1);
+    t.touch(a, 100 + kSessionIdleS - 10);
+    CHECK(t.find(h1, 100 + kSessionIdleS + 100, 0) == a);
+    // ... and a week at most, however busy.
+    uint32_t now = 100;
+    while (now < 100 + kSessionShortMaxS - 3600) {
+        now += 3600;
+        t.touch(a, now);
+    }
+    CHECK(t.find(h1, 100 + kSessionShortMaxS - 1, 0) == a);
+    CHECK(t.find(h1, 100 + kSessionShortMaxS, 0) == -1);
+
+    // Kept ("Remember me"): idle does not matter, 30 days do.
+    t.clear();
+    const int r = static_cast<int>(t.add(h2, true, 50, 0));
+    CHECK(t.find(h2, 50 + kSessionIdleS + 5, 0) == r);
+    CHECK(t.find(h2, 50 + kSessionLongS - 1, 0) == r);
+    CHECK(t.find(h2, 50 + kSessionLongS, 0) == -1);
+    // Dated by the clock when the board has one, across restarts too.
+    t.clear();
+    const int d = static_cast<int>(t.add(h2, true, 10, 1760000000u));
+    t.s[d].earlier_boot = true;           // as loaded after a restart
+    CHECK(t.find(h2, 5, 1760000000u + kSessionLongS - 1) == d);
+    CHECK(t.find(h2, 5, 1760000000u + kSessionLongS) == -1);
+    CHECK(t.find(h2, 5, 0) == d);         // no clock yet after the restart: kept
+    // A clock gone backwards does not end it.
+    CHECK(t.find(h2, 5, 1700000000u) == d);
+
+    // Undated sessions get their date once the clock is known.
+    t.clear();
+    const int u = static_cast<int>(t.add(h3, true, 1000, 0));
+    CHECK(t.date_undated(1600, 1760000000u));
+    CHECK(t.s[u].created_unix == 1760000000u - 600);
+    CHECK(!t.date_undated(1700, 1760000100u));     // nothing left to date
+    CHECK(!t.date_undated(1700, 0));
+
+    // A full table: a dead slot first, then the session not kept used longest
+    // ago, and only then a kept one.
+    SessionTable<3> f;
+    f.clear();
+    uint8_t k[6][32];
+    for (int i = 0; i < 6; ++i) {
+        char tok[33];
+        std::snprintf(tok, sizeof(tok), "%032d", i);
+        token_hash(tok, k[i]);
+    }
+    const size_t s0 = f.add(k[0], true, 10, 0);
+    const size_t s1 = f.add(k[1], false, 20, 0);
+    const size_t s2 = f.add(k[2], false, 30, 0);
+    CHECK(s0 != s1 && s1 != s2 && s0 != s2);
+    f.touch(static_cast<int>(s1), 40);                       // s2 now idle longest
+    const size_t s3 = f.add(k[3], true, 50, 0);
+    CHECK(s3 == s2);
+    CHECK(f.find(k[2], 51, 0) == -1);
+    CHECK(f.find(k[0], 51, 0) == static_cast<int>(s0));
+    const size_t s4 = f.add(k[4], true, 60, 0);              // only s1 is not kept
+    CHECK(s4 == s1);
+    const size_t s5 = f.add(k[5], true, 70, 0);              // all kept: the oldest goes
+    CHECK(s5 == s0);
+    CHECK(f.find(k[0], 71, 0) == -1);
+    CHECK(f.count(71, 0) == 3);
+    // A slot whose session ran out is taken before any live one.
+    SessionTable<2> g;
+    g.clear();
+    g.add(k[0], false, 0, 0);
+    g.add(k[1], true, 0, 0);
+    const size_t gi = g.add(k[2], true, kSessionIdleS + 1, 0);
+    CHECK(g.find(k[1], kSessionIdleS + 2, 0) >= 0);
+    CHECK(g.find(k[2], kSessionIdleS + 2, 0) == static_cast<int>(gi));
+    // Purging, and signing out everywhere but here.
+    CHECK(!g.purge(kSessionIdleS + 2, 0));
+    CHECK(g.remove_all_but(static_cast<int>(gi)) == 1);
+    CHECK(g.count(kSessionIdleS + 3, 0) == 1);
+    g.remove(static_cast<int>(gi));
+    CHECK(g.count(kSessionIdleS + 3, 0) == 0);
+    g.add(k[0], false, 0, 0);
+    CHECK(g.purge(kSessionIdleS, 0));
+    CHECK(!g.purge(kSessionIdleS, 0));
+}
+
+static void test_auth_headers() {
+    char v[40];
+    CHECK(cookie_value("nm_s=abc", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "abc");
+    CHECK(cookie_value("theme=dark; nm_s=0123; x=1", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(cookie_value("a=1;nm_s=zz ;b=2", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "zz");
+    CHECK(!cookie_value("xnm_s=1; nm_sx=2", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "");
+    CHECK(!cookie_value("", "nm_s", v, sizeof(v)));
+    CHECK(!cookie_value(nullptr, "nm_s", v, sizeof(v)));
+    CHECK(cookie_value("nm_s=", "nm_s", v, sizeof(v)));
+    CHECK_STR(v, "");
+    char tiny[4];
+    CHECK(!cookie_value("nm_s=abcdef", "nm_s", tiny, sizeof(tiny)));
+    CHECK(bearer_value("Bearer 0123", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(bearer_value("  bearer   0123  ", v, sizeof(v)));
+    CHECK_STR(v, "0123");
+    CHECK(!bearer_value("Basic YWJj", v, sizeof(v)));
+    CHECK(!bearer_value("Bearer", v, sizeof(v)));
+    CHECK(!bearer_value("Bearer ", v, sizeof(v)));
+    CHECK(!bearer_value("Bearerx 1", v, sizeof(v)));
+    CHECK(!bearer_value(nullptr, v, sizeof(v)));
+    CHECK(!bearer_value("Bearer abcdef", tiny, sizeof(tiny)));
+
+    CHECK(next_path_ok("/"));
+    CHECK(next_path_ok("/settings"));
+    CHECK(next_path_ok("/?q=192.168.2.4"));
+    CHECK(!next_path_ok("//evil.example/"));
+    CHECK(!next_path_ok("/\\evil.example"));
+    CHECK(!next_path_ok("https://evil.example/"));
+    CHECK(!next_path_ok("settings"));
+    CHECK(!next_path_ok(""));
+    CHECK(!next_path_ok(nullptr));
+    CHECK(!next_path_ok("/a\nb"));
+}
+
+static void test_auth_password() {
+    CHECK(password_rule("12345678") == PasswordRule::Ok);
+    CHECK(password_rule("1234567") == PasswordRule::TooShort);
+    CHECK(password_rule("") == PasswordRule::TooShort);
+    CHECK(password_rule(nullptr) == PasswordRule::TooShort);
+    CHECK(password_rule(std::string(64, 'p').c_str()) == PasswordRule::Ok);
+    CHECK(password_rule(std::string(65, 'p').c_str()) == PasswordRule::TooLong);
+    CHECK(password_rule("tab\there!") == PasswordRule::Control);
+    CHECK(password_rule("snowman \xe2\x98\x83 ok") == PasswordRule::Ok);
+    CHECK(password_rule_text(PasswordRule::TooShort)[0] != '\0');
+    CHECK_STR(password_rule_text(PasswordRule::Ok), "");
+
+    uint8_t salt[16];
+    for (int i = 0; i < 16; ++i) salt[i] = static_cast<uint8_t>(i);
+    PasswordHash ph;
+    password_make(ph, "correct horse battery", salt, kPasswordRounds);
+    CHECK(ph.set);
+    CHECK(ph.rounds == kPasswordRounds);
+    CHECK_STR(hex_of(ph.hash, 32).c_str(), "25ec2e843d040853eb91d6ee9a96d626c48de1b5cb7eb4c549e71a3c990cb674");
+    CHECK(password_matches(ph, "correct horse battery"));
+    CHECK(!password_matches(ph, "correct horse batterY"));
+    CHECK(!password_matches(ph, ""));
+    CHECK(!password_matches(ph, nullptr));
+    PasswordHash none{};
+    CHECK(!password_matches(none, "correct horse battery"));
+    PasswordHash silly = ph;
+    silly.rounds = 0;
+    CHECK(!password_matches(silly, "correct horse battery"));
+}
+
+static void test_auth_throttle() {
+    LoginThrottle<3> t;
+    t.clear();
+    const uint32_t A = 0xC0A8021Bu, B = 0xC0A8021Cu;
+    // Five wrong passwords are free.
+    for (int i = 0; i < 5; ++i) {
+        CHECK(t.wait_s(A, 100) == 0);
+        t.failed(A, 100);
+    }
+    CHECK(t.wait_s(A, 100) == 0);
+    t.failed(A, 100);                    // the sixth: 30 s
+    CHECK(t.wait_s(A, 100) == 30);
+    CHECK(t.wait_s(A, 129) == 1);
+    CHECK(t.wait_s(A, 130) == 0);
+    CHECK(t.wait_s(B, 100) == 0);        // somebody else is not held up
+    t.failed(A, 130);                    // seventh: 60 s
+    CHECK(t.wait_s(A, 130) == 60);
+    for (int i = 0; i < 10; ++i) t.failed(A, 200);
+    CHECK(t.wait_s(A, 200) == kLoginWaitMaxS);
+    // The right password clears it.
+    t.succeeded(A);
+    CHECK(t.wait_s(A, 201) == 0);
+    // A place quiet for an hour starts afresh.
+    for (int i = 0; i < 7; ++i) t.failed(B, 300);
+    CHECK(t.wait_s(B, 300) > 0);
+    CHECK(t.wait_s(B, 300 + kLoginForgetS) == 0);
+    t.failed(B, 300 + kLoginForgetS + 1);
+    CHECK(t.wait_s(B, 300 + kLoginForgetS + 1) == 0);
+    // Many places: past 30 wrong passwords in ten minutes, everyone waits.
+    LoginThrottle<3> g;
+    g.clear();
+    for (uint32_t i = 0; i < kLoginGlobalMax; ++i) g.failed(1000 + i, 5000);
+    CHECK(g.wait_s(99, 5000) == 0);
+    g.failed(2000, 5001);
+    CHECK(g.wait_s(99, 5001) == kLoginGlobalWaitS);
+    CHECK(g.wait_s(99, 5001 + kLoginGlobalWaitS) == 0);
+    // Spread out, they never add up to that.
+    LoginThrottle<3> s;
+    s.clear();
+    for (uint32_t i = 0; i < 100; ++i) s.failed(3000 + i, 10000 + i * 30);
+    CHECK(s.wait_s(77, 10000 + 100 * 30) == 0);
+}
+
+static void test_mac_rule() {
+    Mac setup{}, m{};
+    mac_parse("D4:E9:F4:A3:B8:AD", setup);
+    CHECK(mac_rule("02:1A:2B:3C:4D:5E", setup, m) == MacRule::Ok);
+    char out[18];
+    mac_format(m, out);
+    CHECK_STR(out, "02:1A:2B:3C:4D:5E");
+    CHECK(mac_rule("d4e9f4a3b8ac", setup, m) == MacRule::Ok);    // a maker's address may be copied
+    CHECK(mac_rule("01:00:5E:00:00:01", setup, m) == MacRule::Group);
+    CHECK(mac_rule("FF:FF:FF:FF:FF:FF", setup, m) == MacRule::Group);
+    CHECK(mac_rule("00:00:00:00:00:00", setup, m) == MacRule::Zero);
+    CHECK(mac_rule("D4:E9:F4:A3:B8:AD", setup, m) == MacRule::SetupClash);
+    CHECK(mac_rule("02:1A:2B:3C:4D", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule("", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule("zz:1A:2B:3C:4D:5E", setup, m) == MacRule::Unreadable);
+    CHECK(mac_rule_text(MacRule::Group)[0] != '\0');
+    CHECK_STR(mac_rule_text(MacRule::Ok), "");
+    for (uint32_t i = 0; i < 64; ++i) {
+        const Mac r = mac_random_local(i * 2654435761u, ~i * 40503u);
+        CHECK((r.b[0] & 0x03) == 0x02);   // locally administered, one device
+        char t[18];
+        mac_format(r, t);
+        Mac back{};
+        CHECK(mac_rule(t, setup, back) == MacRule::Ok);
+    }
+}
+
+// ---- 0.14: remembered devices and the LAN watch ----------------------------
+
+#include <string>
+#include "../netmon/src/core/baseline.h"
+#include "../netmon/src/core/lan_guard.h"
+
+// Once the list has been learned it decides, before the window does; a device
+// on it is known whatever the window says, and a private address is private.
+static void test_classify_remembered() {
+    // Nothing learned: exactly the old rules.
+    CHECK(classify_remembered(1100, 1000, 600, false, false, false) == Status::Known);
+    CHECK(classify_remembered(9000, 1000, 600, false, false, false) == Status::Unknown);
+    CHECK(classify_remembered(50000, 0, 600, false, false, false) == Status::Known);
+    // On the list: known, even long after the window.
+    CHECK(classify_remembered(9000, 1000, 600, false, true, true) == Status::Known);
+    CHECK(classify_remembered(9000, 1000, 600, false, true, false) == Status::Known);
+    // Learned before, not on the list: unknown at once after a restart, with
+    // the window not even anchored yet. This is the hole 0.12 closes.
+    CHECK(classify_remembered(5, 0, 600, false, false, true) == Status::Unknown);
+    CHECK(classify_remembered(1100, 1000, 600, false, false, true) == Status::Unknown);
+    // Private beats everything.
+    CHECK(classify_remembered(1100, 1000, 600, true, true, true) == Status::Private);
+    CHECK(classify_remembered(9000, 1000, 600, true, false, true) == Status::Private);
+
+    CHECK(still_learning(1100, 1000, 600, false));
+    CHECK(!still_learning(1100, 1000, 600, true));
+    CHECK(!still_learning(9000, 1000, 600, false));
+    CHECK(still_learning(5, 0, 600, false));
+}
+
+static void test_table_trust_forget() {
+    DeviceTable<4> t;
+    bool created = false;
+    t.upsert(mk("AA:BB:CC:00:00:01"), 1, 100, Status::Known, created);
+    t.upsert(mk("AA:BB:CC:00:00:02"), 2, 110, Status::Unknown, created);
+    t.upsert(mk("AA:BB:CC:00:00:03"), 3, 120, Status::Known, created);
+
+    CHECK(t.set_status(mk("AA:BB:CC:00:00:02"), Status::Known));
+    CHECK(t.find(mk("AA:BB:CC:00:00:02"))->status == Status::Known);
+    CHECK(!t.set_status(mk("AA:BB:CC:00:00:09"), Status::Known));
+
+    CHECK(t.remove(mk("AA:BB:CC:00:00:02")));
+    CHECK(t.size() == 2);
+    CHECK(t.find(mk("AA:BB:CC:00:00:02")) == nullptr);
+    // The rest keep their order and their data.
+    CHECK(t.at(0).ip == 1 && t.at(1).ip == 3);
+    CHECK(!t.remove(mk("AA:BB:CC:00:00:02")));
+    // Seen again, it is a new device and judged afresh.
+    t.upsert(mk("AA:BB:CC:00:00:02"), 2, 200, Status::Unknown, created);
+    CHECK(created);
+    CHECK(t.find(mk("AA:BB:CC:00:00:02"))->status == Status::Unknown);
+    CHECK(t.remove(mk("AA:BB:CC:00:00:01")));
+    CHECK(t.remove(mk("AA:BB:CC:00:00:03")));
+    CHECK(t.remove(mk("AA:BB:CC:00:00:02")));
+    CHECK(t.size() == 0);
+}
+
+static void test_auth_rank() {
+    // Open < WEP < WPA < WPA/WPA2 < WPA2 < WPA2/WPA3 < WPA3.
+    CHECK(air_auth_rank(0) < air_auth_rank(1));
+    CHECK(air_auth_rank(1) < air_auth_rank(2));
+    CHECK(air_auth_rank(2) < air_auth_rank(4));
+    CHECK(air_auth_rank(4) < air_auth_rank(3));
+    CHECK(air_auth_rank(3) < air_auth_rank(7));
+    CHECK(air_auth_rank(7) < air_auth_rank(6));
+    CHECK(air_auth_rank(3) == air_auth_rank(5));   // personal and enterprise alike
+    CHECK(air_auth_rank(9) < air_auth_rank(3));    // OWE: anybody may join
+    CHECK(air_auth_rank(200) == 255);              // a mode not known yet
+    bool all_ranked = true;
+    for (uint8_t a = 0; a <= 16; ++a) all_ranked = all_ranked && air_auth_rank(a) != 255;
+    CHECK(all_ranked);
+}
+
+static void test_event_names_012() {
+    CHECK_STR(event_type_text(EventType::Trusted), "trusted");
+    CHECK_STR(event_type_text(EventType::Forgotten), "forgotten");
+    CHECK_STR(event_type_text(EventType::RouterChanged), "router_changed");
+    CHECK_STR(event_type_text(EventType::IpConflict), "ip_conflict");
+    CHECK_STR(event_type_text(EventType::DhcpServer), "dhcp_server");
+    CHECK_STR(event_type_text(EventType::RogueAp), "rogue_ap");
+    CHECK_STR(event_type_text(EventType::WeakAp), "weak_ap");
+    // Each alert is logged under the event of the same name.
+    for (uint8_t i = 0; i <= static_cast<uint8_t>(GuardKind::WeakAp); ++i) {
+        const GuardKind k = static_cast<GuardKind>(i);
+        CHECK_STR(event_type_text(guard_kind_event(k)), guard_kind_text(k));
+        GuardKind back = GuardKind::WeakAp;
+        CHECK(guard_kind_parse(guard_kind_text(k), back) && back == k);
+    }
+    GuardKind k = GuardKind::RouterChanged;
+    CHECK(!guard_kind_parse("seen", k));
+    CHECK(!guard_kind_parse("", k));
+    CHECK(!guard_kind_parse(nullptr, k));
+}
+
+static void test_baseline_lists() {
+    Baseline b;
+    base_reset(b, "Home");
+    CHECK_STR(b.ssid, "Home");
+    CHECK(!b.learned && b.known_count == 0 && !b.has_router);
+
+    CHECK(base_known_add(b, test_mac_n(1)));
+    CHECK(!base_known_add(b, test_mac_n(1)));          // already there
+    CHECK(base_known_add(b, test_mac_n(2)));
+    CHECK(base_known_has(b, test_mac_n(2)));
+    CHECK(!base_known_has(b, test_mac_n(3)));
+    CHECK(base_known_remove(b, test_mac_n(1)));
+    CHECK(!base_known_remove(b, test_mac_n(1)));
+    CHECK(b.known_count == 1 && base_known_has(b, test_mac_n(2)));
+
+    // Full: the device seen longest ago makes room.
+    base_reset(b, "Home");
+    for (uint8_t i = 0; i < kBaseKnownMax; ++i) base_known_add(b, test_mac_n(i));
+    CHECK(b.known_count == kBaseKnownMax);
+    base_known_touch(b, test_mac_n(0));                // 0 seen again: 1 is now oldest
+    CHECK(base_known_add(b, test_mac_n(200)));
+    CHECK(b.known_count == kBaseKnownMax);
+    CHECK(base_known_has(b, test_mac_n(0)));
+    CHECK(!base_known_has(b, test_mac_n(1)));
+    CHECK(base_known_has(b, test_mac_n(200)));
+
+    // DHCP servers: no duplicates, no zero; full, the oldest goes.
+    base_reset(b, "Home");
+    CHECK(!base_add_dhcp(b, 0));
+    CHECK(base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    CHECK(!base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    for (uint8_t i = 2; i <= 5; ++i) base_add_dhcp(b, ipv4_from_octets(192, 168, 2, i));
+    CHECK(b.dhcp_count == kBaseDhcpMax);
+    CHECK(!base_has_dhcp(b, ipv4_from_octets(192, 168, 2, 1)));
+    CHECK(base_has_dhcp(b, ipv4_from_octets(192, 168, 2, 5)));
+
+    // Access points: added, updated, the oldest dropped when full.
+    CHECK(base_put_ap(b, test_mac_n(1), 3));
+    CHECK(!base_put_ap(b, test_mac_n(1), 3));
+    CHECK(base_put_ap(b, test_mac_n(1), 7));
+    CHECK(base_find_ap(b, test_mac_n(1))->auth == 7);
+    CHECK(b.ap_count == 1);
+    for (uint8_t i = 2; i <= kBaseApMax + 1; ++i) base_put_ap(b, test_mac_n(i), 3);
+    CHECK(b.ap_count == kBaseApMax);
+    CHECK(base_find_ap(b, test_mac_n(1)) == nullptr);
+    CHECK(base_find_ap(b, test_mac_n(kBaseApMax + 1)) != nullptr);
+}
+
+static std::string base_text(const Baseline& b) {
+    std::string out;
+    bool lines_ok = true;
+    CHECK(base_write(b, [&](const char* line, size_t n) {
+        lines_ok = lines_ok && std::strlen(line) == n && n < kBaseLineMax && line[n - 1] == '\n';
+        out.append(line, n);
+        return true;
+    }));
+    CHECK(lines_ok);
+    return out;
+}
+
+static void base_load_text(Baseline& b, const std::string& text, int& refused) {
+    refused = 0;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        if (!base_read_line(b, line.c_str())) ++refused;
+        at = nl + 1;
+    }
+    base_read_done(b);
+}
+
+static void test_baseline_file() {
+    // An SSID may hold anything: tabs, newlines, non-Latin text, 32 bytes.
+    const char* names[] = {"Home", "a\tb\nc", "\xD8\xB4\xD8\xA8\xD9\x83\xD8\xA9", "0123456789abcdef0123456789abcdef", ""};
+    for (const char* name : names) {
+        Baseline b;
+        base_reset(b, name);
+        b.learned = true;
+        b.has_router = true;
+        b.router = mk("F4:F2:6D:11:22:33");
+        base_add_dhcp(b, ipv4_from_octets(192, 168, 2, 1));
+        base_add_dhcp(b, ipv4_from_octets(10, 0, 0, 2));
+        base_put_ap(b, mk("F4:F2:6D:11:22:34"), 3);
+        base_put_ap(b, mk("F4:F2:6D:11:22:35"), 15);
+        for (uint8_t i = 0; i < 40; ++i) base_known_add(b, test_mac_n(i));
+        base_known_touch(b, test_mac_n(7));          // most recent
+        const std::string text = base_text(b);
+
+        Baseline r;
+        base_reset(r, "something else");
+        int refused = 0;
+        base_load_text(r, text, refused);
+        CHECK(refused == 0);
+        CHECK_STR(r.ssid, name);
+        CHECK(r.learned);
+        CHECK(r.has_router && mac_equal(r.router, b.router));
+        CHECK(r.dhcp_count == 2 && base_has_dhcp(r, ipv4_from_octets(10, 0, 0, 2)));
+        CHECK(r.ap_count == 2 && base_find_ap(r, mk("F4:F2:6D:11:22:35"))->auth == 15);
+        CHECK(r.known_count == 40);
+        bool all_back = true;
+        for (uint8_t i = 0; i < 40; ++i) all_back = all_back && base_known_has(r, test_mac_n(i));
+        CHECK(all_back);
+        // Recency survives: 7 first, then the newest of the rest, 39.
+        CHECK(mac_equal(r.known[0], test_mac_n(7)));
+        CHECK(mac_equal(r.known[1], test_mac_n(39)));
+        // And what is read back writes the same file.
+        CHECK(base_text(r) == text);
+    }
+
+    // Nothing learned yet, no router: those lines are simply absent.
+    Baseline e;
+    base_reset(e, "Cafe");
+    const std::string text = base_text(e);
+    CHECK(text.find("learned") == std::string::npos);
+    CHECK(text.find("router") == std::string::npos);
+
+    // A damaged file loses the damaged lines and nothing else.
+    Baseline r;
+    base_reset(r, "");
+    int refused = 0;
+    base_load_text(r,
+                   "v\t1\nssid\t486F6D65\nlearned\t1\nrouter\tF4F26D11223\n"
+                   "router\tZZF26D112233\nknown\tAABBCCDDEEFF\nknown\tAABBCCDDEEFF\n"
+                   "known\tAABBCCDDEEF0\r\nap\tAABBCCDDEEFF\t3x\nap\tAABBCCDDEEFF\t999\n"
+                   "dhcp\tC0A8020\nfuture\tthing\nnonsense\nssid\t48006F\nssid\t486\n",
+                   refused);
+    CHECK(refused == 10);
+    CHECK_STR(r.ssid, "Home");
+    CHECK(r.learned);
+    CHECK(!r.has_router);
+    CHECK(r.known_count == 2);
+    CHECK(r.ap_count == 0 && r.dhcp_count == 0);
+
+    char f1[24], f2[24], f3[24];
+    base_file_name("Home", f1);
+    base_file_name("Home", f2);
+    base_file_name("home", f3);
+    CHECK_STR(f1, f2);
+    CHECK(std::strcmp(f1, f3) != 0);
+    CHECK(std::strlen(f1) == 18);
+    CHECK(std::strncmp(f1, "/base-", 6) == 0);
+    CHECK(std::strcmp(f1 + 14, ".txt") == 0);
+    base_file_name("", f1);
+    CHECK_STR(f1, "/base-811c9dc5.txt");       // the FNV-1a offset basis
+}
+
+static void test_guard_log() {
+    GuardLog<3> g;
+    const Mac spoof = test_mac_n(9), router = test_mac_n(1);
+    const uint32_t gw = ipv4_from_octets(192, 168, 2, 1);
+
+    CHECK(g.raise(GuardKind::RouterChanged, spoof, router, gw, 100, 3600));
+    CHECK(g.size() == 1);
+    // Noticed forty times a pass, logged once an hour.
+    bool quiet = true;
+    for (uint32_t t = 101; t < 3700; t += 37) {
+        quiet = quiet && !g.raise(GuardKind::RouterChanged, spoof, router, gw, t, 3600);
+    }
+    CHECK(quiet);
+    CHECK(g.raise(GuardKind::RouterChanged, spoof, router, gw, 3701, 3600));
+    CHECK(g.at(0).first_s == 100 && g.at(0).last_s == 3701 && g.at(0).told_s == 3701);
+    // A different MAC is a different problem, told at once.
+    CHECK(g.raise(GuardKind::RouterChanged, test_mac_n(8), router, gw, 3702, 3600));
+    CHECK(g.size() == 2);
+
+    // A DHCP server is one problem whichever client it answers.
+    const uint32_t rogue = ipv4_from_octets(192, 168, 2, 50);
+    CHECK(g.raise(GuardKind::DhcpServer, test_mac_n(20), Mac{}, rogue, 4000, 3600));
+    CHECK(!g.raise(GuardKind::DhcpServer, test_mac_n(21), Mac{}, rogue, 4010, 3600));
+    CHECK(g.size() == 3);
+    const GuardEntry* d = g.get(GuardKind::DhcpServer, test_mac_n(99), rogue);
+    CHECK(d != nullptr && mac_equal(d->mac, test_mac_n(21)));
+
+    // Full: the one noticed longest ago gives way.
+    CHECK(g.raise(GuardKind::RogueAp, test_mac_n(30), Mac{}, 0, 4020, 3600));
+    CHECK(g.size() == 3);
+    CHECK(g.get(GuardKind::RouterChanged, spoof, gw) == nullptr);   // last 3701
+    CHECK(g.get(GuardKind::RouterChanged, test_mac_n(8), gw) != nullptr);
+
+    // Accepting clears it; an accepted change noticed again is a new problem.
+    CHECK(g.clear(GuardKind::RogueAp, test_mac_n(30), 0));
+    CHECK(!g.clear(GuardKind::RogueAp, test_mac_n(30), 0));
+    CHECK(g.size() == 2);
+    CHECK(g.raise(GuardKind::RogueAp, test_mac_n(30), Mac{}, 0, 4030, 3600));
+
+    // What stopped happening goes after a day.
+    g.expire(4030 + 86400, 86400);
+    CHECK(g.size() == 1);                 // only the one noticed at 4030 is left
+    g.expire(4031 + 86400, 86400);
+    CHECK(g.size() == 0);
+    g.raise(GuardKind::WeakAp, test_mac_n(31), Mac{}, 0, 10, 3600);
+    g.clear_all();
+    CHECK(g.size() == 0);
+}
+
+static void test_ip_claims() {
+    IpClaims<4> c;
+    Mac rival{};
+    const uint32_t x = ipv4_from_octets(192, 168, 2, 45);
+    const Mac a = test_mac_n(1), b = test_mac_n(2), z = test_mac_n(3);
+
+    // A holds it; B takes over: an address handed on, as DHCP does. Quiet.
+    CHECK(!c.observe(x, a, 100, 600, rival));
+    CHECK(!c.observe(x, a, 160, 600, rival));
+    CHECK(!c.observe(x, b, 220, 600, rival));
+    // Back to A a minute later: once is not enough, a sleep proxy does that.
+    CHECK(!c.observe(x, a, 280, 600, rival));
+    // And to B again: they are taking turns.
+    CHECK(c.observe(x, b, 340, 600, rival));
+    CHECK(mac_equal(rival, a));
+    // And on every turn after.
+    CHECK(c.observe(x, a, 400, 600, rival));
+    CHECK(mac_equal(rival, b));
+    CHECK(!c.observe(x, a, 460, 600, rival));         // no change, nothing to say
+
+    // A Mac asleep behind a sleep proxy, waking for a minute each hour: the
+    // address goes over and back once per wake, never three times in a row.
+    const uint32_t y = ipv4_from_octets(192, 168, 2, 46);
+    const Mac mac_book = test_mac_n(4), proxy = test_mac_n(5);
+    bool quiet = !c.observe(y, mac_book, 0, 600, rival);
+    for (uint32_t hour = 0; hour < 6; ++hour) {
+        const uint32_t t = 60 + hour * 3600;
+        quiet = quiet && !c.observe(y, proxy, t, 600, rival);               // falls asleep
+        for (uint32_t k = 1; k < 59; ++k) quiet = quiet && !c.observe(y, proxy, t + 60 * k, 600, rival);
+        quiet = quiet && !c.observe(y, mac_book, t + 3540, 600, rival);     // wakes
+        quiet = quiet && !c.observe(y, mac_book, t + 3570, 600, rival);
+    }
+    CHECK(quiet);
+
+    // Handed on and never handed back: quiet, however long it goes on.
+    const uint32_t v = ipv4_from_octets(192, 168, 2, 48);
+    CHECK(!c.observe(v, a, 100, 600, rival));
+    CHECK(!c.observe(v, b, 5000, 600, rival));
+    CHECK(!c.observe(v, b, 5060, 600, rival));
+
+    // A third device in the middle starts the count again.
+    const uint32_t w = ipv4_from_octets(192, 168, 2, 47);
+    CHECK(!c.observe(w, a, 100, 600, rival));
+    CHECK(!c.observe(w, b, 110, 600, rival));
+    CHECK(!c.observe(w, a, 120, 600, rival));
+    CHECK(!c.observe(w, z, 130, 600, rival));
+    CHECK(!c.observe(w, a, 140, 600, rival));
+    CHECK(c.observe(w, z, 150, 600, rival));        // z and a now take turns
+    CHECK(mac_equal(rival, a));
+    // Too slow: changes more than the window apart do not add up.
+    CHECK(!c.observe(w, a, 2000, 600, rival));
+    CHECK(!c.observe(w, z, 2700, 600, rival));
+    CHECK(!c.observe(w, a, 3400, 600, rival));
+
+    // Full, the address heard from longest ago gives way.
+    CHECK(c.size() == 4);
+    CHECK(!c.observe(ipv4_from_octets(192, 168, 2, 49), a, 10001, 600, rival));
+    CHECK(c.size() == 4);
+    c.clear();
+    CHECK(c.size() == 0);
+}
+
+static void test_guard_judgements() {
+    Baseline b;
+    base_reset(b, "Home");
+    const uint32_t gw = ipv4_from_octets(192, 168, 2, 1);
+    const uint32_t other = ipv4_from_octets(192, 168, 2, 50);
+
+    // Router: the first MAC heard becomes the record.
+    CHECK(guard_router_check(b, test_mac_n(1)) == RouterVerdict::Learn);
+    b.has_router = true;
+    b.router = test_mac_n(1);
+    CHECK(guard_router_check(b, test_mac_n(1)) == RouterVerdict::Same);
+    CHECK(guard_router_check(b, test_mac_n(2)) == RouterVerdict::Changed);
+
+    // DHCP: nothing on record, the router is the server.
+    CHECK(guard_dhcp_expected(b, gw, 0, gw));
+    CHECK(!guard_dhcp_expected(b, other, 0, gw));
+    CHECK(guard_dhcp_expected(b, 0, 0, gw));          // a REQUEST with no option 54
+    // The one that leased this board its address, always.
+    CHECK(guard_dhcp_expected(b, other, other, gw));
+    // Once one is on record, the router is not assumed any more.
+    base_add_dhcp(b, other);
+    CHECK(guard_dhcp_expected(b, other, 0, gw));
+    CHECK(!guard_dhcp_expected(b, gw, 0, gw));
+
+    // Access points: learned while learning, judged after.
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Learn);
+    // Learned with no scan heard: the first scan after records what it hears.
+    b.learned = true;
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Learn);
+    base_put_ap(b, test_mac_n(5), 3);
+    CHECK(guard_ap_check(b, test_mac_n(5), 3) == ApVerdict::Fine);
+    CHECK(guard_ap_check(b, test_mac_n(5), 5) == ApVerdict::Fine);       // WPA2-Enterprise: same rank
+    CHECK(guard_ap_check(b, test_mac_n(5), 0) == ApVerdict::Weaker);     // now open
+    CHECK(guard_ap_check(b, test_mac_n(5), 4) == ApVerdict::Weaker);     // WPA/WPA2
+    CHECK(guard_ap_check(b, test_mac_n(5), 7) == ApVerdict::Stronger);   // WPA3 added
+    CHECK(guard_ap_check(b, test_mac_n(5), 200) == ApVerdict::Fine);     // unknown mode
+    CHECK(guard_ap_check(b, test_mac_n(6), 3) == ApVerdict::Unknown);    // a twin
+    // Accepted while out of range, with no mode on record: the first one heard
+    // is taken, never called weaker.
+    base_put_ap(b, test_mac_n(7), 255);
+    CHECK(guard_ap_check(b, test_mac_n(7), 0) == ApVerdict::Stronger);
+    CHECK(guard_ap_check(b, test_mac_n(7), 255) == ApVerdict::Fine);
+}
+
 int main() {
     test_mac();
     test_event_log();
@@ -1911,6 +3431,34 @@ int main() {
     test_air_find_hold();
     test_air_plan_find();
     test_air_table_get();
+    test_link_vectors();
+    test_link_assembler();
+    test_link_parse();
+    test_link_arg();
+    test_link_cut();
+    test_link_pairing();
+    test_link_pair_why();
+    test_link_parse_auth();
+    test_clock();
+    test_http_date();
+    test_report_slots();
+    test_report_rows();
+    test_report_lines();
+    test_sha256();
+    test_auth_sessions();
+    test_auth_headers();
+    test_auth_password();
+    test_auth_throttle();
+    test_mac_rule();
+    test_classify_remembered();
+    test_table_trust_forget();
+    test_auth_rank();
+    test_event_names_012();
+    test_baseline_lists();
+    test_baseline_file();
+    test_guard_log();
+    test_ip_claims();
+    test_guard_judgements();
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

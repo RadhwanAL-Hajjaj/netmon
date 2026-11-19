@@ -65,3 +65,48 @@ inline uint32_t mac_oui(const Mac& m) {
            (static_cast<uint32_t>(m.b[1]) << 8) |
            static_cast<uint32_t>(m.b[2]);
 }
+
+// --- The board's own Wi-Fi address, when the owner sets one (0.13) --------------
+
+enum class MacRule : uint8_t { Ok, Unreadable, Group, Zero, SetupClash };
+
+// An address the board may take for itself on Wi-Fi: one device's (bit 0 of
+// the first octet clear: not a group address), not all zeros, and not the
+// address the board's own setup network uses, which the Wi-Fi stack needs to
+// be different. A manufacturer's address (copying a device the router
+// already knows) and a locally administered one are both allowed.
+inline MacRule mac_rule(const char* text, const Mac& setup_ap, Mac& out) {
+    if (!mac_parse(text, out)) return MacRule::Unreadable;
+    if (out.b[0] & 0x01) return MacRule::Group;
+    bool zero = true;
+    for (size_t i = 0; i < 6; ++i) {
+        if (out.b[i] != 0) zero = false;
+    }
+    if (zero) return MacRule::Zero;
+    if (mac_equal(out, setup_ap)) return MacRule::SetupClash;
+    return MacRule::Ok;
+}
+
+inline const char* mac_rule_text(MacRule r) {
+    switch (r) {
+        case MacRule::Unreadable: return "Enter a MAC address like 02:1A:2B:3C:4D:5E.";
+        case MacRule::Group: return "That is a group (multicast) address; the first pair of digits must be even.";
+        case MacRule::Zero: return "00:00:00:00:00:00 is not a usable address.";
+        case MacRule::SetupClash: return "That is the address the board's setup network uses; pick another.";
+        case MacRule::Ok: break;
+    }
+    return "";
+}
+
+// A random locally administered unicast address, from four random bytes per
+// call: the first octet ends in binary 10, so it can never be a maker's.
+inline Mac mac_random_local(uint32_t r1, uint32_t r2) {
+    Mac m{};
+    m.b[0] = static_cast<uint8_t>((r1 & 0xFC) | 0x02);
+    m.b[1] = static_cast<uint8_t>(r1 >> 8);
+    m.b[2] = static_cast<uint8_t>(r1 >> 16);
+    m.b[3] = static_cast<uint8_t>(r1 >> 24);
+    m.b[4] = static_cast<uint8_t>(r2);
+    m.b[5] = static_cast<uint8_t>(r2 >> 8);
+    return m;
+}

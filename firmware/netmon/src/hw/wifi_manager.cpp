@@ -2,10 +2,13 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_mac.h>
+#include <esp_wifi.h>
 #include <cstring>
 
 static WifiState g_state = WifiState::Connecting;
 static char g_ssid[33] = {0};
+static bool g_mac_applied = false;
 
 static const char* kHostname = "netmon";
 static const char* kApSsid = "netmon-setup";
@@ -98,6 +101,18 @@ static IPAddress from_u32(uint32_t v) {
 WifiState wifi_begin(const Settings& s) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+
+    // The owner's own address, set before anything goes out on the air, so
+    // the router only ever sees this one. The Wi-Fi stack takes it once its
+    // station interface exists and before it connects; it keeps it through
+    // the switch to setup mode below. Settings were checked when they were
+    // saved; the stack still has the last word.
+    if (s.wifi_mac_set) {
+        const esp_err_t e = esp_wifi_set_mac(WIFI_IF_STA, s.wifi_mac);
+        g_mac_applied = e == ESP_OK;
+        Serial.print(F("[wifi] own MAC address "));
+        Serial.println(g_mac_applied ? WiFi.macAddress() : String(F("REFUSED, using the chip's own")));
+    }
 
     // Sent in the DHCP request, so the router's client list names this board
     // instead of leaving it blank among the other Espressif MACs. Must be set
@@ -197,6 +212,20 @@ Mac wifi_mac() {
     return m;
 }
 const char* wifi_current_ssid() { return g_ssid; }
+
+Mac wifi_factory_mac() {
+    Mac m{};
+    esp_read_mac(m.b, ESP_MAC_WIFI_STA);
+    return m;
+}
+
+Mac wifi_factory_ap_mac() {
+    Mac m{};
+    esp_read_mac(m.b, ESP_MAC_WIFI_SOFTAP);
+    return m;
+}
+
+bool wifi_custom_mac_applied() { return g_mac_applied; }
 
 JoinResult wifi_boot_result(const char* ssid, uint32_t& ms, uint8_t& reason) {
     ms = 0;

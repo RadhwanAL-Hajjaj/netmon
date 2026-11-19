@@ -14,6 +14,16 @@ enum class EventType : uint8_t {
     // the history. Kept so the numbering and the API names do not change.
     ScanStarted = 4,
     ScanFinished = 5,
+    // From 0.12. Somebody marked a device as known, or told the board to stop
+    // recognising it.
+    Trusted = 6,
+    Forgotten = 7,
+    // The LAN watch: see lan_guard.h. The event's MAC and address say who.
+    RouterChanged = 8,     // the router's address answered from another MAC
+    IpConflict = 9,        // two MACs took turns answering for one address
+    DhcpServer = 10,       // a device took a lease from an unexpected server
+    RogueAp = 11,          // an unknown access point using this network's name
+    WeakAp = 12,           // one of this network's access points offers less
 };
 
 struct DeviceEvent {
@@ -77,6 +87,13 @@ inline const char* event_type_text(EventType t) {
         case EventType::Hostname: return "hostname";
         case EventType::ScanStarted: return "scan";
         case EventType::ScanFinished: return "scan_done";
+        case EventType::Trusted: return "trusted";
+        case EventType::Forgotten: return "forgotten";
+        case EventType::RouterChanged: return "router_changed";
+        case EventType::IpConflict: return "ip_conflict";
+        case EventType::DhcpServer: return "dhcp_server";
+        case EventType::RogueAp: return "rogue_ap";
+        case EventType::WeakAp: return "weak_ap";
     }
     return "event";
 }

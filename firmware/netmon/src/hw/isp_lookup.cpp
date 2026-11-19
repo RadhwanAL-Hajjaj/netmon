@@ -7,6 +7,8 @@
 
 #include <cstring>
 
+#include "../core/report.h"
+
 namespace {
 
 // Plain HTTP on purpose. TLS would cost flash on a partition already at 80%,
@@ -35,6 +37,7 @@ void fail(IspInfo& out, const char* why) {
 
 bool isp_fetch(IspInfo& out) {
     out.error[0] = '\0';
+    out.date_unix = 0;
     if (WiFi.status() != WL_CONNECTED) {
         fail(out, "Not connected to a network.");
         return false;
@@ -74,6 +77,9 @@ bool isp_fetch(IspInfo& out) {
         fail(out, "The lookup service sent no readable reply.");
         return false;
     }
+    // The reply's Date header is the time to the second: the board has no
+    // clock of its own, and saved reports are dated by it. No extra request.
+    http_date_header(response.c_str(), static_cast<size_t>(split), out.date_unix);
 
     JsonDocument doc;
     if (deserializeJson(doc, response.substring(split + 4))) {

@@ -93,6 +93,28 @@ class DeviceTable {
         return seen;
     }
 
+    // Changes a device's status after the fact: Trust makes an unknown device
+    // known. True when the device is in the table.
+    bool set_status(const Mac& m, Status s) {
+        Device* d = find(m);
+        if (d == nullptr) return false;
+        d->status = s;
+        return true;
+    }
+
+    // Takes a device out of the table, closing the gap so the rest keep their
+    // order. Seen again, it comes back as a new device. True when it was there.
+    bool remove(const Mac& m) {
+        for (size_t i = 0; i < count_; ++i) {
+            if (!mac_equal(items_[i].mac, m)) continue;
+            for (size_t j = i; j + 1 < count_; ++j) items_[j] = items_[j + 1];
+            --count_;
+            std::memset(&items_[count_], 0, sizeof(items_[count_]));
+            return true;
+        }
+        return false;
+    }
+
     bool set_hostname(const Mac& m, const char* name) {
         Device* d = find(m);
         if (d == nullptr || name == nullptr) return false;

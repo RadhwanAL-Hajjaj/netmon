@@ -31,6 +31,19 @@ struct Settings {
     bool air_wifi;
     bool air_ble;
     uint32_t air_background_s;
+
+    // The Bluetooth link (ble_link.h): the API for paired phones. On unless
+    // switched off; pairing still needs the code from the Settings page.
+    bool ble_link;
+
+    // The owner's own pairing code, 0 to 999999, or -1 for a new random code
+    // each pairing window (0.13).
+    int32_t ble_pin;
+
+    // The address the board uses on Wi-Fi, when the owner has set one (0.13);
+    // otherwise the chip's own. Takes effect at the next start.
+    bool wifi_mac_set;
+    uint8_t wifi_mac[6];
 };
 
 void settings_defaults(Settings& s);

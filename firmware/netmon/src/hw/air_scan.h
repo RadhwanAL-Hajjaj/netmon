@@ -51,8 +51,14 @@ void air_wifi_release();
 
 // ---- Bluetooth LE -------------------------------------------------------
 
-// Starts the Bluetooth stack. False when it would not start, and the Nearby
-// page then says so. Called once; later calls report the first answer.
+// The Bluetooth stack itself, shared by the Nearby scans and the Bluetooth
+// link (ble_link.h): whichever needs it first starts it. False when it would
+// not start. Called once; later calls report the first answer.
+bool ble_stack_begin();
+
+// Gets the Nearby scans ready, starting the stack if nothing has yet. False
+// when it would not start, and the Nearby page then says so. Called once;
+// later calls report the first answer.
 bool air_ble_begin();
 bool air_ble_ready();
 

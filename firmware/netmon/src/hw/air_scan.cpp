@@ -252,12 +252,22 @@ bool listen_one(NimBLEScan* scan, const Mac& addr, BleAddrKind kind) {
 
 }  // namespace
 
+bool ble_stack_begin() {
+    static bool tried = false;
+    static bool up = false;
+    if (tried) return up;
+    tried = true;
+    // The name the board goes by over Bluetooth, to anything that connects.
+    up = NimBLEDevice::init("netmon");
+    return up;
+}
+
 bool air_ble_begin() {
     if (g_tried) return g_ready;
     g_tried = true;
     g_queue = xQueueCreate(kQueueDepth, sizeof(BleSighting));
     if (g_queue == nullptr) return false;
-    if (!NimBLEDevice::init("")) return false;
+    if (!ble_stack_begin()) return false;
     NimBLEScan* scan = NimBLEDevice::getScan();
     // One report per device per burst, kept nowhere but the queue above: the
     // table in loop() is the only list, so the stack need not hold one too.

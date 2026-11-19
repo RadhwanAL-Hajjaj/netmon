@@ -63,11 +63,103 @@
 "dt{color:var(--mut)}" \
 "dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;" \
 "overflow-wrap:anywhere}" \
-"</style>"
+"</style>" \
+"<script>" \
+/* From 0.13 every request needs signing in. A session that ends while a */ \
+/* page is open shows as a 401 marked X-Netmon-Login on whatever the page */ \
+/* asks next; the page then goes to the sign-in page, which brings it back. */ \
+"(function(){var f=window.fetch;if(!f)return;" \
+"window.fetch=function(){return f.apply(this,arguments).then(function(r){" \
+"if(r.status==401&&r.headers.get('X-Netmon-Login')){nmlogin();return new Promise(function(){})}" \
+"return r})}})();" \
+"function nmlogin(){location.href='/login?next='+encodeURIComponent(location.pathname+location.search)+location.hash}" \
+"function nmsignout(){var go=function(){location.href='/login'};" \
+"fetch('/api/logout',{method:'POST'}).then(go,go)}" \
+"</script>"
+
+// The one page served without a session. "Remember me" asks the board for a
+// session that lasts 30 days and a cookie that outlives the browser; the
+// browser's own password manager offers to save the password, which the
+// autocomplete names below let it do.
+static const char LOGIN_HTML[] PROGMEM =
+"<!doctype html><html lang=en>"
+NM_HEAD
+"<title>Sign in - Network Monitor</title>"
+R"HTML(<style>
+.in{max-width:23rem;margin:0 auto;padding:2rem 1rem 1.4rem}
+h1{margin:0;font-size:1.3rem;font-weight:600;letter-spacing:-.02em}
+.who{margin:.3rem 0 0;color:var(--mut);font-size:.88rem;overflow-wrap:anywhere}
+.pw{display:flex;gap:.4rem}.pw input{flex:1;min-width:0}.pw button{flex:none}
+label.keep{display:flex;align-items:flex-start;gap:.55rem;margin:1rem 0 1.1rem;
+ font-size:.9rem;color:var(--ink);cursor:pointer}
+.keep input{width:auto;margin:.2rem 0 0;padding:0;flex:none}
+#err{margin:.85rem 0 0;font-size:.88rem;color:var(--bad)}#err:empty{display:none}
+button.primary:disabled{opacity:.6;cursor:default}
+</style>
+<div class=sh>
+<header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a></header>
+<form class=in id=f>
+<h1>Sign in</h1>
+<p class=who id=who>to this network monitor</p>
+<input id=user name=username autocomplete=username value=netmon hidden>
+<label for=pw>Password</label>
+<div class=pw><input id=pw name=password type=password autocomplete=current-password
+ autocapitalize=off spellcheck=false autofocus>
+<button type=button id=peek aria-pressed=false>Show</button></div>
+<label class=keep><input type=checkbox id=keep><span id=keeptext>Remember me on this
+ browser for 30 days</span></label>
+<button class=primary id=go>Sign in</button>
+<p id=err role=alert></p>
+<p class=hint>Your login password, or the board's update password from secrets.h,
+which always works. Unticked, you stay signed in until the browser closes.</p>
+</form>
+</div>
+<script>
+var busy=false,waitT=0,nx='/';
+// Back to the page that sent you here, but only to a page on this board:
+// "//elsewhere" and "/\elsewhere" would leave it, and browsers drop tabs and
+// line breaks from an address before reading it.
+(function(){var m=location.search.match(/[?&]next=([^&#]*)/),v='';
+ if(m)try{v=decodeURIComponent(m[1])}catch(e){}
+ if(/^\/(?![\/\\])[^\\\x00-\x20\x7f]*$/.test(v))nx=v;
+ if(/^\/login\b/.test(nx))nx='/';
+ if(location.hash&&nx.indexOf('#')<0)nx+=location.hash})();
+function say(m){err.textContent=m||''}
+peek.onclick=function(){var s=pw.type=='password';pw.type=s?'text':'password';
+ peek.textContent=s?'Hide':'Show';peek.setAttribute('aria-pressed',s);pw.focus()};
+try{keep.checked=localStorage.getItem('nm.keep')=='1'}catch(e){}
+fetch('/api/auth',{cache:'no-store'}).then(function(r){return r.json()}).then(function(a){
+ if(a.signed_in){location.replace(nx);return}
+ ver.textContent=a.version||'';who.textContent=(a.name||'netmon')+' at '+location.host;
+ if(a.remember_days)keeptext.textContent='Remember me on this browser for '+a.remember_days+' days'})
+ .catch(function(){say('Could not reach the board.')});
+// After too many wrong passwords the board says how long to wait.
+function hold(s){var end=Date.now()+s*1000;go.disabled=true;clearInterval(waitT);
+ function tick(){var l=Math.ceil((end-Date.now())/1000);
+  if(l>0){say('Too many wrong passwords. Try again in '+l+' s.');return}
+  clearInterval(waitT);go.disabled=false;say('')}
+ tick();waitT=setInterval(tick,1000)}
+f.onsubmit=function(e){e.preventDefault();if(busy||go.disabled)return;
+ if(!pw.value){say('Enter the password.');pw.focus();return}
+ busy=true;go.disabled=true;go.textContent='Signing in…';say('');
+ try{localStorage.setItem('nm.keep',keep.checked?'1':'0')}catch(x){}
+ fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({password:pw.value,remember:keep.checked,unix:Math.floor(Date.now()/1000)})})
+ .then(function(r){return r.json().catch(function(){return {}}).then(function(j){return {s:r.status,j:j}})})
+ .then(function(x){busy=false;go.textContent='Sign in';
+  if(x.s==200){location.replace(nx);return}
+  go.disabled=false;
+  if(x.s==429){hold(x.j.retry_s||30);return}
+  say(x.j.error||'The board refused ('+x.s+').');pw.select()})
+ .catch(function(){busy=false;go.disabled=false;go.textContent='Sign in';
+  say('Could not reach the board.')})};
+</script>
+)HTML";
 
 static const char DASHBOARD_HTML[] PROGMEM =
-"<!doctype html><title>Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Network Monitor</title>"
 R"HTML(<style>
 .top{padding:1.05rem 1rem .9rem}
 .count{margin:0;font-size:1.35rem;font-weight:600;letter-spacing:-.02em;
@@ -82,6 +174,11 @@ R"HTML(<style>
 .find input{width:100%;padding:.55rem .7rem;border:1px solid var(--edge);
  border-radius:9px;background:var(--panel)}
 .hits{margin:.45rem 0 0;font-size:.8rem;color:var(--mut)}
+.count small{font-size:.9rem;font-weight:500;color:var(--mut);letter-spacing:0}
+td.up .ago{color:var(--mut)}
+td .gen{color:var(--mut)}
+.tag.same{color:var(--warn)}
+th:focus-visible{outline-offset:-2px}
 .wrap{overflow-x:auto;border-top:1px solid var(--edge)}
 table{border-collapse:collapse;table-layout:fixed;font-size:.84rem}
 @media(max-width:640px){table{font-size:.78rem}}
@@ -108,6 +205,34 @@ tr.off{opacity:.55}
 tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
 .tag{font-size:.72rem;color:var(--mut);margin-left:.35rem}
 .none{padding:1.6rem 1rem;color:var(--mut)}
+.verdict a{color:inherit}
+tbody tr{cursor:pointer}
+tbody tr.sel td{background:var(--tint)}
+.act{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .6rem;
+ margin:0 1rem .85rem;padding:.6rem .7rem;border:1px solid var(--edge);border-radius:9px}
+.act .who{flex:1 1 12rem;min-width:0;font-size:.88rem}
+.act .who b{font-weight:600;overflow-wrap:anywhere}
+.act .who span{display:block;font-family:var(--mono);font-size:.76rem;color:var(--mut);
+ overflow-wrap:anywhere}
+.act button{padding:.35rem .75rem;font-size:.84rem}
+.act button.go{border-color:var(--ok);color:var(--ok);font-weight:600}
+.act button.arm{border-color:var(--bad);color:var(--bad)}
+.act button:disabled{opacity:.5;cursor:default}
+.act p{flex-basis:100%;margin:0;font-size:.78rem;color:var(--mut)}
+.act p.err{color:var(--bad)}
+.act p.ok{color:var(--ok)}
+/* Narrow: the name and the close button on one line, the actions under. */
+@media(max-width:520px){.act .who{order:1;flex-basis:calc(100% - 3.4rem)}
+ .act #aclose{order:2}.act #atrust{order:3}.act #aforget{order:4}
+ .act #ascan{order:5}.act p{order:6}.act #aports{order:7}}
+/* Port scan results */
+#aports{flex-basis:100%;margin:0}
+#aports .ps-bar{height:3px;border-radius:2px;background:var(--edge);margin:.35rem 0 .5rem;overflow:hidden}
+#aports .ps-fill{height:100%;border-radius:2px;background:var(--ok);transition:width .3s}
+#aports .ps-list{display:flex;flex-wrap:wrap;gap:.3rem .5rem;font-size:.78rem}
+#aports .ps-port{padding:.18rem .5rem;border-radius:5px;background:var(--tint);
+ font-family:var(--mono);color:var(--ok);font-weight:600}
+#aports .ps-none{font-size:.78rem;color:var(--mut)}
 </style>
 <div class=sh>
 <header><a class=brand href="/">
@@ -125,10 +250,19 @@ tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
   placeholder="Search address, vendor or MAC">
  <p class=hits id=hits></p>
 </div>
+<div class=act id=act hidden role=region aria-label="Selected device">
+ <div class=who><b id=aname></b><span id=aaddr></span></div>
+ <button type=button class=go id=atrust>Trust</button>
+ <button type=button id=aforget>Forget</button>
+ <button type=button id=ascan>Scan ports</button>
+ <button type=button id=aclose aria-label="Close">&#x2715;</button>
+ <p id=amsg aria-live=polite></p>
+ <div id=aports hidden></div>
+</div>
 <div class=wrap id=wrap><table id=tbl><colgroup id=cg></colgroup>
 <thead><tr id=hrow></tr></thead><tbody id=rows></tbody></table></div>
 <p class=none id=none hidden></p>
-<p class=foot><a href="/events">Event history</a> · <a href="/api/health">Health data</a></p>
+<p class=foot><a href="/events">Event history</a> · <a href="/api/health">Health data</a> · <a href="/login" onclick="nmsignout();return false">Sign out</a></p>
 </div>
 <script>
 // Floors are measured from the widest real value each column has to hold:
@@ -137,12 +271,12 @@ tr.off td.st{box-shadow:inset 3px 0 var(--mut)}
 // container rather than shrinking values into ellipses.
 var all=[],cols=[{k:'status',t:'State',f:.13,m:84},{k:'ip',t:'IP',f:.19,m:140},
  {k:'mac',t:'MAC',f:.17,m:116},{k:'hostname',t:'Hostname',f:.24,m:150},
- {k:'vendor',t:'Vendor',f:.20,m:150},{k:'up',t:'Uptime',f:.10,m:74}];
+ {k:'vendor',t:'Vendor',f:.20,m:150},{k:'up',t:'Uptime',f:.10,m:84}];
 var sortk='ip',sortd=1;
 function put(k,v){try{localStorage.setItem('nm.'+k,v)}catch(e){}}
 function get(k){try{return localStorage.getItem('nm.'+k)}catch(e){return null}}
 function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;')
- .replace(/"/g,'&quot;')}
+ .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function age(s){if(s<60)return s+'s';if(s<3600)return((s/60)|0)+'m';
  if(s<86400)return((s/3600)|0)+'h';return((s/86400)|0)+'d'}
 function dur(s){if(!s)return '';if(s<60)return s+'s';
@@ -156,17 +290,29 @@ function shortv(v){if(!v)return '';
   /\b(corporation|corp|company|technologies|technology|electronics|international|holdings|limited|ltd|inc|co|llc|gmbh|plc|pte|bv|nv|srl|spa)\b\.?/gi,' ')
   .replace(/\s+/g,' ').replace(/^[\s.]+|[\s.]+$/g,'');
  return x||v}
+// Names a module's network stack hands out when nobody set one. They say
+// nothing about the device, so the vendor stands in for them (0.16).
+var GENERIC=/^(lwip|espressif|esp32|esp-?32|arduino|localhost|unknown|android-?[0-9a-f]*)$/i;
+function nm(x){return x.hostname&&!GENERIC.test(x.hostname)?x.hostname:''}
+// Another row with the same real name: a phone that rotates its address
+// shows up once per address. Map of name -> rows, rebuilt on every load.
+var byname={};
+function twins(x){var n=nm(x);if(!n)return [];
+ return (byname[n.toLowerCase()]||[]).filter(function(y){return y.mac!=x.mac})}
 function vendor(x){return x.vendor?shortv(x.vendor)
  :x.randomised?'randomised address':'not in registry'}
 function ipnum(s){var p=String(s||'').split('.');
  return p.length==4?(+p[0])*16777216+(+p[1])*65536+(+p[2])*256+(+p[3]):0}
 var rank={unknown:0,private:1,known:2};
+// Up devices by how long they have been up; offline ones below them, the
+// most recently seen first.
+function upk(x){return x.online?(x.up_s||0):-1-(x.last_seen_s||0)}
 function cmp(a,b){var r;
  if(sortk=='ip')r=ipnum(a.ip)-ipnum(b.ip);
- else if(sortk=='up')r=(a.up_s||0)-(b.up_s||0);
+ else if(sortk=='up')r=upk(a)-upk(b);
  else if(sortk=='status')r=(rank[a.status]-rank[b.status])||
   (ipnum(a.ip)-ipnum(b.ip));
- else if(sortk=='hostname'){var av=a.hostname||'',bv=b.hostname||'';
+ else if(sortk=='hostname'){var av=nm(a),bv=nm(b);
   r=av.toLowerCase()<bv.toLowerCase()?-1:av.toLowerCase()>bv.toLowerCase()?1:0}
  else if(sortk=='vendor'){var av=vendor(a),bv=vendor(b);
   r=av.toLowerCase()<bv.toLowerCase()?-1:av.toLowerCase()>bv.toLowerCase()?1:0}
@@ -188,9 +334,12 @@ function head(){
   var th=document.createElement('th');
   th.innerHTML=c.t+(sortk==c.k?'<span class=ar>'+(sortd>0?'▲':'▼')
    +'</span>':'');
-  th.title='Sort by '+c.t.toLowerCase();
+  th.title='Sort by '+c.t.toLowerCase();th.tabIndex=0;th.scope='col';
+  th.setAttribute('aria-sort',sortk==c.k?(sortd>0?'ascending':'descending'):'none');
   th.onclick=function(){sortd=(sortk==c.k)?-sortd:1;sortk=c.k;
-   put('s',c.k);put('d',sortd);head();render()};
+   put('s',c.k);put('d',sortd);head();render();
+   var n=hrow.children[i];if(n)n.focus()};
+  th.onkeydown=function(e){if(e.key=='Enter'||e.key==' '){e.preventDefault();th.onclick()}};
   var h=document.createElement('span');h.className='rz';
   h.onclick=function(e){e.stopPropagation()};
   h.addEventListener('pointerdown',function(e){
@@ -214,60 +363,189 @@ function render(){
  if(!show.length){none.textContent=f?'No device matches '+q.value+'.'
   :'No devices found yet. The first sweep runs a minute after start-up.';
   return}
- rows.innerHTML=show.slice().sort(cmp).map(function(x){
-  return '<tr class="'+x.status+(x.self?' self':'')+(x.online?'':' off')+'">'
+ // A refresh rebuilds every row. Note which one had the keyboard so it can
+ // have it back, and leave the table alone while someone is selecting text
+ // in it, so copying a MAC is not cut off by the next poll (0.16).
+ var fm=document.activeElement&&document.activeElement.getAttribute
+  &&document.activeElement.getAttribute('data-m');
+ var sl=window.getSelection&&getSelection();
+ if(sl&&!sl.isCollapsed&&rows.contains(sl.anchorNode))return;
+ rows.innerHTML=show.slice().sort(cmp).map(function(x){var hn=nm(x),tw=twins(x);
+  return '<tr tabindex=0 data-m="'+esc(x.mac)+'" class="'+x.status+(x.self?' self':'')
+   +(x.online?'':' off')+(x.mac==sel?' sel':'')+'">'
    +'<td class=st>'+x.status+'</td>'
    +'<td class=ip>'+esc(x.ip||'')
    +(x.self?'<span class=tag>this</span>':'')+'</td>'
    +'<td class=mac title="'+esc(x.mac)+'">'+esc(x.mac.replace(/:/g,''))+'</td>'
-   +'<td title="'+esc(x.hostname||'')+'">'+esc(x.hostname||'—')+'</td>'
+   +'<td title="'+esc(x.hostname||'')+(tw.length?' \u00b7 same name as '+tw.length
+    +' other row'+(tw.length>1?'s':''):'')+'">'
+   +(hn?esc(hn):x.hostname?'<span class=gen>'+esc(x.hostname)+'</span>':'—')
+   +(tw.length?'<span class="tag same">\u00d7'+(tw.length+1)+'</span>':'')+'</td>'
    +'<td title="'+esc(x.vendor||'')+'">'+esc(vendor(x))+'</td>'
-   +'<td class=up title="last seen '+age(x.last_seen_s)+' ago">'
-   +(x.online?dur(x.up_s):'—')+'</td></tr>'}).join('')}
+   +'<td class=up title="'+(x.online?'up '+dur(x.up_s)+' \u00b7 ':'')
+    +'first seen '+dur(x.first_seen_s||0)+' ago \u00b7 last seen '+age(x.last_seen_s)+' ago">'
+   +(x.online?dur(x.up_s)||'0s':'<span class=ago>'+age(x.last_seen_s)+' ago</span>')
+   +'</td></tr>'}).join('');
+ if(fm){var r=rows.querySelector('tr[data-m="'+fm+'"]');if(r)r.focus()}}
+// The board has no clock of its own; it dates saved reports by the first one
+// it is given (firmware 0.12).
+var clockSent=false;
+function sendclock(){if(clockSent)return;clockSent=true;
+ fetch('/api/clock',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({unix:Math.floor(Date.now()/1000)})}).catch(function(){})}
 function load(){
  fetch('/api/health').then(function(r){return r.json()}).then(function(h){
   ver.textContent=h.version;
-  count.textContent=h.devices+(h.devices==1?' device on ':' devices on ')+h.subnet;
-  log.textContent=(h.last_pass_ms
-   ?'Swept in '+(h.last_pass_ms/1000).toFixed(1)+'s, reached '+h.pass_seen+'. '
+  if(h.clock===false)sendclock();
+  // "online" is from 0.16; older boards only say how many rows they keep.
+  var on=h.online!=null?h.online:h.devices;
+  count.innerHTML=esc(on+(h.online!=null?' online':(on==1?' device':' devices')))
+   +' <small>'+esc((h.online!=null?'of '+h.devices+' seen · ':'')+h.subnet)+'</small>';
+  log.textContent='Monitor up '+(dur(h.uptime_s)||'0s')+'. '
+   +(h.last_pass_ms
+   ?'Swept in '+(h.last_pass_ms/1000).toFixed(1)+'s, reached '+h.pass_seen
+    +(h.pass_recovered?' ('+h.pass_recovered+' on a second try)':'')+'. '
    :'First sweep has not finished yet. ')
    +'Signal '+h.rssi+' dBm.'
    +(h.latency_valid?' · Gateway '+h.latency_ms+' ms':'');
   if(!h.sweepable){verdict.className='verdict idle';
    verdict.textContent='Not scanning. No usable subnet, so the board is in setup mode.';
    return}
-  return fetch('/api/devices').then(function(r){return r.json()})
-   .then(function(d){all=d;
-    var u=d.filter(function(x){return x.status=='unknown'}).length;
-    if(u){verdict.className='verdict flag';
-     verdict.textContent=u==1?'1 device is not recognised.'
-      :u+' devices are not recognised.'}
+  return Promise.all([fetch('/api/devices').then(function(r){return r.json()}),
+   h.alerts?fetch('/api/guard').then(function(r){return r.json()})
+    .catch(function(){return null}):null])
+   .then(function(res){var d=res[0],g=res[1];all=d;byname={};
+    d.forEach(function(x){var n=nm(x).toLowerCase();if(n)(byname[n]=byname[n]||[]).push(x)});
+    var uu=d.filter(function(x){return x.status=='unknown'}),u=uu.length;
+    var uon=uu.filter(function(x){return x.online}).length;
+    var un=u?(u==1?'1 device is not recognised':u+' devices are not recognised')
+     +(uon<u?' ('+(uon?uon+' online now':'none online now')+').':'.'):'';
+    var al=g&&g.alerts?g.alerts.slice().sort(function(a,b){return a.age_s-b.age_s}):[];
+    if(al.length){verdict.className='verdict flag';
+     verdict.innerHTML=esc((ALERT[al[0].type]||'The network changed.')
+      +(al.length>1?' And '+(al.length-1)+' more.':'')+(un?' '+un:''))
+      +' <a href="/events">Review</a>'}
+    else if(u){verdict.className='verdict flag';
+     verdict.textContent=un+' Pick '+(u==1?'it':'one')+' in the list to trust or forget it.'}
     else{verdict.className='verdict clear';
      verdict.textContent=h.baseline_open
       ?'Still learning. Everything seen so far counts as known for '
        +Math.max(1,Math.round(h.baseline_closes_in_s/60))+' more minutes.'
       :'Everything here is recognised.'}
-    render()})})
+    render();showact()})})
  .catch(function(){verdict.className='verdict flag';
   verdict.textContent='Cannot reach the monitor.'})}
+// What each LAN watch alert means, for the line at the top. Events has more.
+var ALERT={router_changed:'The router\u2019s address answers from a different device.',
+ ip_conflict:'Two devices are answering for one address.',
+ dhcp_server:'An unexpected DHCP server is handing out addresses.',
+ rogue_ap:'An unknown access point is using your Wi-Fi name.',
+ weak_ap:'One of your access points offers weaker security than before.'};
+// A row picked in the table: who it is, and Trust or Forget. Trust keeps an
+// unknown device known on this network after restarts; Forget takes a device
+// off the list, so it is flagged if it turns up again. Forget takes two taps.
+var sel=null,busy=false,armT=0;
+function pick(m){sel=sel==m?null:m;disarm();amsg.textContent='';amsg.className='';
+ scanReset();render();showact();if(sel)act.scrollIntoView({block:'nearest'})}
+function cur(){for(var i=0;i<all.length;i++)if(all[i].mac==sel)return all[i];return null}
+function showact(){var x=sel&&cur();act.hidden=!x;if(!x)return;
+ aname.textContent=nm(x)||(x.vendor?shortv(x.vendor)+' device'
+  :x.randomised?'Device with a private address':'Unnamed device');
+ var tw=twins(x);
+ aaddr.textContent=(x.ip?x.ip+' \u00b7 ':'')+x.mac;
+ atrust.hidden=x.self||x.status!='unknown';aforget.hidden=x.self;
+ ascan.hidden=x.self||!x.ip;
+ if(amsg.className!='err'&&amsg.className!='ok')amsg.textContent=(x.self?'This is the monitor itself.'
+  :x.status=='unknown'?'Not recognised. Trust it if it is yours: it stays known after restarts.'
+  :x.status=='private'?'A private address, which is never flagged. Forget takes it off the list.'
+  :'Recognised on this network. Forget it to have it flagged if it turns up again.')
+  +(tw.length&&!x.self?' Same name as '+tw.map(function(y){return y.ip||y.mac}).join(', ')
+   +': probably one device using more than one address.':'')
+  +(x.online?' Up '+(dur(x.up_s)||'0s')+'.':' Last seen '+age(x.last_seen_s)+' ago.')
+  +(x.first_seen_s?' First seen '+dur(x.first_seen_s)+' ago.':'')}
+function disarm(){clearTimeout(armT);aforget.textContent='Forget';aforget.className=''}
+function post(path,done){var m=sel;busy=true;atrust.disabled=aforget.disabled=true;
+ fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({mac:m})})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){busy=false;atrust.disabled=aforget.disabled=false;
+  if(!res.ok){amsg.textContent=res.j.error||'The board refused that.';amsg.className='err';return}
+  done();load()})
+ .catch(function(){busy=false;atrust.disabled=aforget.disabled=false;
+  amsg.textContent='Could not reach the monitor.';amsg.className='err'})}
+atrust.onclick=function(){if(busy||!sel)return;amsg.className='';
+ amsg.textContent='Marking it as known\u2026';
+ post('/api/devices/trust',function(){amsg.textContent='Marked as known.';amsg.className='ok'})};
+aforget.onclick=function(){if(busy||!sel)return;
+ if(aforget.className!='arm'){aforget.textContent='Confirm';aforget.className='arm';
+  armT=setTimeout(disarm,4000);return}
+ disarm();post('/api/devices/forget',function(){sel=null;act.hidden=true})};
+aclose.onclick=function(){pick(sel)};
+// Port scanner: starts a TCP probe of the selected device's common ports.
+var scanIp=null,scanT=0;
+function scanReset(){clearInterval(scanT);scanT=0;scanIp=null;
+ aports.hidden=true;aports.innerHTML='';ascan.disabled=false;ascan.textContent='Scan ports'}
+function scanRender(d){
+ var pct=d.total>0?Math.round(d.probed/d.total*100):0;
+ var html='<div class=ps-bar><div class=ps-fill style="width:'+pct+'%"></div></div>';
+ if(d.state=='done'){
+  clearInterval(scanT);scanT=0;ascan.disabled=false;ascan.textContent='Scan ports';
+  if(d.open&&d.open.length){
+   html+='<div class=ps-list>';
+   for(var i=0;i<d.open.length;i++)
+    html+='<span class=ps-port>'+(+d.open[i].port)+' <span style="font-family:inherit;font-weight:400;color:var(--mut)">'+esc(d.open[i].name||'')+'</span></span>';
+   html+='</div>'}
+  else html+='<p class=ps-none>No open ports found.</p>'}
+ else if(d.state=='scanning')
+  html+='<p class=ps-none>Scanning… '+d.probed+' / '+d.total+'</p>';
+ aports.innerHTML=html;aports.hidden=false}
+function scanPoll(){
+ if(!scanIp)return;
+ fetch('/api/portscan?ip='+encodeURIComponent(scanIp))
+ .then(function(r){return r.json()})
+ .then(function(d){if(d.state=='idle'&&scanIp){scanReset();return}scanRender(d)})
+ .catch(function(){});}
+ascan.onclick=function(){
+ if(!sel)return;var x=cur();if(!x||!x.ip)return;
+ scanReset();scanIp=x.ip;ascan.disabled=true;ascan.textContent='Scanning…';
+ aports.innerHTML='<div class=ps-bar><div class=ps-fill style="width:0%"></div></div><p class=ps-none>Starting…</p>';
+ aports.hidden=false;
+ fetch('/api/portscan',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({ip:x.ip})})
+ .then(function(r){return r.json()})
+ .then(function(d){if(d.status=='started'){scanT=setInterval(scanPoll,800)}
+  else{scanReset();amsg.textContent=d.error||'Scan failed.';amsg.className='err'}})
+ .catch(function(){scanReset();amsg.textContent='Could not reach the monitor.';amsg.className='err'})};
+rows.onclick=function(e){var t=e.target.closest&&e.target.closest('tr[data-m]');
+ if(t)pick(t.getAttribute('data-m'))};
+rows.onkeydown=function(e){if(e.key!='Enter'&&e.key!=' ')return;
+ var t=e.target.closest&&e.target.closest('tr[data-m]');
+ if(t){e.preventDefault();pick(t.getAttribute('data-m'))}};
 sortk=get('s')||'ip';sortd=+get('d')||1;
 initWidths();head();
 q.addEventListener('input',render);
 // /?q=192.168.2.45 opens with that search, as the Map page links to it.
 var qq=location.search.match(/[?&]q=([^&]*)/);
 if(qq)try{q.value=decodeURIComponent(qq[1].replace(/\+/g,' '))}catch(e){}
-load();setInterval(load,15000);
+// Every 15s while the page is in view. A tab left in the background used to
+// keep pulling the whole list from the board; now it waits, and catches up
+// the moment it is looked at again (0.16).
+load();setInterval(function(){if(!document.hidden)load()},15000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)load()});
 </script>
 )HTML";
 
 static const char SETTINGS_HTML[] PROGMEM =
-"<!doctype html><title>Settings - Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Settings - Network Monitor</title>"
 R"HTML(<style>
-#msg,#fwmsg,#netmsg{margin:.75rem 0 0;font-size:.85rem;min-height:1.2em}
-#msg.err,#fwmsg.err,#netmsg.err{color:var(--bad)}
-#msg.ok,#fwmsg.ok{color:var(--ok)}
-#netmsg:empty{display:none}
+#msg,#fwmsg,#netmsg,#basemsg{margin:.75rem 0 0;font-size:.85rem;min-height:1.2em}
+#msg.err,#fwmsg.err,#netmsg.err,#basemsg.err{color:var(--bad)}
+#msg.ok,#fwmsg.ok,#basemsg.ok{color:var(--ok)}
+#netmsg:empty,#basemsg:empty{display:none}
+#relearn{margin-top:.75rem}
+#relearn.arm{border-color:var(--bad);color:var(--bad)}
 button:disabled{opacity:.5;cursor:default}
 .nets{width:100%;border-collapse:collapse;margin:.8rem 0 0;font-size:.85rem}
 .nets th{text-align:left;font-weight:500;font-size:.76rem;color:var(--mut);
@@ -289,6 +567,25 @@ button:disabled{opacity:.5;cursor:default}
 input[type=file]{padding:.4rem}
 input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.7rem;
  padding:.3rem .7rem;border:1px solid var(--edge);border-radius:7px;background:var(--bg)}
+.btrow{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.9rem}
+.btrow button.arm{border-color:var(--bad);color:var(--bad)}
+#btcode{margin:.9rem 0 0;padding:.7rem .9rem;border:1px solid var(--edge);border-radius:12px;
+ background:var(--tint)}
+#btcode b{display:block;font:600 2rem/1.15 var(--mono);letter-spacing:.14em;
+ font-variant-numeric:tabular-nums}
+#btmsg{margin:.75rem 0 0;font-size:.85rem}#btmsg:empty{display:none}
+#btmsg.err{color:var(--bad)}#btmsg.ok{color:var(--ok)}
+#reprows td{vertical-align:top}#reprows .acts{display:flex;flex-wrap:wrap;gap:.35rem;justify-content:flex-end}
+@media(min-width:560px){#reprows .acts{flex-wrap:nowrap}}
+#reprows a.dl{font-size:.8rem;padding:.28rem .6rem;border:1px solid var(--edge);border-radius:9px;
+ text-decoration:none;background:var(--bg);color:inherit;white-space:nowrap}
+#repmsg{margin:.75rem 0 0;font-size:.85rem}#repmsg:empty{display:none}
+#repmsg.err{color:var(--bad)}#repmsg.ok{color:var(--ok)}
+#btcodemsg,#authmsg{margin:.75rem 0 0;font-size:.85rem}#btcodemsg:empty,#authmsg:empty{display:none}
+#btcodemsg.err,#authmsg.err{color:var(--bad)}#btcodemsg.ok,#authmsg.ok{color:var(--ok)}
+#btcodemsg.warn{color:var(--warn)}
+#btown{max-width:10rem;font:600 1.1rem var(--mono);letter-spacing:.14em}
+#macin{font-family:var(--mono)}
 </style>
 <div class=sh>
 <header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a><nav><a href="/">Devices</a><a href="/map">Map</a><a href="/nearby">Nearby</a><a href="/events">Events</a><a href="/isp">Internet</a>
@@ -331,11 +628,29 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  </div>
  <p class=hint id=acthead>In use right now</p>
  <dl id=act></dl>
+ <div id=macbox hidden>
+  <label for=macin>MAC address on Wi-Fi</label>
+  <input id=macin autocomplete=off spellcheck=false autocapitalize=characters oninput=machint()>
+  <div class=btrow><button type=button onclick=macrand()>Random address</button>
+  <button type=button onclick=macown()>The chip's own</button></div>
+  <p class=hint id=machelp></p>
+  <p class=hint>A new address is taken at the restart after saving. The router
+  then sees a new device and may give the board a new IP address: if this page
+  does not come back, find netmon in the router's list of devices, or try
+  http://netmon.local. The Bluetooth address stays the same, so paired phones
+  stay paired.</p>
+ </div>
 </section>
 <section>
  <h2>DHCP information</h2>
  <dl id=dhcp><dt>Status</dt><dd>Waiting for DHCP traffic…</dd></dl>
  <p class=hint>Learned from the DHCP requests devices broadcast when they join the network, which is also where hostnames come from. A device that stays connected shows up here only after it reconnects or restarts. Names are remembered across restarts.</p>
+</section>
+<section>
+ <h2>Recognised devices</h2>
+ <p class=hint id=basenote>Checking</p>
+ <button type=button id=relearn>Learn this network again</button>
+ <p id=basemsg></p>
 </section>
 <section>
  <h2>Advanced monitoring</h2>
@@ -355,6 +670,66 @@ input[type=file]::file-selector-button{font:inherit;color:inherit;margin-right:.
  <p class=hint>Saving reconnects the board. If it cannot rejoin, it opens a
  setup network called netmon-setup at 192.168.4.1, and goes back to trying its
  saved networks whenever nobody has been joined to that for three minutes.</p>
+</section>
+<section>
+ <h2>Bluetooth</h2>
+ <p class=hint>A phone paired with this board can use the netmon app over
+ Bluetooth, out of reach of this Wi-Fi: while you walk with the Finder, say, or
+ when the board is in setup mode. Each phone pairs once, with a code shown here.</p>
+ <dl id=btinfo><dt>Link</dt><dd>Reading&hellip;</dd></dl>
+ <div id=btcode hidden aria-live=polite><b id=btdigits></b>
+ <p class=hint id=btsteps></p></div>
+ <div class=btrow><button type=button id=btpair onclick=btpairing()>Pair a phone</button>
+ <button type=button id=btonoff onclick=btswitch()>Switch off</button>
+ <button type=button id=btforget onclick=btforgetall()>Forget paired phones</button></div>
+ <p id=btmsg></p>
+ <div id=btcodebox hidden>
+  <label for=btmode>Pairing code</label>
+  <select id=btmode onchange=btmodeset()>
+   <option value=random>A new random code for each pairing</option>
+   <option value=own>My own code, the same every time</option>
+  </select>
+  <div id=btownbox hidden><label for=btown>Your code: six digits</label>
+  <input id=btown inputmode=numeric autocomplete=off maxlength=6 placeholder="000000" oninput="btedit=true"></div>
+  <p class=hint>Whichever you choose, a phone can pair only while a pairing
+  window is open, and three wrong codes close it. Your own code is easier to
+  enter on a phone that cannot see this page; keep it to yourself, and avoid
+  ones like 000000 or 123456.</p>
+  <div class=btrow><button type=button id=btcodebtn onclick=btcodesave()>Save pairing code</button></div>
+  <p id=btcodemsg></p>
+ </div>
+</section>
+<section>
+ <h2>Saved reports</h2>
+ <p class=hint>For each network this board has been on, up to four, the device
+ list as it last stood: saved every 15 minutes, before every restart, and when
+ you ask. Devices not seen since the board last started are kept from the
+ report before. Download one as JSON or as CSV for a spreadsheet.</p>
+ <table class=nets id=reptbl hidden><thead><tr><th>Network</th><th>Devices</th>
+ <th>Saved</th><th aria-label="Action"></th></tr></thead><tbody id=reprows></tbody></table>
+ <p class=hint id=repnote>Reading&hellip;</p>
+ <div class=btrow><button type=button id=repsave onclick=repsavenow()>Save this network now</button></div>
+ <p id=repmsg></p>
+</section>
+<section>
+ <h2>Signing in</h2>
+ <p class=hint>These pages and the netmon app ask for a password: your own
+ login password once you set one here, and always the update password from
+ secrets.h, as the way back in if you forget yours.</p>
+ <dl id=authinfo><dt>This browser</dt><dd>Reading&hellip;</dd></dl>
+ <div class=btrow><button type=button onclick=nmsignout()>Sign out</button>
+ <button type=button id=soall onclick=signoutall()>Sign out everywhere</button></div>
+ <label for=pwcur>Current password</label>
+ <input id=pwcur type=password autocomplete=current-password>
+ <label for=pwnew>New login password</label>
+ <input id=pwnew type=password autocomplete=new-password>
+ <label for=pwnew2>New login password again</label>
+ <input id=pwnew2 type=password autocomplete=new-password>
+ <p class=hint>8 to 64 characters. Every other browser and phone signed in is
+ signed out, so they sign in again with the new one.</p>
+ <div class=btrow><button type=button id=pwbtn onclick=setpw()>Set login password</button>
+ <button type=button id=pwdel onclick=delpw() hidden>Remove it</button></div>
+ <p id=authmsg></p>
 </section>
 <section>
  <h2>Firmware update</h2>
@@ -418,8 +793,39 @@ function loadcfg(){fetch('/api/config').then(function(r){return r.json()})
     +'automatic unless you know the new network uses fixed addresses — a '
     +'fixed address from somewhere else will leave the board unreachable. '
     +'Left alone for three minutes, it restarts and tries its saved networks again.'}
-  showactive(c.active)})
+  showactive(c.active);macshow(c.mac)})
  .catch(function(){show('Could not read the current settings.')})}
+// The board's own Wi-Fi address (0.13): the chip's, or one the owner sets.
+// Empty or the chip's own both mean the chip's own.
+var macnow=null;
+function macnorm(v){var h=v.trim().replace(/[:.\-]/g,'');
+ return /^[0-9a-f]{12}$/i.test(h)?h.toUpperCase().match(/../g).join(':'):''}
+function macshow(m){macnow=m||null;macbox.hidden=!m;if(!m)return;
+ macin.value=m.custom||m.factory;machint()}
+function machint(){var m=macnow;if(!m)return;
+ var v=macin.value.trim()?macnorm(macin.value):m.factory,saved=m.custom||m.factory;
+ machelp.textContent=!v?'Six pairs of hex digits, like 02:1A:2B:3C:4D:5E. Empty means the chip\'s own.'
+  :v!=saved?'Not saved yet: the board takes '+v+' when you save and it restarts.'
+  :m.custom&&m.active==m.custom?'Your own address, in use now. The chip\'s own is '+m.factory+'.'
+  :m.custom?'Saved, and taken at the next restart. In use now: '+m.active+'.'
+  :'The chip\'s own address. Enter another, or make a random one, and the router sees this board as a new device.'}
+function macrand(){var b=new Uint8Array(6),i;
+ try{crypto.getRandomValues(b)}catch(e){for(i=0;i<6;i++)b[i]=Math.random()*256|0}
+ // Locally administered (bit 1 set) and for one device (bit 0 clear), so it
+ // cannot be any manufacturer's.
+ b[0]=b[0]&0xFC|2;
+ macin.value=[].map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join(':').toUpperCase();
+ machint()}
+function macown(){if(macnow){macin.value=macnow.factory;machint()}}
+// What save() sends to /api/mac: null for no change, '' for the chip's own,
+// or the new address; a string starting with '!' is what is wrong with it.
+function macwant(){var m=macnow;if(!m)return null;
+ var t=macin.value.trim(),v=t?macnorm(t):m.factory;
+ if(!v)return '!Enter a MAC address like 02:1A:2B:3C:4D:5E, or leave it empty for the chip\'s own.';
+ if(parseInt(v.slice(0,2),16)&1)return '!That is a group (multicast) address; the first pair of digits must be even.';
+ if(v=='00:00:00:00:00:00')return '!00:00:00:00:00:00 is not a usable address.';
+ if(v==(m.custom||m.factory))return null;
+ return v==m.factory?'':v}
 function doscan(){show('Scanning');
  fetch('/api/scan').then(function(r){return r.json()}).then(function(n){
   ssidsel.innerHTML='';
@@ -429,7 +835,9 @@ function doscan(){show('Scanning');
   if(n.length){ssid.value=n[0].ssid}
   show(n.length?n.length+' networks in range':'No networks found',n.length>0)})
  .catch(function(){show('Wi-Fi scan failed or is busy. DHCP capture is paused during the scan; try again in a few seconds.')})}
-function save(){show('Saving');
+function save(){var mac=macwant();
+ if(mac&&mac.charAt(0)=='!'){show(mac.slice(1));macin.focus();return}
+ show('Saving');
  fetch('/api/config',{method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({ssid:ssid.value,pass:pass.value,
@@ -439,7 +847,16 @@ function save(){show('Saving');
  .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
  .then(function(res){
   if(!res.ok){show(res.j.error);return}
-  show('Saved. Restarting now.',true);
+  if(mac===null)return res;
+  // The address goes second: a setting the board refused leaves it as it was.
+  return fetch('/api/mac',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({mac:mac})})
+  .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})})
+ .then(function(res){
+  if(!res)return;
+  if(!res.ok){show(res.j.error);return}
+  show(mac===null?'Saved. Restarting now.':'Saved. Restarting now with '
+   +(mac||'the chip\'s own address')+'. If this page does not come back within a minute, the board has a new IP address.',true);
   fetch('/api/reboot',{method:'POST'})})
  .catch(function(){show('Could not save. The board may have restarted already.')})}
 var nets=[],armed=null,armT=0;
@@ -541,6 +958,8 @@ function sendfw(key){var x=new XMLHttpRequest(),fd=new FormData(),t0=Date.now();
  x.onload=function(){var j={};try{j=JSON.parse(x.responseText)}catch(e){}
   if(x.status==200){fwfill.style.width='100%';
    fwsay('Installed. The board is restarting\u2026','ok');waitback(t0);return}
+  // Signed out meanwhile: XMLHttpRequest goes past the fetch() wrapper.
+  if(x.status==401&&x.getResponseHeader('X-Netmon-Login')){nmlogin();return}
   busy=false;fwbtn.disabled=false;fwbar.hidden=true;
   fwsay(x.status==401?'Wrong update password.':(j.error||'The board rejected the file.'),'err')};
  x.onerror=function(){
@@ -568,14 +987,227 @@ function waitback(t0){setTimeout(function poll(){
     fwsay('No answer from the board after two and a half minutes. If it does not '
      +'come back, reflash it over USB.','err');return}
    setTimeout(poll,2000)})},4000)}
-loadcfg();loadnets();loaddhcp();
+// Bluetooth. Polled every two seconds while a pairing window is open, so the
+// countdown runs and "paired" shows as soon as the phone is done.
+var bt=null,btT=0,btarm=null,btarmT=0,btauto=false,btedit=false;
+function btsay(m,c){btmsg.textContent=m;btmsg.className=c||'';btauto=false}
+function mmss(s){return Math.floor(s/60)+':'+('0'+s%60).slice(-2)}
+// How the last pairing attempt went. From 0.13 the board says why one failed:
+// a wrong code, the phone giving up, the connection dropping.
+function btlast(l){return l.text.replace(/\.$/,'')+' \u00b7 '+agetext(l.age_s)
+ +(l.status?' \u00b7 code 0x'+(l.status>>>0).toString(16):'')}
+function btshow(b){bt=b;
+ var state=!b.available?'Not running: Bluetooth could not start on this board'
+  :!b.enabled?'Off':'On, advertising as '+b.name;
+ btinfo.innerHTML=row('Link',state)+row('Address',b.addr||'-')
+  +row('Paired phones',b.bonds+' of '+b.max_bonds)
+  +row('Connected now',b.connected?b.connected+(b.secure<b.connected?' ('+b.secure+' paired)':''):'none')
+  +(b.own_code==null?'':row('Pairing code',b.own_code?'Your own':'New random code each time'))
+  +(b.last?row('Last attempt',btlast(b.last)):'');
+ btonoff.textContent=b.enabled?'Switch off':'Switch on';
+ btpair.disabled=!b.available||!b.enabled;
+ btpair.textContent=b.pairing?'Cancel pairing':'Pair a phone';
+ btcode.hidden=!b.pairing;
+ var m='',c='';
+ if(b.pairing){btdigits.textContent=b.code.slice(0,3)+' '+b.code.slice(3);
+  btsteps.textContent='In the netmon app, tap this board under Bluetooth when finding a monitor, '
+   +'or Pair this phone in Settings, Bluetooth, and enter this code when the app asks for it. '
+   +'It works for one phone, for the next '+mmss(b.left_s)+'.'
+   +(b.tries_left!=null&&b.tries_left<3?' '+b.tries_left+(b.tries_left==1?' try':' tries')+' left.':'');
+  if(b.result=='failed'){m='That try did not pair: '+(b.why_text||'pairing failed.')
+   +' The window is still open with the same code.';c='err'}}
+ else if(b.result=='paired'&&b.result_age_s<120){m='Paired. That phone can now use the app over Bluetooth.';c='ok'}
+ else if(b.result=='failed'&&b.result_age_s<120){m='Pairing failed: '
+  +(b.why_text||'a wrong code, or the phone gave up.')
+  +(b.tries_left===0?' Three tries failed, so the window closed.':'')+' Pair again to try again.';c='err'}
+ // Messages of its own replace one the page put up after a tap; only the
+ // ones from here go away again by themselves.
+ if(m){btsay(m,c);btauto=true}else if(btauto)btsay('');
+ btcodebox.hidden=b.own_code==null;
+ if(!btedit){btmode.value=b.own_code?'own':'random';btown.value=b.own||'';btownbox.hidden=!b.own_code}
+ clearTimeout(btT);btT=setTimeout(loadble,b.pairing?2000:10000)}
+// The owner's own pairing code (0.13), or a new random one each window.
+function btmodeset(){btedit=true;btownbox.hidden=btmode.value!='own';
+ if(btmode.value=='own'){btown.focus()}}
+function btweak(c){return /^(\d)\1{5}$/.test(c)||'0123456789'.indexOf(c)>=0||'9876543210'.indexOf(c)>=0}
+function btcodesay(m,c){btcodemsg.textContent=m;btcodemsg.className=c||''}
+function btcodesave(){var own=btmode.value=='own'?btown.value.replace(/\s/g,''):'';
+ if(btmode.value=='own'&&!/^\d{6}$/.test(own)){btcodesay('The code needs exactly six digits.','err');btown.focus();return}
+ btcodebtn.disabled=true;btcodesay('');
+ btpost('/api/ble',{own:own}).then(function(b){btcodebtn.disabled=false;btedit=false;btshow(b);
+  if(!own)btcodesay('Saved. Each pairing window gets a new random code.','ok');
+  else if(btweak(own))btcodesay('Saved, though '+own+' is easy to guess. A code nobody would try first is safer.','warn');
+  else btcodesay('Saved. Pairing windows use your code from now on.','ok')})
+ .catch(function(e){btcodebtn.disabled=false;btcodesay(typeof e=='string'?e:'Could not reach the board.','err')})}
+function loadble(){fetch('/api/ble').then(function(r){if(!r.ok)throw r.status;return r.json()})
+ .then(btshow)
+ .catch(function(e){btinfo.innerHTML=row('Link',e==404?'Needs firmware 0.12 or later':'Unavailable');
+  btpair.disabled=true})}
+function btpost(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body||{})})
+ .then(function(r){return r.json().then(function(j){if(!r.ok)throw j.error||'The board refused.';return j})})}
+function btpairing(){btsay('');
+ btpost('/api/ble/pair',bt&&bt.pairing?{stop:true}:{}).then(btshow)
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+function btswitch(){btsay('');if(!bt)return;
+ btpost('/api/ble',{enabled:!bt.enabled}).then(btshow)
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+// Two taps, like forgetting a network: the first arms the button for four seconds.
+function btforgetall(){
+ if(btarm!==btforget){btarm=btforget;btforget.textContent='Confirm: every phone pairs again';
+  btforget.className='arm';btarmT=setTimeout(btdisarm,4000);return}
+ btdisarm();btsay('');
+ btpost('/api/ble/forget').then(function(b){btshow(b);btsay('Forgot every paired phone.','ok')})
+ .catch(function(e){btsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+function btdisarm(){clearTimeout(btarmT);btarm=null;btforget.textContent='Forget paired phones';
+ btforget.className=''}
+// Saved reports. CSV is made here from the board's JSON, the same columns as
+// the app's export.
+var reps=[],reparm=null,reparmT=0,repclock=false;
+function repsay(m,c){repmsg.textContent=m;repmsg.className=c||''}
+function agetext(s){return s<0?'before the last restart':s<90?'just now'
+ :s<5400?Math.round(s/60)+' min ago':s<172800?Math.round(s/3600)+' h ago':Math.round(s/86400)+' days ago'}
+function whentext(r){var d=r.saved_unix?new Date(r.saved_unix*1000):null;
+ return (d?d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'})+' \u00b7 ':'')+agetext(r.age_s)}
+function fname(r,ext){return 'netmon-'+(r.ssid||'network').replace(/[^A-Za-z0-9._-]+/g,'_')+'-'
+ +(r.saved_unix?new Date(r.saved_unix*1000).toISOString().slice(0,10):'report')+'.'+ext}
+function showreps(l){reps=l.reports||[];repclock=!!l.clock;
+ if(l.clock===false)sendclock();
+ reptbl.hidden=!reps.length;
+ reps.sort(function(a,b){return (b.current-a.current)||((b.saved_unix||0)-(a.saved_unix||0))});
+ reprows.innerHTML=reps.map(function(r,i){
+  return '<tr><td><span class=ss>'+esc(r.ssid)+'</span>'+(r.current?' <span class=pill>On it now</span>':'')
+   +'<span class=sub>'+esc(r.subnet)+(r.gateway?' \u00b7 router '+esc(r.gateway):'')+'</span></td>'
+   +'<td>'+r.count+'<span class=sub>'+r.online+' online</span></td>'
+   +'<td>'+esc(whentext(r))+'</td>'
+   +'<td class=a><div class=acts><a class=dl href="/api/reports/get?slot='+r.slot+'" download="'+esc(fname(r,'json'))+'">JSON</a>'
+   +'<button type=button data-csv='+i+'>CSV</button><button type=button data-del='+i+'>Delete</button></div></td></tr>'}).join('');
+ repnote.textContent=(reps.length?'':'No report saved yet. ')
+  +(l.network?'This board is on '+l.network.ssid+'.':'This board is not on a network now.')
+  +' Room for '+l.max+' networks; a fifth replaces the one saved longest ago.'
+  +(l.clock?'':' The board does not know the time yet, so reports say how long ago devices were seen rather than when.');
+ repsave.disabled=!l.network}
+function loadreps(){fetch('/api/reports').then(function(r){if(!r.ok)throw r.status;return r.json()})
+ .then(showreps)
+ .catch(function(e){repnote.textContent=e==404?'Saved reports need firmware 0.12 or later.':'Saved reports unavailable.';
+  repsave.disabled=true})}
+var clockSent=false;
+function sendclock(){if(clockSent)return;clockSent=true;
+ fetch('/api/clock',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({unix:Math.floor(Date.now()/1000)})}).catch(function(){})}
+function repsavenow(){repsay('Saving\u2026');
+ btpost('/api/reports/save').then(function(l){showreps(l);repsay('Saved.','ok')})
+ .catch(function(e){repsay(typeof e=='string'?e:'Could not reach the board.','err')})}
+// One value for a CSV cell. A cell a spreadsheet would run as a formula is
+// written as text: names come from what devices broadcast about themselves.
+function csvcell(v){v=v==null?'':String(v);
+ if(/^[=+\-@\t\r]/.test(v))v="'"+v;
+ return /[",\r\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v}
+function iso(t){if(!t)return '';var d=new Date(t*1000),p=function(n){return ('0'+n).slice(-2)};
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+function tocsv(j){
+ var rows=[['network','subnet','saved','mac','ip','hostname','vendor','status','private_mac','online',
+  'last_seen','last_seen_s_before_save','first_seen','uptime_s','carried_over']];
+ (j.devices||[]).forEach(function(d){
+  var seen=d.seen_unix||(j.saved_unix?j.saved_unix-d.last_seen_s:0);
+  rows.push([j.ssid,j.subnet,iso(j.saved_unix),d.mac,d.ip,d.hostname,d.vendor,d.status,
+   d.randomised?'yes':'no',d.online?'yes':'no',iso(seen),d.last_seen_s,iso(d.first_unix),d.up_s,d.carried?'yes':'no'])});
+ return rows.map(function(r){return r.map(csvcell).join(',')}).join('\r\n')+'\r\n'}
+function repcsv(r,b){b.disabled=true;
+ fetch('/api/reports/get?slot='+r.slot).then(function(x){if(!x.ok)throw 0;return x.json()})
+ .then(function(j){var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob(['\ufeff'+tocsv(j)],{type:'text/csv'}));a.download=fname(r,'csv');
+  document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000);
+  b.disabled=false})
+ .catch(function(){b.disabled=false;repsay('Could not read that report.','err')})}
+function repdisarm(){clearTimeout(reparmT);if(reparm){reparm.textContent='Delete';reparm.className=''}reparm=null}
+reprows.onclick=function(e){var t=e.target.closest&&e.target.closest('button');if(!t)return;
+ if(t.hasAttribute('data-csv')){repcsv(reps[+t.getAttribute('data-csv')],t);return}
+ var r=reps[+t.getAttribute('data-del')];if(!r)return;
+ if(reparm!==t){repdisarm();reparm=t;t.textContent='Confirm';t.className='arm';reparmT=setTimeout(repdisarm,4000);return}
+ repdisarm();repsay('');
+ btpost('/api/reports/delete',{slot:r.slot}).then(function(l){showreps(l);repsay('Deleted.','ok')})
+ .catch(function(x){repsay(typeof x=='string'?x:'Could not reach the board.','err')})};
+// Signing in (0.13).
+var soarm=false,soarmT=0,pwarm=false,pwarmT=0;
+function authsay(m,c){authmsg.textContent=m;authmsg.className=c||''}
+function loadauth(){fetch('/api/auth',{cache:'no-store'}).then(function(r){return r.json()})
+ .then(function(a){
+  authinfo.innerHTML=row('This browser',a.remembered?'Signed in, remembered for '+a.remember_days+' days'
+    :'Signed in until the browser closes, or 12 hours unused')
+   +row('Password',a.own_password?'Your login password, or the update password'
+    :'The update password from secrets.h')
+   +row('Signed in now',a.sessions+(a.sessions==1?' browser or phone':' browsers and phones'));
+  pwbtn.textContent=a.own_password?'Change login password':'Set login password';
+  pwdel.hidden=!a.own_password})
+ .catch(function(){authinfo.innerHTML=row('Status','Unavailable')})}
+function signoutall(){
+ if(!soarm){soarm=true;soall.textContent='Confirm: this browser too';soall.className='arm';
+  soarmT=setTimeout(function(){soarm=false;soall.textContent='Sign out everywhere';soall.className=''},4000);return}
+ clearTimeout(soarmT);
+ var go=function(){location.href='/login'};
+ fetch('/api/auth/signout',{method:'POST'}).then(go,go)}
+function pwsend(cur,nw){pwbtn.disabled=pwdel.disabled=true;authsay('');
+ fetch('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({current:cur,new:nw})})
+ .then(function(r){return r.json().catch(function(){return {}}).then(function(j){return {s:r.status,j:j}})})
+ .then(function(x){pwbtn.disabled=pwdel.disabled=false;
+  if(x.s!=200){authsay(x.j.error||'The board refused ('+x.s+').','err');return}
+  pwcur.value=pwnew.value=pwnew2.value='';
+  authsay((nw?'Login password set.':'Login password removed: the update password signs in.')
+   +(x.j.ended?' '+x.j.ended+(x.j.ended==1?' other browser or phone was':' other browsers and phones were')
+    +' signed out.':''),'ok');
+  loadauth()})
+ .catch(function(){pwbtn.disabled=pwdel.disabled=false;authsay('Could not reach the board.','err')})}
+function setpw(){
+ if(!pwcur.value){authsay('Enter the current password first: your login password or the update password.','err');pwcur.focus();return}
+ if(!pwnew.value){authsay('Enter the new password.','err');pwnew.focus();return}
+ if(pwnew.value!==pwnew2.value){authsay('The two new passwords are not the same.','err');pwnew2.focus();return}
+ pwsend(pwcur.value,pwnew.value)}
+// Two taps, like the other buttons that take something away.
+function delpw(){
+ if(!pwcur.value){authsay('Enter the current password first.','err');pwcur.focus();return}
+ if(!pwarm){pwarm=true;pwdel.textContent='Confirm';pwdel.className='arm';
+  pwarmT=setTimeout(function(){pwarm=false;pwdel.textContent='Remove it';pwdel.className=''},4000);return}
+ clearTimeout(pwarmT);pwarm=false;pwdel.textContent='Remove it';pwdel.className='';
+ pwsend(pwcur.value,'')}
+// What the board keeps for this network, and starting it over. Learning again
+// forgets every recognised device here, the router's MAC, the DHCP servers and
+// the access points; what is on the network for the next window becomes known.
+function loadbase(){Promise.all([fetch('/api/guard').then(function(r){return r.json()}),
+  fetch('/api/health').then(function(r){return r.json()})])
+ .then(function(res){var g=res[0],h=res[1];relearn.hidden=!g.network;
+  basenote.textContent=!g.network?'Not on a network yet.'
+   :g.learning?'Learning '+g.network+'. Everything seen counts as known for about '
+    +Math.max(1,Math.round(h.baseline_closes_in_s/60))+' more minutes, then the list is kept on '
+    +'the board and survives restarts and updates.'
+   :g.learned?g.known+(g.known==1?' device is':' devices are')+' recognised on '+g.network
+    +', kept across restarts and updates. Mark others as known from the Devices page.'
+   :'Nothing learned on '+g.network+' yet. Learning starts at the first sweep that finds something.'})
+ .catch(function(){basenote.textContent='Could not read what the board keeps for this network.'})}
+var rlT=0;
+function rldisarm(){clearTimeout(rlT);relearn.className='';relearn.textContent='Learn this network again'}
+relearn.onclick=function(){
+ if(relearn.className!='arm'){relearn.className='arm';relearn.textContent='Confirm: forget every recognised device';
+  rlT=setTimeout(rldisarm,4000);return}
+ rldisarm();relearn.disabled=true;basemsg.textContent='';basemsg.className='';
+ fetch('/api/guard/relearn',{method:'POST'})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){relearn.disabled=false;
+  basemsg.textContent=res.ok?'Learning again. Devices on the network over the next window become known.'
+   :(res.j.error||'The board refused that.');basemsg.className=res.ok?'ok':'err';loadbase()})
+ .catch(function(){relearn.disabled=false;basemsg.textContent='Could not reach the board.';
+  basemsg.className='err'})};
+loadcfg();loadnets();loaddhcp();loadble();loadreps();loadauth();loadbase();
 setInterval(function(){if(!busy)loaddhcp()},10000);
+setInterval(function(){if(!busy)loadreps()},60000);
 </script>
 )HTML";
 
 static const char ISP_HTML[] PROGMEM =
-"<!doctype html><title>Internet - Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Internet - Network Monitor</title>"
 R"HTML(<style>
 .hero{padding:1.1rem 1rem}
 .big{margin:0;font-family:var(--mono);font-size:1.45rem;font-weight:600;
@@ -650,8 +1282,9 @@ check(0);
 
 
 static const char EVENTS_HTML[] PROGMEM =
-"<!doctype html><title>Events - Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Events - Network Monitor</title>"
 R"HTML(<style>
 .event{display:grid;grid-template-columns:5.5rem 5.8rem 1fr;gap:.55rem;
  padding:.65rem 1rem;border-bottom:1px solid var(--edge);font-size:.82rem}
@@ -659,10 +1292,27 @@ R"HTML(<style>
 .event .type{font-weight:600}
 .event.offline .type{color:var(--warn)}
 .event.hostname .type{color:var(--link)}
+.event.router_changed .type,.event.ip_conflict .type,.event.dhcp_server .type,
+.event.rogue_ap .type,.event.weak_ap .type{color:var(--bad)}
+.event.trusted .type{color:var(--ok)}
+.event.forgotten .type{color:var(--mut)}
 .empty{padding:1.5rem 1rem;color:var(--mut)}
+.al{display:flex;gap:.75rem;align-items:flex-start;margin:.8rem 0 0;padding:.7rem .75rem;
+ border:1px solid var(--edge);border-left:3px solid var(--bad);border-radius:9px;font-size:.85rem}
+.al div{flex:1;min-width:0;overflow-wrap:anywhere}
+.al b{display:block;font-weight:600;color:var(--bad)}
+.al small{display:block;margin-top:.25rem;color:var(--mut)}
+.al code{font-family:var(--mono);font-size:.8rem}
+.al button{flex:none;padding:.35rem .7rem;font-size:.82rem}
+.al button:disabled{opacity:.5;cursor:default}
+#almsg{margin:.6rem 0 0;font-size:.82rem}
+#almsg:empty{display:none}
+#almsg.err{color:var(--bad)}
 </style>
 <div class=sh>
 <header><a class=brand href="/"><svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true"><circle cx="4" cy="10" r="2.4" fill="currentColor"/><path d="M8.4 5.6a6 6 0 0 1 0 8.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.3 2.9a9.8 9.8 0 0 1 0 14.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity=".5"/></svg><b>netmon</b><span class=ver id=ver></span></a><nav><a href="/">Devices</a><a href="/map">Map</a><a href="/nearby">Nearby</a><span>Events</span><a href="/isp">Internet</a><a href="/settings">Settings</a></nav></header>
+<section><h2>LAN watch</h2><p class=hint id=watch>Checking</p><div id=alerts></div>
+<p id=almsg aria-live=polite></p></section>
 <section><h2>Recent events</h2><p class=hint>Stored in RAM; history is cleared when the monitor restarts.</p></section>
 <div id=list></div><p class=empty id=empty hidden>No events yet.</p>
 <p class=foot><a href="/api/events">Event JSON</a> · <a href="/api/latency">Latency JSON</a></p>
@@ -671,15 +1321,66 @@ R"HTML(<style>
 function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
 function ago(s){if(!s)return 'now';if(s<60)return s+'s ago';if(s<3600)return((s/60)|0)+'m ago';
  if(s<86400)return((s/3600)|0)+'h ago';return((s/86400)|0)+'d ago'}
+// The LAN watch's events go by shorter names in the list.
+var LABEL={router_changed:'router',ip_conflict:'clash',dhcp_server:'dhcp',
+ rogue_ap:'rogue ap',weak_ap:'weak ap'};
+var ATITLE={router_changed:'The router answers from a different device',
+ ip_conflict:'Two devices on one address',dhcp_server:'An unexpected DHCP server',
+ rogue_ap:'An unknown access point with your Wi-Fi name',
+ weak_ap:'An access point offers weaker security'};
+function code(t){return '<code>'+esc(t)+'</code>'}
+function adesc(a,g){switch(a.type){
+ case 'router_changed':return 'The router\u2019s address '+code(a.ip)+' now answers from '
+  +code(a.mac)+', not '+code(a.other)+'. ARP spoofing looks like this, and so does a replaced router.';
+ case 'ip_conflict':return code(a.mac)+' and '+code(a.other)+' both answer for '+code(a.ip)
+  +'. Two devices set to one address look like this, and so does one answering for another.';
+ case 'dhcp_server':return 'A DHCP server at '+code(a.ip)+' handed out an address, most recently to '
+  +code(a.mac)+'. A second server can send devices through itself.';
+ case 'rogue_ap':return code(a.mac)+' uses the name '+esc(g.network)+' but is not one of this '
+  +'network\u2019s access points. An evil twin looks like this, and so does a new extender.';
+ case 'weak_ap':return 'Your access point '+code(a.mac)+' now offers weaker security than it '
+  +'did. The event list below says what changed.'}
+ return esc(a.type)}
+var galerts=[],busy=false;
+function showguard(g,now){
+ galerts=(g.alerts||[]).slice().sort(function(a,b){return a.age_s-b.age_s});
+ var w=[];if(g.router)w.push('the router at '+g.router);
+ var d=g.dhcp_own||(g.dhcp||[]).join(', ');if(d)w.push('DHCP from '+d);
+ var n=(g.aps||[]).length;if(n)w.push(n+(n==1?' access point':' access points'));
+ watch.textContent=(g.learning?'Learning this network: what is seen now becomes the normal. '
+  :galerts.length?'':'Nothing unusual. ')
+  +(w.length?'Watching '+w.join(', ')+'.':'')
+  +(g.wifi_watch?'':' Access points are checked only while Nearby Wi-Fi scanning is on.');
+ alerts.innerHTML=galerts.map(function(a,i){
+  return '<div class=al><div><b>'+esc(ATITLE[a.type]||a.type)+'</b>'+adesc(a,g)
+   +'<small>First noticed '+ago(now>=a.first_s?now-a.first_s:0)+', last '
+   +ago(a.age_s)+'.</small></div><button type=button data-i='+i+'>'
+   +(a.type=='ip_conflict'?'Dismiss':'Accept')+'</button></div>'}).join('')
+  +(galerts.length?'<p class=hint>Accept a change you made yourself: it becomes the normal '
+   +'for this network. An alert also clears by itself a day after it stops.</p>':'')}
+alerts.onclick=function(e){var b=e.target.closest&&e.target.closest('button[data-i]');
+ var a=b&&galerts[+b.getAttribute('data-i')];if(!a||busy)return;
+ busy=true;b.disabled=true;almsg.textContent='';almsg.className='';
+ fetch('/api/guard/accept',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({type:a.type,mac:a.mac,ip:a.ip})})
+ .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+ .then(function(res){busy=false;
+  if(!res.ok){almsg.textContent=res.j.error||'The board refused that.';almsg.className='err'}
+  load()})
+ .catch(function(){busy=false;almsg.textContent='Could not reach the monitor.';
+  almsg.className='err';load()})};
 function load(){fetch('/api/health').then(function(r){return r.json()}).then(function(h){
- ver.textContent=h.version||'';return fetch('/api/events').then(function(r){return r.json()})
- .then(function(es){var now=h.uptime_s||0;empty.hidden=es.length>0;
+ ver.textContent=h.version||'';var now=h.uptime_s||0;
+ fetch('/api/guard').then(function(r){return r.json()}).then(function(g){showguard(g,now)})
+  .catch(function(){watch.textContent='The LAN watch did not answer.'});
+ return fetch('/api/events').then(function(r){return r.json()})
+ .then(function(es){empty.hidden=es.length>0;
  list.innerHTML=es.map(function(e){var age=now>=e.at_s?now-e.at_s:0;
  return '<div class="event '+esc(e.type)+'"><div class=time>'+age+'s</div>'
-  +'<div class=type>'+esc(e.type)+'</div><div><span class=mac>'+esc(e.mac)
-  +'</span> · '+esc(e.ip)+'<br>'+esc(e.text)+'</div></div>'}).join('')})})
+  +'<div class=type>'+esc(LABEL[e.type]||e.type)+'</div><div><span class=mac>'+esc(e.mac)
+  +'</span>'+(e.ip&&e.ip!='0.0.0.0'?' · '+esc(e.ip):'')+'<br>'+esc(e.text)+'</div></div>'}).join('')})})
  .catch(function(){list.innerHTML='<p class=empty>Cannot reach the monitor.</p>'})}
-load();setInterval(load,10000);
+load();setInterval(function(){if(!busy)load()},10000);
 </script>
 )HTML";
 
@@ -698,8 +1399,9 @@ load();setInterval(load,10000);
 // Calibration, ranges and switches live in this browser, like the dashboard's
 // column widths.
 static const char NEARBY_HTML[] PROGMEM =
-"<!doctype html><title>Nearby - Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Nearby - Network Monitor</title>"
 R"HTML(<style>
 :root{--wifi:#0e7c93;--ble:#8a3fbf;--scope:#f6f9fb;--ring:#d3dde6;
  --gp:#2a78d6;--gt:#eb6834;--gh:#1baf7a;
@@ -1720,8 +2422,9 @@ if(!reduce)requestAnimationFrame(frame);else redraw();
 )HTML";
 
 static const char MAP_HTML[] PROGMEM =
-"<!doctype html><title>Map - Network Monitor</title>"
+"<!doctype html><html lang=en>"
 NM_HEAD
+"<title>Map - Network Monitor</title>"
 R"HTML(<style>
 :root{--scope:#f6f9fb;--ring:#d3dde6;--line:#c4d0db}
 @media(prefers-color-scheme:dark){:root{--scope:#111920;--ring:#2b3947;--line:#34475a}}

@@ -3,10 +3,12 @@
 A network monitor that runs on one ESP32 board. It finds every device on your
 LAN, tells you which ones it doesn't recognise, and scans the Wi-Fi and
 Bluetooth around it. You use it through web pages that the board serves
-itself, and those pages never load anything from the internet.
+itself, and those pages never load anything from the internet. It keeps a
+saved report of each network it has been on, and a paired phone can reach it
+over Bluetooth, away from its Wi-Fi. Pages and API ask for a password.
 
-- **Firmware** 0.11.0-finder for an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash). It is written in Arduino C++ and needs no extra wiring.
-- **Android app** 1.1.0 (optional). It reads the same HTTP API and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications and can update the firmware.
+- **Firmware** 0.16.1 for an ESP32-S3 N8R2 board (8 MB flash, 2 MB PSRAM). It is written in Arduino C++ and needs no extra wiring.
+- **Android app** (optional). The source in `android/` is 1.1.0; Bluetooth, signing in and saved reports need 1.3.0 or newer. It reads the same API, over Wi-Fi or Bluetooth, and has the same Devices, Map, Nearby and Finder screens. It also keeps a longer event history on the phone, sends notifications, browses and exports the saved reports, and can update the firmware.
 
 <table>
   <tr>
@@ -30,12 +32,15 @@ router relays. It also gets one of three states:
 
 | State | Meaning |
 |---|---|
-| known | Seen during the 10-minute learning window after start-up |
+| known | On this network's list: seen during its first 10-minute learning window, or marked as known since |
 | private | Uses a randomised (locally administered) MAC, as most phones do. Never flagged |
-| unknown | Has a manufacturer-assigned MAC and first appeared after the learning window. **This is the case worth checking.** |
+| unknown | Has a manufacturer-assigned MAC and is not on the list. **This is the case worth checking.** |
 
-The page also shows uptime as the board has seen it, and the time each offline
-device was last seen.
+The list is kept on the board, one per network, so it survives restarts, power
+cuts and firmware updates. Pick a device in the table to **Trust** it (it
+becomes known and stays known) or **Forget** it (it comes off the list and is
+flagged if it turns up again). The page also shows uptime as the board has
+seen it, and the time each offline device was last seen.
 
 **Map** (`/map`). Draws your network around the router. Devices are grouped by
 what they are (phones, cameras, smart home, servers and so on), going by
@@ -51,7 +56,34 @@ with the board held against your chest and it also gives a direction. In the
 Android app the phone follows that turn with its own rotation sensor, and an
 arrow keeps pointing the way afterwards.
 
-**Events** (`/events`) lists devices that appeared, went offline or came back.
+**Saved reports** (in Settings). For each network the board has been on, up
+to four, its device list as it last stood, kept in flash: saved two sweeps
+after joining, then every 15 minutes, before every restart and when you ask.
+Devices not seen since the board last started are carried over from the
+report before, so a power cut doesn't shrink it. Download one as JSON or CSV,
+or browse it in the app. See [Saved reports](docs/saved-reports.md).
+
+**Bluetooth.** A phone paired with the board, once, with a 6-digit code from
+the Settings page, uses the Android app over Bluetooth whenever the board
+doesn't answer on Wi-Fi: within about 10 metres, in setup mode, on another
+network. See [Using netmon over Bluetooth](docs/bluetooth.md).
+
+**Events** (`/events`) lists devices that appeared, went offline or came back,
+and opens with the **LAN watch**. That notices four things that should not
+change on a home network unless somebody changes them:
+
+| Alert | What changed | Looks like |
+|---|---|---|
+| Router changed | The router's address answers from a different MAC | ARP spoofing, or a replaced router |
+| Address clash | Two MACs keep taking turns answering for one address | Two devices on one fixed address, or one answering for another |
+| Unexpected DHCP server | A device took its address from a server the network doesn't use | A rogue DHCP server, or a second one you added |
+| Unknown or weaker access point | Your Wi-Fi name from an access point that isn't one of yours, or one of yours offering weaker security than before | An evil twin, or a new extender or mesh node |
+
+Each one is logged once and again hourly while it carries on. **Accept** a
+change you made yourself and it becomes the new normal; an address clash can
+only be dismissed. An alert clears by itself a day after it stops. The Devices
+page names the newest one at the top.
+
 **Internet** (`/isp`) shows your public address and provider, plus the
 router's maker and the latency to it. **Settings** (`/settings`) covers Wi-Fi
 setup and the saved-network history, DHCP or a fixed address, monitoring
@@ -59,50 +91,77 @@ intervals and firmware updates from the browser.
 
 ## Hardware
 
-- An ESP32 DevKit V1 or another classic ESP32 board with **4 MB flash** and Bluetooth. Only the DevKit V1 has been tested.
+- An **ESP32-S3 N8R2** board: ESP32-S3 with 8 MB flash and 2 MB quad (QSPI) PSRAM. From 0.16.0 the sketch refuses to build for other chips.
+  Firmware up to 0.15.0 ran on an ESP32 DevKit V1 (ESP32-WROOM-32, 4 MB flash).
 - A USB cable for the first flash. After that, updates go over Wi-Fi.
 - For the Finder you take the board with you, so a USB power bank helps.
 
 ## Build and flash
 
 1. Install the **Arduino IDE** (2.x) and the **esp32 by Espressif Systems**
-   boards package, version 3.x. Builds have used 3.3.12.
-2. Install the libraries **ArduinoJson** 7 by Benoit Blanchon (7.4.3) and
-   **NimBLE-Arduino** 2 by h2zero (2.5.1).
+   boards package. 0.16.1 has been built with 4.0.0.
+2. Install the libraries **ArduinoJson** 7 by Benoit Blanchon and
+   **NimBLE-Arduino** 2 by h2zero (built with 2.5.2).
+   With esp32 core 4.0.0, NimBLE-Arduino fails to compile
+   (`'struct ble_npl_event' has no member named 'event'`) because the core
+   turns on periodic advertising, which the library doesn't support. Add these
+   lines to the library's `src/nimconfig.h`, after
+   `#include "nimconfig_rename.h"`:
+
+   ```c
+   #undef CONFIG_BT_NIMBLE_ENABLE_PERIODIC_ADV
+   #undef CONFIG_BT_NIMBLE_ENABLE_PERIODIC_SYNC
+   #undef CONFIG_BT_NIMBLE_PERIODIC_ADV_SYNC_TRANSFER
+   #undef CONFIG_BT_NIMBLE_MAX_PERIODIC_SYNCS
+   ```
 3. Copy `firmware/netmon/secrets.example.h` to `firmware/netmon/secrets.h` and
    set your own `NETMON_UPDATE_PASSWORD`. This password protects firmware
-   updates. The build refuses to run if the file is missing or still holds the
-   placeholder, and git ignores `secrets.h`.
+   updates and is the way back in when signing in. The build refuses to run if
+   the file is missing or still holds the placeholder, and git ignores
+   `secrets.h`.
 4. Open `firmware/netmon/netmon.ino` and select:
-   - Board: **ESP32 Dev Module**
-   - Partition Scheme: **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**.
-     The default 1.2 MB app partition is too small now that Bluetooth is in.
-5. Upload. The image is about 1.5 MB, which is 76% of the app partition.
+   - Board: **ESP32S3 Dev Module**
+   - Flash Size: **8MB (64Mb)**
+   - PSRAM: **QSPI PSRAM** (the N8R2 has quad PSRAM, not OPI)
+   - Partition Scheme: **8M with spiffs (3MB APP/1.5MB SPIFFS)**
+   - USB CDC On Boot: **Enabled** on the board's native USB port, **Disabled**
+     when the port is a USB-serial chip
+5. Upload. The image is about 1.7 MB, which is 50% of the app partition.
 
 To do the same with arduino-cli:
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs firmware/netmon
-arduino-cli upload  --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs -p <port> firmware/netmon
+FQBN="esp32:esp32:esp32s3:FlashSize=8M,PSRAM=enabled,PartitionScheme=default_8MB"
+arduino-cli compile --fqbn "$FQBN" firmware/netmon
+arduino-cli upload  --fqbn "$FQBN" -p <port> firmware/netmon
 ```
 
-Coming from firmware 0.9.x or older? Flash over USB once, because 0.10.0
-changed the partition scheme. See the [changelog](CHANGELOG.md#0100-nearby).
+Moving from a DevKit V1 board? The S3 is flashed over USB the first time.
+Settings, recognised devices and saved reports stay on the old board. Updates
+after that go over the air. See the [changelog](CHANGELOG.md#0160).
 
 ## First start
 
 1. The board doesn't know your Wi-Fi yet, so it opens its own open network
-   called **`netmon-setup`**. Join it from a phone. The settings page should
-   open by itself as a "sign in to network" page. If it doesn't, browse to
-   `http://192.168.4.1`.
-2. Tap **Scan for networks**, pick yours, enter the password, then **Save and restart**.
-3. The board joins your network and starts sweeping. Open `http://netmon.local`,
+   called **`netmon-setup`**. Join it from a phone. The board's sign-in page
+   should open by itself as a "sign in to network" page. If it doesn't, browse
+   to `http://192.168.4.1`.
+2. Sign in with the update password you set in `secrets.h`. Tick **Remember
+   me** to stay signed in on that browser for 30 days.
+3. Tap **Scan for networks**, pick yours, enter the password, then **Save and restart**.
+4. The board joins your network and starts sweeping. Open `http://netmon.local`,
    or find the board's address in your router's client list, where it shows
    up as `netmon`. More ways to find it are in [Finding netmon](docs/finding-netmon.md).
 
+Under **Settings → Signing in** you can set a login password of your own. The
+update password keeps working too, as the way back in if you forget yours.
+
 For the first ten minutes everything it sees counts as **known**, because it
 is learning what normal looks like. After that, any new device with a
-manufacturer MAC shows as **unknown**.
+manufacturer MAC shows as **unknown**. What it learned is saved for that
+network, so after a restart or an update there is no second learning window:
+anything new is flagged from the first sweep. To start a network over, use
+**Settings → Recognised devices → Learn this network again**.
 
 The board remembers up to four networks and tries each one for 12 s at
 start-up. If none of them answers, it falls back to `netmon-setup`. While
@@ -122,24 +181,39 @@ Once a build is on the board, you can update it over Wi-Fi in any of these ways:
 - **ArduinoOTA** from the Arduino IDE. The board appears as `netmon`.
 - **The Android app**, under Settings → Firmware update.
 
-All three use the update password from `secrets.h`. Saved Wi-Fi networks,
-settings and learned hostnames survive an update.
+All three use the update password from `secrets.h`, and from 0.13 the page
+and the app also need to be signed in. Saved Wi-Fi networks, settings,
+learned hostnames, sessions and paired phones survive an update.
 
 ## Security notes
 
-- The pages and the read-only API need no login, so anyone on your LAN can
-  view them.
-- Requests that change things, such as settings, forgetting a network,
-  restarting or the Nearby controls, are refused when they come from a page on
-  another site (a browser Origin check). This is not authentication: a device
-  on the LAN that talks to the board directly can still make them. Only
-  firmware updates need the password.
+- From 0.13 every page and API call needs signing in, over Wi-Fi and over
+  Bluetooth. The password is your login password (Settings → Signing in) or
+  the update password from `secrets.h`, which always works. A session is a
+  random token the board keeps only a hash of: 30 days with *Remember me* (or
+  in the app), otherwise until the browser closes or 12 hours unused. Wrong
+  passwords cost a growing wait, up to 15 minutes. *Sign out everywhere* ends
+  every session, and a new login password ends all but yours.
+- The pages are plain HTTP, so on your LAN the password and the session travel
+  unencrypted: Wi-Fi encryption keeps them from outsiders, not from another
+  device that can see the traffic on your network.
+- Requests that change things are also refused when they come from a page on
+  another site (a browser Origin check), so a web page you visit can't use
+  your session on the board.
 - `netmon-setup` is an open network. It exists only while the board can't join
   one of its saved networks.
 - The Internet page sends one plain-HTTP request to [ip-api.com](https://ip-api.com)
   at most every six hours (or when you press *Check again*). This request
   reveals your public IP address to that service. Nothing else leaves your
   network.
+- Bluetooth: the API answers only phones paired with a 6-digit code, over an
+  encrypted link, and signed in like any other client. The code is shown only
+  on the Settings page or in the app over Wi-Fi, or is your own, and it only
+  works while a pairing window is open: two minutes and three tries. Up to
+  three phones stay paired, and a stranger in range cannot push one out.
+  Bluetooth can be switched off in Settings.
+- Saved reports stay in the board's flash until replaced or deleted. Anyone
+  who can reach the API, on the LAN or a paired phone, can read them.
 - Don't expose the board to the internet. To check on it from outside, use a
   VPN into your network.
 
@@ -149,12 +223,23 @@ Found a security problem? Please report it privately, as described in
 ## HTTP API
 
 Every endpoint returns JSON. The Android app uses this API, and anything else
-on your network can use it too.
+on your network can use it too, once signed in: from 0.13 every endpoint but
+the first three below needs a session, from `POST /api/login`, sent as the
+`nm_s` cookie or as `Authorization: Bearer <token>`. Without one the answer is
+`401` with `"login":true` (and, over Wi-Fi, an `X-Netmon-Login` header).
 
 | Endpoint | |
 |---|---|
-| `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, free memory |
+| `GET /api/auth` | What the board is (`netmon`, `version`, `id`: the chip's MAC) and whether the asker is signed in. Needs no session |
+| `POST /api/login` | `{"password":"...","remember":true}`: a session, as the `nm_s` cookie and as `token` in the answer. `429` with `retry_s` after too many wrong passwords |
+| `POST /api/logout` | Ends the asker's session |
+| `POST /api/auth/password`, `POST /api/auth/signout` | `{"current":"...","new":"..."}` sets the login password (`"new":""` removes it) and ends every other session; sign out everywhere |
+| `GET /api/health` | Version, Wi-Fi, address and subnet, sweep timing, learning window, whether this network's list is saved and how many devices are on it, LAN watch alerts, free memory |
 | `GET /api/devices` | Every device: MAC, IP, hostname, vendor, state, online, uptime, last seen |
+| `POST /api/devices/trust`, `POST /api/devices/forget` | `{"mac": "..."}`: mark a device as known on this network, or take it off the list and out of the table |
+| `GET /api/guard` | What the LAN watch keeps for this network (router MAC, DHCP servers, access points, how many devices are recognised) and its current alerts |
+| `POST /api/guard/accept` | `{"type": "...", "mac": "...", "ip": "..."}` from an alert: accept the change, or dismiss an address clash |
+| `POST /api/guard/relearn` | Forget everything learned on this network and open a new learning window |
 | `GET /api/events` | The last 48 events (appeared, offline, returned, hostname learned) |
 | `GET /api/latency` | Gateway round trip (TCP connect to port 80 or 443, not ICMP) |
 | `GET /api/dhcp` | DHCP listener state and the last request heard |
@@ -168,16 +253,34 @@ on your network can use it too.
 | `GET`/`POST /api/nearby/config` | Turn Wi-Fi and Bluetooth scanning on or off, and set the background interval |
 | `GET`/`POST /api/nearby/find` | The Finder: start, keep alive, stop, read new signal readings |
 | `GET /api/map` | The board, its access points, the router, the subnet and the provider, for the Map page |
+| `GET`/`POST /api/ble` | The Bluetooth link: on or off, address, paired phones, the pairing window and how the last attempt went. `{"enabled":false}` switches it off; `{"own":"123456"}` sets your own pairing code, `{"own":""}` goes back to random ones |
+| `POST /api/ble/pair`, `POST /api/ble/forget` | Open a two-minute pairing window and get its code (`{"stop":true}` closes it); forget every paired phone |
+| `GET /api/reports`, `GET /api/reports/get?slot=N` | The saved reports, one per network; one of them, as the JSON document kept in flash |
+| `POST /api/reports/save`, `POST /api/reports/delete` | Save this network's report now; delete one (`{"slot":N}`) |
+| `POST /api/clock` | `{"unix":seconds}`: the time, for dating reports. The app and the pages send it when `/api/health` says `"clock":false` |
+| `POST /api/mac` | `{"mac":"02:1A:2B:3C:4D:5E"}`: the address the board uses on Wi-Fi from its next start; `{"mac":""}` goes back to the chip's own |
+
+Over Bluetooth every endpoint above answers the same, except the firmware
+upload. The framing is described in `firmware/netmon/src/core/ble_link.h`.
 
 The [changelog](CHANGELOG.md) describes each endpoint's fields in the release
 that added it.
 
 ## Limitations
 
-- The known/unknown baseline, the event history, the Nearby lists and the map
-  data are all kept in RAM. A restart, including one after an update, starts
-  the learning window again.
-- Settings endpoints take no password, as described under Security notes.
+- The event history, the Nearby lists, the map data and the LAN watch's current
+  alerts are kept in RAM and start over after a restart. What the board has
+  learned about each network (the recognised devices, the router's MAC, the
+  DHCP servers and the access points) is kept on flash.
+- The LAN watch sees only what reaches the board. It reads the router's MAC
+  from its own ARP cache, so it notices a spoofer that targets the board too,
+  as whole-network spoofing tools do. It learns a rogue DHCP server from the
+  requests of devices that took its offer. It checks access points only while
+  Nearby Wi-Fi scanning is on, and only on 2.4 GHz. Range extenders that
+  answer for their clients can show up as an address clash.
+- Sessions and the login password live in the board's flash. Lose every
+  password and the update password still signs in; lose that too and the
+  board needs reflashing over USB with a new `secrets.h`.
 - A fixed address applies to every saved network.
 - Hostnames come from DHCP broadcasts. A device that only renews a lease it
   already holds stays unnamed until it next reconnects. Routers that isolate
@@ -186,6 +289,11 @@ that added it.
   which access point a device uses, or other devices' signal strength.
 - Distances worked out from signal strength are rough. The Finder's direction
   depends on your body blocking the signal, so it's a hint, not a bearing.
+- Bluetooth reaches around 10 metres indoors and is slower than Wi-Fi, so
+  over it the Nearby lists and saved reports take a moment longer. Firmware
+  updates go over Wi-Fi only.
+- Saved reports keep the latest state of each network, not a history, and
+  four networks at most.
 - Map groups are guesses from names and a small built-in list of makers.
 
 ## Tests
@@ -194,7 +302,7 @@ The hardware-independent logic lives in `firmware/netmon/src/core/` and is
 tested on a PC:
 
 ```sh
-cd firmware/test && make test        # 1331 checks, g++ or clang, C++17
+cd firmware/test && make test        # 2187 checks, g++ or clang, C++17
 ```
 
 The web pages are tested in headless Chromium against a simulated board. See
@@ -211,6 +319,7 @@ firmware/
     src/core/           pure C++ logic, unit-tested on the host
     src/hw/             ESP32 parts: ARP, Wi-Fi, BLE, storage, pages
   test/                 host unit tests and page checks
+  tools/gen_oui.py      builds src/core/oui_table.h from Wireshark's manuf data
 android/                companion app (Kotlin, no AndroidX): see android/README.md
 docs/                   how-tos and screenshots
 CHANGELOG.md            release notes, 0.3.1 onwards
@@ -223,7 +332,8 @@ CHANGELOG.md            release notes, 0.3.1 onwards
   radar scale, the arrival and departure marks, trend arrows, device kinds
   grouped by colour, hiding private addresses and masking for screenshots.
 - Bluetooth company identifiers and service UUIDs come from the Bluetooth SIG's
-  assigned numbers. MAC vendors come from a small subset of the IEEE OUI registry.
+  assigned numbers. MAC vendors come from a subset of the IEEE MA-L registry (13,405 prefixes),
+  taken from Wireshark's manuf data.
 - Public address lookups come from [ip-api.com](https://ip-api.com).
 
 ## License

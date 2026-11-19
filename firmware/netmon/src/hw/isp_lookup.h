@@ -15,6 +15,7 @@ struct IspInfo {
     char country[48];
     char tz[48];
     uint32_t rtt_ms;      // time to open the TCP connection
+    uint32_t date_unix;   // the reply's Date header, 0 when it had none
     char error[72];       // why the last attempt failed, when it did
 };
 

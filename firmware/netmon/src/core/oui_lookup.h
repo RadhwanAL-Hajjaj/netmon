@@ -5,9 +5,8 @@
 // Binary search keeps lookup cheap enough to run inside a scan loop on a
 // 240 MHz core.
 //
-// Note this device carries a trimmed table of common consumer prefixes,
-// not the full IEEE registry — 1.1 MB does not fit
-// alongside OTA on 4 MB of flash. Coverage here is deliberately narrower.
+// The table the firmware uses (oui_table.h, from 0.16) is packed and has its
+// own lookup, oui_vendor(); this one remains for OuiEntry tables in tests.
 #include <cstdint>
 #include <cstddef>
 
